@@ -312,6 +312,8 @@ export class Execution {
       fillFresh: options.fillFresh ?? null,
       halfWeights: options.halfWeights ?? false,
       int5Weights: options.int5Weights ?? false });
+    // ...and a texture the pool deletes takes its cached framebuffers with it (Storage.#deleteTexture)
+    this.storage.onDeleteTexture = (texture) => this.#forgetTexture(texture);
     /**
      * Read every output back and refuse at the first non-finite value.
      *
@@ -661,6 +663,8 @@ export class Execution {
     /** Stable small ids for textures, so an attachment set has a short key. */
     this.textureIds = new WeakMap();
     this.nextTextureId = 1;
+    /** @type {Map<number, Set<string>>} The cached attachment sets each texture id is in, to forget them with it. */
+    this.framebufferKeysOf = new Map();
     this.framebufferBuilds = 0;
     /** How many attachment sets to keep. A fold uses tens; the cap is slack. */
     this.maxFramebuffers = options.maxFramebuffers ?? 256;
@@ -944,6 +948,12 @@ export class Execution {
         + `${targets.map((tensor) => tensor.label).join(", ")} (0x${status.toString(16)})`);
     }
     this.framebuffers.set(key, framebuffer);
+    for (const id of key.split(",")) {
+      if (id === "") continue;
+      const keys = this.framebufferKeysOf.get(Number(id)) ?? new Set();
+      keys.add(key);
+      this.framebufferKeysOf.set(Number(id), keys);
+    }
     this.framebufferBuilds += 1;
   }
 
@@ -1336,6 +1346,22 @@ export class Execution {
       maxBandRows: this.maxBandRows, maxDrawBuffers: this.maxDrawBuffers,
       ...this.storage.stats(),
     };
+  }
+
+  /** Delete every cached framebuffer a texture is attached to, before the texture itself is deleted. */
+  #forgetTexture(texture) {
+    const id = this.textureIds.get(texture);
+    if (id === undefined) return;
+    this.textureIds.delete(texture);
+    const gl = this.gl;
+    for (const key of this.framebufferKeysOf.get(id) ?? []) {
+      const framebuffer = this.framebuffers.get(key);
+      if (framebuffer === undefined) continue;
+      if (gl.getParameter(gl.FRAMEBUFFER_BINDING) === framebuffer) gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.deleteFramebuffer(framebuffer);
+      this.framebuffers.delete(key);
+    }
+    this.framebufferKeysOf.delete(id);
   }
 
   destroy() {

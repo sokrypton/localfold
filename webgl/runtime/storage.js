@@ -288,6 +288,21 @@ export class Storage {
   }
 
   /**
+   * Delete a texture, and tell whoever holds it attached (`onDeleteTexture`: the framebuffer cache).
+   *
+   * 🔴 A DELETED TEXTURE STILL ATTACHED TO A FRAMEBUFFER KEEPS ITS MEMORY. GL frees a texture's storage only when
+   * nothing references it, and `Execution`'s framebuffer cache keeps up to 256 attachment sets alive - so every
+   * texture the pool evicted stayed resident until its framebuffer aged out. Mol-1 with an 8076-row alignment
+   * counted 3.8 GB here while NVIDIA's OpenGL held 17.7 GB and refused the next target (0x8cdd: that driver takes
+   * ~16 GB of float textures in one context); through Vulkan the same leak passed unseen. Unpooled the cache is not
+   * used, which is why `--no-pool` folded.
+   */
+  #deleteTexture(texture) {
+    this.onDeleteTexture?.(texture);
+    this.gl.deleteTexture(texture);
+  }
+
+  /**
    * A pooled texture for a tensor of `height` rows: one of exactly that height, else the SHORTEST taller one.
    *
    * 🔴 A POOL THAT ONLY MATCHES A SHAPE EXACTLY HOLDS EVERY SHAPE'S SPARE AT ONCE, AND THAT IS WHAT THE BOUND RAN
@@ -712,7 +727,7 @@ export class Storage {
     if (tensor.texture === null) return;
     this.bytes -= tensor.bytes;
     if (!this.pooling || tensor.bytes > this.poolLimitBytes) {
-      this.gl.deleteTexture(tensor.texture);
+      this.#deleteTexture(tensor.texture);
       return;
     }
     const key = poolKey(tensor.width, tensor.rows ?? tensor.height, tensorFormat(tensor));
@@ -723,13 +738,13 @@ export class Storage {
       if (oldKey === key) continue;
       const each = this.poolEntryBytes.get(oldKey);
       while (textures.length > 0 && this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
-        this.gl.deleteTexture(textures.pop());
+        this.#deleteTexture(textures.pop());
         this.pooledBytes -= each;
       }
       if (textures.length === 0) this.pool.delete(oldKey);
     }
     if (this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
-      this.gl.deleteTexture(tensor.texture);
+      this.#deleteTexture(tensor.texture);
       return;
     }
     const free = this.pool.get(key) ?? [];
@@ -749,7 +764,7 @@ export class Storage {
   /** Delete every pooled texture, which is what actually frees the memory. */
   drainPool() {
     for (const textures of this.pool.values()) {
-      for (const texture of textures) this.gl.deleteTexture(texture);
+      for (const texture of textures) this.#deleteTexture(texture);
     }
     this.pool.clear();
     this.pooledBytes = 0;

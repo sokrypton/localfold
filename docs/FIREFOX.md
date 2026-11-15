@@ -294,6 +294,33 @@ with the exact-match 512 MiB pool, 30.9 s at 1.96 with any-fit under the same bo
 shorter tensor is live bytes) and 27.0 s at 2.29 with both rules - the same structure in all three, in Chrome and
 in Firefox with `--no-webgpu`. `fold-af3-webgl.js --any-fit --pool-mib=<n>` is the arm with, there.
 
+### Through the page, as the reader folds
+
+`LOCALFOLD_GPU_ANGLE=gl-egl` reaches `tools/cdp.py` too, so `fold-in-page.py --no-webgpu` folds through the page on
+that driver. AlphaFold 3, the page's default 58 residues, 25 steps, single sequence (CA from the saved PDBs):
+
+| | status line | CA-CA median | Rg | to WebGPU's fold |
+|---|---|---:|---:|---:|
+| WebGPU | pLDDT 68.1 | 3.824 A | 10.4 A | - |
+| WebGL2 on NVIDIA's OpenGL, `main` | **pLDDT 82.8**, no warning | 3.737 A | **21.2 A** | **15.8 A** |
+| WebGL2 on NVIDIA's OpenGL, fixed | pLDDT 68.0 | 3.824 A | 10.4 A | 0.015 A |
+
+🔴 **THE PAGE'S OWN "NOT A CHAIN" GUARD DID NOT FIRE**: the broken fold is a chain - every consecutive CA within
+3.48-3.89 A - unfolded to twice the radius, and its pLDDT is HIGHER than the right answer's. That is the report
+("it does produce an output, it just doesn't make much sense"), and no check on a single fold can see it.
+
+### Evicted textures were never freed: 26 GB of card for a 1.7 GB fold
+
+Mol-1 with the 8076-row alignment failed on NVIDIA's OpenGL (`0x8cdd`, an 8-target draw) - on `main` too - with
+**17.7 GB** on the card against the 3.8 GB `Storage` counted, where `--no-pool` and a pool too big to evict both
+folded. GL frees a texture only when nothing references it, and `Execution`'s framebuffer cache (256 attachment
+sets, used when pooling) kept every texture the pool evicted attached. That driver takes ~16 GB of float textures
+in one context and then refuses; through Vulkan the leak passed unseen - the 262-residue fold on `main` drove the
+A100 to **26.4 GB** for a 1.74 GB count. Now a deleted texture takes its cached framebuffers with it
+(`Storage.#deleteTexture` -> `Execution.#forgetTexture`): that fold peaks at **3.4 GB** through Vulkan and 4.1
+through OpenGL (10.1 / 12.3 s, same pLDDT), and Mol-1 with the alignment folds on both at 4.9e-4 from WGSL. Every
+reader whose AF3-lineage WebGL2 fold evicts - any fold past ~180 residues, on any device - was holding it.
+
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
 On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),
