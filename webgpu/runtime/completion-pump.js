@@ -9,43 +9,31 @@
  * buffer, creating one, or asking `onSubmittedWorkDone` again does not, and one empty submit straight after the ask
  * does not either (the work has not finished yet).
  *
- * `startCompletionPump` measures the delay once and, where it is long, wraps the two waits of this device so that an
- * empty submit goes out every half millisecond while any is open. Nothing is wrapped in a browser that answers promptly.
+ * `startCompletionPump` wraps the two waits of a device so that an empty submit goes out every half millisecond
+ * while any is open. The caller says which device: Firefox's, known by its compiler (webgpu/runtime/device.js).
+ *
+ * 🔴 IT USED TO MEASURE THE DELAY ONCE AND PUMP OVER 30 ms, AND THAT LEFT SOME FIREFOX SESSIONS UNPUMPED. The delay
+ * is usually 90-100 ms, has read 70, and now and then reads under any bar - and a session that measured short folded
+ * unpumped for its whole life: 6.3 s where a pumped one is 3.2, one page load in seven. A measurement that is only
+ * right when it says "no" decides nothing, so there is none.
  */
-
-/** A wait longer than this for work that takes none is a browser on a tick. */
-const SLOW_MILLISECONDS = 30;
 
 /** An empty submit this often while a wait is open. */
 const SUBMIT_SPACING_MILLISECONDS = 0.5;
 
-/** Milliseconds this device takes to report an empty submit done: the smaller of two asks. */
-export async function completionDelay(device) {
-  let best = Infinity;
-  for (let attempt = 0; attempt < 2 && best >= SLOW_MILLISECONDS; attempt += 1) {
-    device.queue.submit([device.createCommandEncoder().finish()]);
-    const start = performance.now();
-    await device.queue.onSubmittedWorkDone();
-    best = Math.min(best, performance.now() - start);
-  }
-  return best;
-}
-
 const PUMPED = new WeakMap();
 
-/** Whether this device's waits are pumped, and the delay that decided it. */
-export const completionPumpOf = (device) => PUMPED.get(device) ?? { pumped: false, delayMs: null };
+/** Whether this device's waits are pumped. */
+export const completionPumpOf = (device) => PUMPED.get(device) ?? { pumped: false };
 
 /**
  * @param {GPUDevice} device
- * @param {{force?: boolean}} [options] `force: true` pumps without measuring, `force: false` never pumps
+ * @param {boolean} pump whether to pump this device's waits; false leaves it exactly as it was
  */
-export async function startCompletionPump(device, options = {}) {
+export function startCompletionPump(device, pump) {
   if (PUMPED.has(device)) return PUMPED.get(device);
-  const delayMs = options.force === undefined ? await completionDelay(device) : null;
-  const pumped = options.force ?? delayMs >= SLOW_MILLISECONDS;
-  PUMPED.set(device, { pumped, delayMs });
-  if (!pumped) return PUMPED.get(device);
+  PUMPED.set(device, { pumped: pump === true });
+  if (pump !== true) return PUMPED.get(device);
 
   const queue = device.queue;
   // 🔴 THE TURNS ARE MESSAGES, NOT TIMERS. A timer turn is 4 ms at best and, in a window that is not in front,

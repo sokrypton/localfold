@@ -113,9 +113,13 @@ awaited by `mapAsync` or `onSubmittedWorkDone` is 99-101 ms every time, Chrome 0
 every sampler step, so a denoiser call of 45 ms was 100. The device looks when something is submitted: an empty
 `queue.submit([])` while the wait is open brings the answer in 1-8 ms; a `writeBuffer`, a `createBuffer`, another
 `onSubmittedWorkDone` and ONE empty submit straight after the ask do not. `webgpu/runtime/completion-pump.js`
-measures the delay once a device and, where it is over 30 ms, wraps the two waits so an empty submit goes out every
+wraps the two waits of a Firefox device (known by its compiler) so an empty submit goes out every
 half millisecond while one is open. 🔴 The turns are MessageChannel messages, not timers: a timer turn in a window
 that is not in front read 5 to 682 ms. `LOCALFOLD_GPU_NO_PUMP=1` is the arm without.
+🔴 **And nothing is measured to decide it.** The pump used to turn on where one startup wait took over 30 ms; the delay is not always 100 ms - 70 was read,
+and now and then under the bar - and a session that measured short folded unpumped for its whole life: the page's
+default example (59 residues, 7664 MSA rows, 4 passes) 11 s on a first fold where a pumped session is 3, `fold.js`
+6.3 s against 3.2, with the unpumped arm's stage signature to the millisecond. One in seven page loads did it here.
 
 **3. Every loop iteration costs, whatever is in it.** `tools/gpu/probe-loop-cost.js`, 1536 iterations a lane, GPU
 clock, Firefox against Chrome:

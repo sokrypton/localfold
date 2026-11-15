@@ -43,11 +43,11 @@ function fakeDevice({ delay, pokeable = false }) {
   };
 }
 
-test("a device that answers promptly is left exactly as it was", async () => {
-  const device = fakeDevice({ delay: 0 });
+test("a device that is not pumped is left exactly as it was", async () => {
+  const device = fakeDevice({ delay: 120 });
   const { onSubmittedWorkDone } = device.queue;
   const { createBuffer } = device;
-  const state = await startCompletionPump(device);
+  const state = startCompletionPump(device, false);
   assert.equal(state.pumped, false);
   assert.equal(device.queue.onSubmittedWorkDone, onSubmittedWorkDone);
   assert.equal(device.createBuffer, createBuffer);
@@ -56,9 +56,9 @@ test("a device that answers promptly is left exactly as it was", async () => {
 
 test("a device on a tick has both waits pumped with empty submits, and the pump stops with the last wait", async () => {
   const device = fakeDevice({ delay: 120, pokeable: true });
-  const state = await startCompletionPump(device);
+  const state = startCompletionPump(device, true);
   assert.equal(state.pumped, true);
-  assert.ok(state.delayMs >= 30);
+  assert.equal(device.submits.length, 0);   // nothing is measured: no submit until a wait is open
   const before = device.submits.length;
   const start = performance.now();
   await device.queue.onSubmittedWorkDone();
@@ -74,11 +74,4 @@ test("a device on a tick has both waits pumped with empty submits, and the pump 
   const settled = device.submits.length;
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(device.submits.length, settled);
-});
-
-test("`force` decides without measuring", async () => {
-  const slow = fakeDevice({ delay: 120 });
-  assert.equal((await startCompletionPump(slow, { force: false })).pumped, false);
-  const fast = fakeDevice({ delay: 0 });
-  assert.deepEqual(await startCompletionPump(fast, { force: true }), { pumped: true, delayMs: null });
 });
