@@ -28,6 +28,33 @@ import { errorBinCentres, MAX_ERROR_BIN, NUM_BINS } from "../confidence/confiden
 import { backboneGeometry } from "../../../webgpu/af3/fold.js";
 
 /** Whether this browser can run the WebGL2 fold: WebGL2 that renders to float textures. */
+/**
+ * The renderer's name where this browser's WebGL2 is drawn on the CPU, else null.
+ *
+ * 🔴 A SOFTWARE RENDERER FOLDS HUNDREDS OF TIMES SLOWER, AND TO A READER IT LOOKS LIKE A HANG. Firefox on Linux
+ * draws WebGL on Mesa's llvmpipe when it has no usable GPU driver: a 4-block, 8-step AlphaFold 3 prefix that is
+ * 1.3 s on a GPU ran past ten minutes there at one core (docs/FIREFOX.md, "Linux"), and the page's own fold is
+ * twelve times that work. So the page refuses with the renderer's name rather than start (`foldBackend`).
+ * Firefox sanitises the name ("llvmpipe, or similar") and keeps the word that matters.
+ */
+export const SOFTWARE_RENDERER = /llvmpipe|lavapipe|softpipe|swiftshader|software|basic render/i;
+
+export function webgl2SoftwareRenderer(gl) {
+  const debug = gl.getExtension("WEBGL_debug_renderer_info");
+  const name = String(gl.getParameter(debug === null ? gl.RENDERER : debug.UNMASKED_RENDERER_WEBGL));
+  return SOFTWARE_RENDERER.test(name) ? name : null;
+}
+
+/** The renderer's name if WebGL2 here can fold but only on the CPU (see `webgl2SoftwareRenderer`), else null. */
+export function webgl2FoldIsSoftware() {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2");
+    return gl === null ? null : webgl2SoftwareRenderer(gl);
+  } catch {
+    return null;
+  }
+}
+
 export function webgl2FoldAvailable() {
   try {
     const gl = document.createElement("canvas").getContext("webgl2");

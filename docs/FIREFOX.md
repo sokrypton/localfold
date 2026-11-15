@@ -321,6 +321,19 @@ A100 to **26.4 GB** for a 1.74 GB count. Now a deleted texture takes its cached 
 through OpenGL (10.1 / 12.3 s, same pLDDT), and Mol-1 with the alignment folds on both at 4.9e-4 from WGSL. Every
 reader whose AF3-lineage WebGL2 fold evicts - any fold past ~180 residues, on any device - was holding it.
 
+### A software renderer is refused by name, and the no-WebGPU sentence is true on Linux
+
+Firefox for Linux draws WebGL on Mesa's **llvmpipe** when it has no usable GPU driver (it is the only renderer
+Firefox reaches under this box's Xvfb, whatever EGL/GLX vendor it is pointed at). There a 4-block, 8-step AF3 prefix
+- 1.3 s on the GPU - ran past ten minutes at one core and was stopped; the page's fold is twelve times that work.
+To a reader that is a hang. `foldBackend` (web/model.js) now refuses it with the renderer's name and what to do
+(`webgl2SoftwareRenderer`; `test/webgl2-software-renderer.test.js` holds the match against real renderer strings -
+Firefox's sanitised "llvmpipe, or similar", Chrome's ANGLE names, SwiftShader - and against GPUs, an AMD name
+that mentions LLVM included). Chrome on Mesa's llvmpipe (`LOCALFOLD_GPU_ANGLE=gl`) gets the same sentence; it
+could not fold there anyway (every first draw `0x8cdd`), and a stock Linux Chrome turns WebGL off rather than
+use it. The page with no GPU at all said WebGPU "ships in current Chrome, Edge, Safari and Firefox", which is not
+so for Firefox on Linux; it says so now.
+
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
 On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),
