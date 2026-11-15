@@ -254,6 +254,29 @@ on NVIDIA's OpenGL as on Vulkan (45 pass; the seven that do not are this A100's 
   96.34 / 96.32, Protenix-v2 84.78 / 84.78, RoseTTAFold3 81.53 / 81.52, OpenDDE 92.046 / 92.045, AlphaFold 2
   62.930 / 62.924, multimer 51.272 / 51.249, ESMFold2 73.347 / 73.346, BioEmu2 worst CA-CA 3.892 / 3.892.
 
+### Speed on that driver: a fresh texture is the cost, and the pool is sized from it
+
+A 262-residue AlphaFold 3 fold (48 + 4 blocks, 2 passes, 25 steps, single sequence) through WebGL2 on NVIDIA's OpenGL
+was **79 s** where the same draws through ANGLE's Vulkan on the same A100 are 10.6 s and WebGPU is 4.1 s; at 59
+residues the two WebGL2 paths were level (3.9 / 3.8 s), so it is not the arithmetic. The first draw into a texture
+nothing has written costs **0.86 ms a MiB** on that driver (110 ms for 128 MiB, 19 more to delete it) against 0.08
+through Vulkan - `texImage2D` and `texStorage2D` alike, and a clear of our own before the draw moves nothing, so it
+is the driver's allocation and not the browser's zeroing. At 262 tokens the pool's 512 MiB cannot hold one pairformer
+block's shapes, so every block created them again (8 blocks: 12.8 s at 512 MiB, 5.5 at 1 GiB, 3.1 from 1.5 GiB up,
+where nothing is fresh after the first block; Vulkan 1.9 -> 1.6).
+
+`freshTextureMsPerMiB` (webgl/af3/model/fold-batch.js) measures it when the context is made - 0.05 and 0.96 here,
+three readings each - and the pool is 2 GiB past 0.3, 512 MiB otherwise:
+
+| 262 residues, NVIDIA OpenGL | fold | peak |
+|---|---:|---:|
+| 512 MiB pool | 79 s | 1.74 GiB |
+| measured: 2 GiB | **12.1 s** | 3.2 GiB |
+
+Same pLDDT (27.546 - a single sequence), the 59-residue fold level and the same peak (3.87 / 3.79 s, 1.0 GiB).
+`fold-af3-webgl.js --pool-mib=512` is the arm without, and its report carries the measurement and the bound. What a
+Mac or a phone reads there has not been measured from here; under 0.3 they keep the 512 MiB they had.
+
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
 On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),

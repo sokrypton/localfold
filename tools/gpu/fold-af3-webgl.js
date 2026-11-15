@@ -57,7 +57,9 @@ import { createWebGL2Context } from "../../webgl/index.js";
 import {
   foldAf3, prepareFoldPrograms, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
 } from "../../webgl/af3/model/fold.js";
-import { AF3_HALF_WEIGHT_FLOOR, AF3_POOL_LIMIT_BYTES, foldMsa } from "../../webgl/af3/model/fold-batch.js";
+import {
+  AF3_HALF_WEIGHT_FLOOR, af3PoolLimitBytes, foldMsa, freshTextureMsPerMiB,
+} from "../../webgl/af3/model/fold-batch.js";
 import { DIFFUSION_DEFAULTS, foldBatch } from "../../webgpu/af3/fold.js";
 import { relativeRms } from "./relative-rms.js";
 import { modelAlphaCarbons, superpose } from "./superpose.js";
@@ -212,8 +214,10 @@ export async function main(device, args) {
 
   const gl = createWebGL2Context();
   // ...as the page's fold-batch.js builds it: a bounded texture pool (`--no-pool` is the arm without)
+  // ...its bound measured on this context as the page measures it (`--pool-mib=512` is the arm without)
+  const freshMsPerMiB = freshTextureMsPerMiB(gl);
   const execution = webglExecution(gl, args ?? [], {
-    pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, halfWeightFloor: AF3_HALF_WEIGHT_FLOOR,
+    pooling: true, poolLimitBytes: af3PoolLimitBytes(gl), halfWeightFloor: AF3_HALF_WEIGHT_FLOOR,
   });
   const uploadStart = performance.now();
   const uploaded = uploadAf3Weights(execution, weights);
@@ -596,6 +600,7 @@ export async function main(device, args) {
     },
     dialect: Object.fromEntries(
       Object.entries(dialect).filter(([, value]) => value === true)),
+    pool: { freshTextureMsPerMiB: Number(freshMsPerMiB.toFixed(3)), limitMiB: execution.storage.poolLimitBytes / 2 ** 20 },
     milliseconds: {
       load: loadMs, upload: uploadMs, prepare: prepareMs, fold: foldMs,
       ...(referenceMs === null ? {} : { reference: referenceMs }),
