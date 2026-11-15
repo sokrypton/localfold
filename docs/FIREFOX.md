@@ -238,6 +238,22 @@ LOCALFOLD_GPU_FIREFOX=1 node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.
 WebGPU; the adapter line then names the WebGL renderer. After the fix every `check-webgl-*` gate reads the same
 on NVIDIA's OpenGL as on Vulkan (45 pass; the seven that do not are this A100's own, identical on both).
 
+**A second pass for the same class (2026-11-15), nothing further found.**
+
+- *WebGL2 on NVIDIA's OpenGL against WebGPU, family by input* (`fold-af3-webgl.js --seams --recycles=1 --steps=25`):
+  AlphaFold 3, OpenBind-0, Boltz-2 and Protenix-v2, each single sequence, the 8076-row alignment, + GOL, two
+  chains, + a DNA chain and SEP@3, and IntelliFold-2 single - 25 folds, the trunk pair 7.1e-5 to 1.7e-4 from the
+  WGSL fold's in every one, the masks that are really zero (padding, a second chain, atom tokens) included.
+  RoseTTAFold3, Mol-1 and the rest of IntelliFold-2 were not run.
+- *No other shader sums a large constant into a live term*: the remaining ones are selects (`... ? x : -1e9`), a
+  clamp and a bin edge.
+- *Firefox's own WebGPU on Linux* is off in release 160 and a reader can turn it on
+  (`LOCALFOLD_FIREFOX_PREFS=dom.webgpu.enabled=true,gfx.webgpu.ignore-blocklist=true` with `LOCALFOLD_GPU_FIREFOX=1`;
+  wgpu over NVIDIA's Vulkan here). `probe-barrier-visibility.js` passes every shape, and each family folds at
+  stock-flag Chrome's numbers on the same card (pLDDT, Firefox / Chrome): AlphaFold 3 86.88 / 86.89, Boltz-2
+  96.34 / 96.32, Protenix-v2 84.78 / 84.78, RoseTTAFold3 81.53 / 81.52, OpenDDE 92.046 / 92.045, AlphaFold 2
+  62.930 / 62.924, multimer 51.272 / 51.249, ESMFold2 73.347 / 73.346, BioEmu2 worst CA-CA 3.892 / 3.892.
+
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
 On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),

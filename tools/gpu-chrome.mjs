@@ -457,6 +457,9 @@ async function main() {
       "browser.shell.checkDefaultBrowser=false", "browser.aboutwelcome.enabled=false", "app.update.enabled=false",
       "datareporting.policy.dataSubmissionEnabled=false", "toolkit.telemetry.reportingpolicy.firstRun=false",
       "browser.sessionstore.resume_from_crash=false", "dom.min_background_timeout_value=4",
+      // LOCALFOLD_FIREFOX_PREFS=key=value,...: Firefox for Linux ships WebGPU off, and a reader can turn it on -
+      // `dom.webgpu.enabled=true,gfx.webgpu.ignore-blocklist=true` is that browser (docs/FIREFOX.md, "Linux")
+      ...(process.env.LOCALFOLD_FIREFOX_PREFS ?? "").split(",").filter((line) => line !== ""),
     ].map((line) => { const [key, value] = line.split("="); return `user_pref("${key}", ${value});`; }).join("\n") + "\n");
   }
   const chrome = ANDROID ? null : FIREFOX !== null
