@@ -1511,15 +1511,41 @@ export function ignoreDevicePrior(device, keep = []) {
 }
 
 /**
+ * Who an adapter is when its `info` says nothing.
+ *
+ * 🔴 FIREFOX LEAVES `adapter.info` BLANK - vendor, architecture, device and description all "" (Firefox 160 on an
+ * M2) - so no prior matched and an Apple part ran as a device nobody had measured: AlphaFold 3's warm fold 5.2 s
+ * against 3.6 with metal-3's entry (docs/FIREFOX.md). What it does report is the adapter's FEATURES, and on a Mac
+ * ASTC texture compression is Apple silicon's alone: an Intel Mac's GPUs (Intel, AMD) have BC and no ASTC. The
+ * platform string is asked as well, because ASTC is also every phone's and a Windows-on-Arm part's, and those must
+ * stay unrecognised rather than take Apple's values. Every Apple silicon Mac is Metal 3.
+ *
+ * @param {Iterable<string> | undefined} features the adapter's
+ * @param {string | undefined} platform `navigator.platform`
+ * @returns {{vendor: string, architecture: string, inferred: true} | null}
+ */
+export function identityOfUnnamedAdapter(features, platform) {
+  if (!/^Mac/.test(String(platform ?? ""))) return null;
+  const offered = new Set(features ?? []);
+  if (!offered.has("texture-compression-astc")) return null;
+  return { vendor: "apple", architecture: "metal-3", inferred: true };
+}
+
+/**
  * Remembers what the adapter said about itself, so code holding only a
  * `GPUDevice` can still ask. Called by `requestAlphaFoldDevice`; a device
  * built any other way simply has no identity and gets the defaults.
  */
 export function recordAdapter(device, adapter) {
   const info = adapter?.info ?? {};
-  RECORDED.set(device, {
+  const named = {
     vendor: String(info.vendor ?? "").toLowerCase(),
     architecture: String(info.architecture ?? "").toLowerCase(),
+  };
+  const identity = named.vendor === "" && named.architecture === ""
+    ? (identityOfUnnamedAdapter(adapter?.features, globalThis.navigator?.platform) ?? named) : named;
+  RECORDED.set(device, {
+    ...identity,
     // 🔴 THE SHAPES ARE ONLY ON THE ADAPTER, and a kernel that wants them holds
     // a device. They are also WebIDL interfaces rather than plain objects, so
     // spreading or JSON-ing one yields `{}` - the fields have to be named. See
@@ -1796,7 +1822,13 @@ const WGSL_SUPPORT = new WeakMap();
  * creation in Firefox on a device that reports the feature (issue #10). A device that was never asked is taken
  * to accept it, which is what every device got before this existed.
  */
-export const recordWgslSupport = (device, support) => { WGSL_SUPPORT.set(device, { ...support }); };
+export const recordWgslSupport = (device, support) => {
+  WGSL_SUPPORT.set(device, { ...(WGSL_SUPPORT.get(device) ?? {}), ...support });
+};
+/** Whether this device's shader compiler is naga (Firefox), recognised by the bitcast it refuses. */
+export const compilerIsNaga = (device) => WGSL_SUPPORT.get(device)?.naga === true;
+/** Whether this device's compiler wants its constant-count loops unrolled (webgpu/runtime/wgsl-compat.js). */
+export const loopsUnrolledFor = (device) => WGSL_SUPPORT.get(device)?.unrollLoops === true;
 export const f16WidthBitcastAvailable = (device) => WGSL_SUPPORT.get(device)?.f16WidthBitcast !== false;
 
 /**

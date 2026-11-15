@@ -33,7 +33,8 @@
 import { createGridAttentionShaders, packGridAttentionWeights } from "./grid-attention.js";
 import { createTriangleShaders } from "../../kernels/triangle/shaders.js";
 import { createAttentionRegisterFlashShader } from "../../kernels/attention.js";
-import { deviceProfile, halfPrecisionAvailable, setDeviceTuning } from "../../runtime/device-profile.js";
+import { deviceProfile, halfPrecisionAvailable, setDeviceTuning, compilerIsNaga } from "../../runtime/device-profile.js";
+import { compilerText } from "../../runtime/wgsl-compat.js";
 
 const RACES = new WeakMap();
 const MEMORY = "localfold.gridAttendRace.v4";
@@ -51,6 +52,12 @@ export const gridAttendRaceDetail = (device) => DETAIL.get(device) ?? null;
 /** Whether this device should race at all: an Apple GPU with f16 that no prior or caller has answered for. */
 function wantsRace(device) {
   const profile = deviceProfile(device);
+  // 🔴 NOT IN FIREFOX, WHOSE CLOCK CANNOT CALL IT. Its pass timestamps read one kernel at 12.8 to 47.7 ms over six
+  // passes (Chrome: 9.09 to 9.34), and timed three passes to a stamp the arms are near ties that still fall either
+  // way - so the race answered differently on each page load, and a fold's kernels, its speed (1.8 to 3.3 s) and its
+  // last digits (pLDDT 68.74 to 68.88) went with it, for 2-4 s of racing. There the knobs stay unanswered, which is
+  // the form every kernel shipped in before the race existed (docs/FIREFOX.md; an M5 in Firefox is unmeasured).
+  if (compilerIsNaga(device)) return false;
   return profile.vendor === "apple" && !profile.software && profile.tuning.gridAttendTiled === null
     && profile.tuning.gridAttendTiledHalf === null && halfPrecisionAvailable(device);
 }
@@ -205,7 +212,7 @@ function prepareProject(device) {
       packed.offsets, 1e-5, "fast", { swapTransposedBias: false });
     const pipeline = await device.createComputePipelineAsync({
       label: `grid-project-race.${half ? "f16" : "f32"}`, layout: "auto",
-      compute: { module: device.createShaderModule({ code: project }), entryPoint: "main" },
+      compute: { module: device.createShaderModule({ code: compilerText(device, project) }), entryPoint: "main" },
     });
     return { half, pipeline, weightsLength: packed.data.length, groups: [Math.ceil(N * N / tiles.projectRows)], times: [] };
   }));
@@ -284,7 +291,7 @@ function prepareContract(device) {
       half ? { rows: 32, columns: 32, arithmetic: "f16" } : undefined);
     const pipeline = await device.createComputePipelineAsync({
       label: `tri-contract-race.${half ? "f16" : "f32"}`, layout: "auto",
-      compute: { module: device.createShaderModule({ code: contract }), entryPoint: "main" },
+      compute: { module: device.createShaderModule({ code: compilerText(device, contract) }), entryPoint: "main" },
     });
     return { half, pipeline, times: [],
              groups: [Math.ceil(N / contractTile.columns), Math.ceil(N / contractTile.rows), CHANNELS_RACED] };
@@ -316,8 +323,8 @@ function prepareGroup(device) {
   return Promise.all([1, 4].map(async (group) => {
     const pipeline = await device.createComputePipelineAsync({
       label: `attention-group-race.g${group}`, layout: "auto",
-      compute: { module: device.createShaderModule({
-        code: createAttentionRegisterFlashShader(headDim, undefined, { group, precision: "chunk16" }) }), entryPoint: "main" },
+      compute: { module: device.createShaderModule({ code: compilerText(device,
+        createAttentionRegisterFlashShader(headDim, undefined, { group, precision: "chunk16" })) }), entryPoint: "main" },
     });
     return { group, pipeline, times: [], groups: [Math.ceil(queries / 64), batch, heads] };
   }));
@@ -375,7 +382,7 @@ async function race(device) {
     const { attend, tiles } = shaders(tiled);
     const pipeline = await device.createComputePipelineAsync({
       label: `grid-attend-race.${tiled ? "tiled" : "untiled"}`, layout: "auto",
-      compute: { module: device.createShaderModule({ code: attend }), entryPoint: "main" },
+      compute: { module: device.createShaderModule({ code: compilerText(device, attend) }), entryPoint: "main" },
     });
     return { tiled, pipeline, groups: [Math.ceil(N / tiles.attendRows), N, HEADS], times: [] };
   }));

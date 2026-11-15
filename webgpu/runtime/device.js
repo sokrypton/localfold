@@ -14,6 +14,7 @@
 import { budgetForDevice, setMemoryBudget } from "./device-memory.js";
 import { recordAdapter, deviceTuning, deviceDerivationsAllowed } from "./device-profile.js";
 import { recordCompilerSupport } from "./wgsl-compat.js";
+import { startCompletionPump } from "./completion-pump.js";
 import { measureDeviceOccupancy } from "./occupancy.js";
 
 const RAISED_LIMITS = [
@@ -139,6 +140,9 @@ export async function requestAlphaFoldDevice(adapter, options = {}) {
   recordAdapter(device, adapter);
   // ...and what its WGSL compiler takes, which no feature states (webgpu/runtime/wgsl-compat.js)
   await recordCompilerSupport(device);
+  // ...and whether it is slow to say that work is done (Firefox: 100 ms a wait), in which case its waits are pumped
+  // (webgpu/runtime/completion-pump.js). `completionPump: false` is the arm without.
+  await startCompletionPump(device, options.completionPump === undefined ? {} : { force: options.completionPump });
   // 🔴 A DEVICE THAT ACCEPTS AN ALLOCATION IT CANNOT AFFORD FREEZES THE MACHINE.
   // Metal takes buffers well past the point where macOS starts paging, and a
   // phone's driver takes them and is then killed by the system - in neither
