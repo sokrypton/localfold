@@ -334,8 +334,31 @@ could not fold there anyway (every first draw `0x8cdd`), and a stock Linux Chrom
 use it. The page with no GPU at all said WebGPU "ships in current Chrome, Edge, Safari and Firefox", which is not
 so for Firefox on Linux; it says so now.
 
-🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
-browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
-On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),
-and a whole fold is refused loudly - a float render target is `FRAMEBUFFER_UNSUPPORTED` once ~480 MiB of weight
-textures are live. The reader's GPU is not known; an NVIDIA card is the one case shown to give their symptom.
+### Firefox itself on NVIDIA's OpenGL (2026-11-15)
+
+Under Xvfb Firefox reaches only llvmpipe, whatever it is told. A headless X server on the card does it (the NVIDIA X
+driver is installed; `AllowEmptyInitialConfiguration` and a virtual screen - not `UseDisplayDevice "None"`, which the
+driver refuses with a virtual display):
+
+```
+sudo Xorg :98 -config <xorg.conf: Device Driver "nvidia", BusID "PCI:6:0:0"> -noreset -ac -nolisten tcp &
+DISPLAY=:98 LOCALFOLD_GPU_FIREFOX=1 LOCALFOLD_FIREFOX_PREFS=webgl.sanitize-unmasked-renderer=false \
+  node tools/gpu-chrome.mjs tools/gpu/check-webgl-kernels.js --no-webgpu      # "NVIDIA A100-SXM4-40GB/PCIe/SSE2"
+```
+
+Firefox on Linux hands WebGL's shaders to the driver without ANGLE, a second compiler path, and it shows the defect
+the same way. Firefox 160 (with `dom.webgpu.enabled` for the seam arm's reference):
+
+| | `main` | this branch |
+|---|---|---|
+| `check-webgl-kernels.js` attention arms | 0.28-0.41 against 1e-5 | all 18 pass |
+| `fold-af3-webgl.js --seams`, against Firefox's WebGPU | trunk pair 1.38e-1, worst atom 8.77 A | 3.7e-4, 0.085 A |
+| 59 residues, whole fold, 25 steps | CA-CA 3.292 A - not a chain | 3.860 A, pLDDT 57.533 |
+| 262 residues, whole fold | CA-CA 2.835 A - not a chain | 3.885 A, pLDDT 27.546 |
+| card at 262 residues | 8.2 GB | 3.5 GB |
+
+The fixed folds are Chrome's on the same driver to the digit. A fresh texture is NOT expensive in Firefox (no
+ANGLE): 262 residues is 10.8 s before and 10.5 after, so the 79 s was Chrome's GL backend; the leak was Firefox's too.
+
+🔴 **What was not run.** Mesa on Intel or AMD hardware - none on this box, and no free cloud offers it. The reader's
+GPU is still not known; NVIDIA's OpenGL is the one driver shown to give their symptom, in both browsers.
