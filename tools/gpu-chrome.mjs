@@ -202,7 +202,9 @@ try {
   const device = await requestAlphaFoldDevice(adapter,
     { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_SPEC_FLOOR === "1" ? "spec"
       : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")},
-      withholdFeatures: ${JSON.stringify((process.env.LOCALFOLD_GPU_WITHHOLD ?? "").split(",").filter(Boolean))} });
+      withholdFeatures: ${JSON.stringify((process.env.LOCALFOLD_GPU_WITHHOLD ?? "").split(",").filter(Boolean))},
+      // LOCALFOLD_GPU_NO_PUMP=1: the waits as the browser gives them (webgpu/runtime/completion-pump.js's control arm)
+      ...(${JSON.stringify(process.env.LOCALFOLD_GPU_NO_PUMP === "1")} ? { completionPump: false } : {}) });
   if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1"
       || process.env.LOCALFOLD_SPEC_FLOOR === "1")}) {
     console.log("[gpu-chrome] portable limits: workgroup storage "
@@ -237,6 +239,28 @@ try {
     const { setDeviceTuning } = await import("/webgpu/runtime/device-profile.js");
     setDeviceTuning(device, { runtimeLoopBounds: false });
     console.log("[gpu-chrome] runtimeLoopBounds off for a benchmark");
+  }
+  // --rewrite-f16-bitcasts: compile what a compiler that refuses the f16 width bitcasts is handed (naga, so
+  // Firefox), in a browser that takes them - the arm that prices webgpu/runtime/wgsl-compat.js's rewrite alone.
+  if (${JSON.stringify(moduleArgs)}.includes("--rewrite-f16-bitcasts")) {
+    const { recordWgslSupport } = await import("/webgpu/runtime/device-profile.js");
+    recordWgslSupport(device, { f16WidthBitcast: false });
+    console.log("[gpu-chrome] f16 width bitcasts rewritten as for naga");
+  }
+  // --no-pool: every tensor a fresh (zeroed) buffer, never a recycled one, for any tool - a kernel that reads what it
+  // did not write then differs from the pooled run (webgpu/runtime/allocator.js's setBufferPooling; it leaks by design).
+  if (${JSON.stringify(moduleArgs)}.includes("--no-pool")) {
+    const { setBufferPooling } = await import("/webgpu/runtime/allocator.js");
+    setBufferPooling(false);
+    console.log("[gpu-chrome] buffer pooling off");
+  }
+  // --unroll-loops / --no-unroll-loops: the constant-count loops unrolled as for naga, or left as written in
+  // Firefox - the two arms of webgpu/runtime/wgsl-compat.js's withUnrolledLoops.
+  for (const [flag, unrollLoops] of [["--unroll-loops", true], ["--no-unroll-loops", false]]) {
+    if (!${JSON.stringify(moduleArgs)}.includes(flag)) continue;
+    const { recordWgslSupport } = await import("/webgpu/runtime/device-profile.js");
+    recordWgslSupport(device, { unrollLoops });
+    console.log("[gpu-chrome] loops " + (unrollLoops ? "unrolled" : "as written"));
   }
   const priorAs = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--prior="));
   if (priorAs !== undefined) {

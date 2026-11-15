@@ -109,6 +109,33 @@ export async function main(device, args) {
     pairWeightPrecision,
   });
   const actual = await stack.run(state, blocks, dialect, {});
+  // `--repeat=N`: the same blocks over the same input N more times in this process, each held to the first run
+  // element for element. One input and one set of pipelines, so any difference is the DEVICE's - a race or a read
+  // of something not written - and never precision. Firefox differed where Chrome did not (docs/FIREFOX.md).
+  const repeats = Number(option(args, "repeat", "0"));
+  if (repeats > 0) {
+    const differing = [];
+    for (let round = 0; round < repeats; round += 1) {
+      const again = await stack.run(state, blocks, dialect, {});
+      for (const [name, first, next, width] of [["pair", actual.pair, again.pair, pairChannels],
+        ["single", actual.single, again.single, singleChannels]]) {
+        let count = 0, worst = 0, at = -1;
+        const channels = new Set(), rows = new Set();
+        for (let index = 0; index < first.length; index += 1) {
+          if (first[index] === next[index]) continue;
+          count += 1;
+          channels.add(index % width); rows.add(Math.floor(index / width));
+          const gap = Math.abs(first[index] - next[index]);
+          if (gap > worst) { worst = gap; at = index; }
+        }
+        if (count > 0) {
+          differing.push({ round, name, count, of: first.length, worst, at, channels: channels.size, rows: rows.size,
+            firstRows: [...rows].slice(0, 6) });
+        }
+      }
+    }
+    return { n, blocks: count, repeats, same: differing.length === 0, differing };
+  }
 
   const pair = relativeRms(actual.pair, expected.pair);
   const single = relativeRms(actual.single, expected.single);

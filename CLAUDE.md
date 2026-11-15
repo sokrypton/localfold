@@ -1232,6 +1232,14 @@ the value from before the store in Firefox on Apple silicon, silently (every AF3
 AlphaFold 2 were NaN or not a chain) - have every lane fold the last partials itself; and **a bitcast that
 changes the element count across f16 is refused by naga**, rewritten for it in `webgpu/runtime/wgsl-compat.js`.
 `tools/gpu/probe-barrier-visibility.js` and `probe-wgsl-support.js` are the reproductions. See docs/FIREFOX.md.
+🔴 **AND IT WAS 4x SLOWER FOR THREE REASONS THAT ARE NOT ARITHMETIC** (AF3 warm fold 5.2 s -> 1.6, Chrome 1.33): its
+`adapter.info` is blank, so no prior matched (`identityOfUnnamedAdapter`); it reports finished GPU work on a 100 ms
+tick unless something is submitted (`webgpu/runtime/completion-pump.js`; `probe-readback-latency.js`); and every loop
+iteration costs 2.5-3.5x (`withUnrolledLoops`, short constant-count loops only; `probe-loop-cost.js`). 🔴 **AND A
+WORKGROUP ARRAY OVER 8 KiB COSTS EVERY WORKGROUP ~3 ns A BYTE THERE** (`probe-workgroup-init.js`: 2048 floats 0.98 ms,
+2052 floats 36) - ESMFold2's trunk 1.6x and OpenDDE 2.5x until `withSmallWorkgroupArrays` cut such arrays up. Its pass
+timestamps cannot separate two kernels, so the Apple startup race is skipped there - with it a fold changed from
+load to load. **A kernel compiled anywhere but the pipeline cache goes through `compilerText`.**
 
 🔴 **A RESIDENT SERVER IS NOT A FRESH PROCESS, AND EVERY cuda/*/gate.py FOLDS IN A FRESH PROCESS.** Three bugs of one
 class in a week, all invisible to per-process gates: AF2 holding an emitted LayerNorm in a SHARED scratch slot across

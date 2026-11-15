@@ -1,5 +1,5 @@
-import { deviceTuning, f16WidthBitcastAvailable } from "./device-profile.js";
-import { withoutF16WidthBitcasts } from "./wgsl-compat.js";
+import { deviceTuning } from "./device-profile.js";
+import { compilerText } from "./wgsl-compat.js";
 /**
  * What the pipeline cache was handed and threw away.
  *
@@ -38,7 +38,9 @@ const UPGRADE_QUIET_MS = 2000;
  */
 function compileNamed(device, label, moduleLabel, source, entryPoint) {
   // (the text a compiler without the f16 width bitcasts is given: webgpu/runtime/wgsl-compat.js)
-  const code = f16WidthBitcastAvailable(device) ? source : withoutF16WidthBitcasts(source);
+  // (the text this device's compiler is given - the f16 width bitcasts rewritten, the loops unrolled, each where it
+  // wants that: webgpu/runtime/wgsl-compat.js)
+  const code = compilerText(device, source);
   const module = device.createShaderModule({ label: moduleLabel, code });
   return device.createComputePipelineAsync({ label, layout: "auto", compute: { module, entryPoint } })
     .catch(async (cause) => {

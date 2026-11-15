@@ -9,8 +9,7 @@
  * Every kernel that folds its workgroup index (`wid.x + wid.y * 65535u`) guards it against the real count before
  * touching a buffer (AGENTS.md).
  */
-import { f16WidthBitcastAvailable } from "../runtime/device-profile.js";
-import { withoutF16WidthBitcasts } from "../runtime/wgsl-compat.js";
+import { compilerText } from "../runtime/wgsl-compat.js";
 
 const MAX_X = 65535;
 const STORAGE = 0x80;
@@ -2538,8 +2537,16 @@ export class Rfd4pEngine {
     if (!p) {
       // (and the f16 width bitcasts by their builtins where the compiler refuses them - Firefox's:
       // webgpu/runtime/wgsl-compat.js)
+      // 🔴 THESE KERNELS NEED `subgroups` AND FIREFOX HAS NONE. Every GEMM and LayerNorm here shares its row
+      // statistics by subgroupShuffleXor, so without the feature there is nothing to compile - and the browser's own
+      // refusal ("ShaderModule with 'rfd4p.gemm-...' label is invalid") names neither the feature nor the browser.
+      // Refused here, by name, until the kernels have a form without them (docs/FIREFOX.md).
+      if (source.includes('enable subgroups;') && this.device.features?.has?.('subgroups') !== true) {
+        throw new Error("RFD4-Proteina's kernels need WebGPU's `subgroups` feature, which this browser does not offer"
+          + ' (Firefox does not yet). Chrome on the same machine does.');
+      }
       const subgrouped = applySubgroupMode(source, this.subgroups);
-      const code = f16WidthBitcastAvailable(this.device) ? subgrouped : withoutF16WidthBitcasts(subgrouped);
+      const code = compilerText(this.device, subgrouped);
       p = this.device.createComputePipelineAsync({
         label: `rfd4p.${key}`,
         layout: 'auto',

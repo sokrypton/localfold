@@ -66,7 +66,12 @@ export function parseSafetensors(buffer) {
 //
 // A local `./model-rfd4p-int8` is still honoured first, so a developer who exported
 // their own shards is not forced through the network. See docs/DESIGN.md.
-export const RFD4P_PUBLISHED_BASE = 'https://sokrypton.github.io/rfd4-proteina-webgpu';
+//
+// 🔴 AND THE ADDRESS IS THE SITE'S OWN DOMAIN, NOT ITS github.io ONE. That repository took a custom domain, so
+// `sokrypton.github.io/rfd4-proteina-webgpu/...` answers 301 - and GitHub's redirect carries no
+// Access-Control-Allow-Origin, so a page on another origin is refused at the redirect and `fetch` throws "Failed to
+// fetch" with the weights sitting one hop away (found 2026-11-14: every RFD4 tool here died loading its manifest).
+export const RFD4P_PUBLISHED_BASE = 'https://web.rfd4-proteina.org';
 export const DEFAULT_LOCAL_WEIGHTS_URL = './weights/model.safetensors';
 export const DEFAULT_LOCAL_SHARDED_DIR = './model-rfd4p-int8';
 export const DEFAULT_LOCAL_CONFIG_URL = './model-rfd4p-int8/config.json';

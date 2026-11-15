@@ -11,7 +11,8 @@ Stock means `LOCALFOLD_STOCK_FLAGS=1`: no `chromium-experimental-subgroup-matrix
 
 ## 1. 🔴 This copy loads its weights from that site
 
-`shared/rfd4p/safetensors.js` falls back to `https://sokrypton.github.io/rfd4-proteina-webgpu/weights/int8` when
+`shared/rfd4p/safetensors.js` falls back to `https://web.rfd4-proteina.org/weights/int8` (that site's own domain - its github.io address redirects without
+CORS and a cross-origin fetch is refused there) when
 there is no local `./model-rfd4p-int8`. That site's owner has been told the path is a dependency. If RFD4 stops
 loading here, check that URL first: `manifest.json` and `shard_000.bin` should both answer 200.
 
