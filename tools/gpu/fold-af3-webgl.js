@@ -58,7 +58,7 @@ import {
   foldAf3, prepareFoldPrograms, releaseAf3Weights, SAMPLER_DEFAULTS, uploadAf3Weights,
 } from "../../webgl/af3/model/fold.js";
 import {
-  AF3_HALF_WEIGHT_FLOOR, af3PoolLimitBytes, foldMsa,
+  AF3_HALF_WEIGHT_FLOOR, af3PoolFollowsFold, af3PoolLimitBytes, foldMsa,
 } from "../../webgl/af3/model/fold-batch.js";
 import { DIFFUSION_DEFAULTS, foldBatch } from "../../webgpu/af3/fold.js";
 import { relativeRms } from "./relative-rms.js";
@@ -214,9 +214,11 @@ export async function main(device, args) {
 
   const gl = createWebGL2Context();
   // ...as the page's fold-batch.js builds it: a bounded texture pool (`--no-pool` is the arm without)
-  // ...its bound following the fold as the page's does (`--pool-mib=512` is the arm without)
+  // ...its bound following the fold as the page's does (`--pool-mib=512` is the arm without) - and on an Apple
+  // renderer the pool as it was, as the page's (`af3PoolFollowsFold`; `--any-fit --pool-mib=<n>` is the arm with)
   const execution = webglExecution(gl, args ?? [], {
-    pooling: true, poolLimitBytes: af3PoolLimitBytes(tokens, weights.trunk.embedder.pairChannels),
+    pooling: true, poolLimitBytes: af3PoolLimitBytes(tokens, weights.trunk.embedder.pairChannels, gl),
+    anyFit: af3PoolFollowsFold(gl),
     halfWeightFloor: AF3_HALF_WEIGHT_FLOOR,
   });
   const uploadStart = performance.now();

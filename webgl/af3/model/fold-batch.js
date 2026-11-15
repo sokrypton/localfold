@@ -76,8 +76,29 @@ export const AF3_POOL_LIMIT_BYTES = 512 * 2 ** 20;
  *
  * `fold-af3-webgl.js --pool-mib=512` and `--no-any-fit` are the arms without (docs/FIREFOX.md, "Linux").
  */
-export function af3PoolLimitBytes(tokens, pairChannels) {
+export function af3PoolLimitBytes(tokens, pairChannels, gl = null) {
+  if (gl !== null && !af3PoolFollowsFold(gl)) return AF3_POOL_LIMIT_BYTES;
   return Math.max(AF3_POOL_LIMIT_BYTES, 32 * tokens * tokens * pairChannels * 4);
+}
+
+/**
+ * Whether this context takes the pool above - any-fit reuse and a bound that follows the fold - or the pool as
+ * it was (exact match, 512 MiB). False on an Apple renderer.
+ *
+ * 🔴 ON METAL A FRESH TEXTURE IS CHEAP, SO THE BIGGER POOL BUYS NOTHING AND COSTS MEMORY. The same 262-token fold
+ * (48 + 4 blocks, 25 steps) on an M2 through ANGLE's Metal, seconds at GiB of peak:
+ *
+ *     exact match, 512 MiB          28.3 at 1.64      <- kept
+ *     any-fit, 512 MiB              30.9 at 1.96      (a taller texture under a shorter tensor is live bytes)
+ *     any-fit, bound follows fold   27.0 at 2.29
+ *
+ * and the answer is the same in all three. A reader folding in WebGL2 on Apple hardware has no WebGPU, which
+ * includes phones, where 0.65 GiB is the risk. `fold-af3-webgl.js --any-fit --pool-mib=<n>` is the arm with.
+ */
+export function af3PoolFollowsFold(gl) {
+  const debug = gl.getExtension("WEBGL_debug_renderer_info");
+  const renderer = String(debug === null ? gl.getParameter(gl.RENDERER) : gl.getParameter(debug.UNMASKED_RENDERER_WEBGL));
+  return !/Apple|Metal/i.test(renderer);
 }
 
 /**
@@ -99,9 +120,12 @@ let resident = null; // { weights, ready: Promise<uploaded> }
 /** The weights on the GPU, uploaded a module at a time with the thread let go in between. */
 function uploadedFor(weights) {
   // The configuration fold-af3-webgl.js gates against the WGSL fold: half weights and activations, a bounded pool.
-  execution ??= new Execution(createWebGL2Context(),
-    { halfWeights: true, halfActivations: true, int5Weights: true,
-      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, halfWeightFloor: AF3_HALF_WEIGHT_FLOOR });
+  if (execution === null) {
+    const gl = createWebGL2Context();
+    execution = new Execution(gl,
+      { halfWeights: true, halfActivations: true, int5Weights: true, anyFit: af3PoolFollowsFold(gl),
+        pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, halfWeightFloor: AF3_HALF_WEIGHT_FLOOR });
+  }
   if (resident?.weights !== weights) {
     const previous = resident;
     resident = {
@@ -185,8 +209,9 @@ export async function foldBatchWebGl2(batch, weights, options) {
   }
   const { tokens, dense } = batch;
   const uploaded = await uploadedFor(weights);
-  // ...the pool's bound follows the fold (`af3PoolLimitBytes`); a shorter fold after a long one evicts down to its own
-  execution.storage.poolLimitBytes = af3PoolLimitBytes(tokens, weights.trunk.embedder.pairChannels);
+  // ...the pool's bound follows the fold (`af3PoolLimitBytes`; not on an Apple renderer); a shorter fold after a long
+  // one evicts down to its own
+  execution.storage.poolLimitBytes = af3PoolLimitBytes(tokens, weights.trunk.embedder.pairChannels, execution.gl);
   const fold = await foldAf3Async(execution, {
     batch, weights: uploaded, hostWeights: weights,
     msa: foldMsa(batch, weights.trunk.dialect, options),

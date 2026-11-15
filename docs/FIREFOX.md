@@ -288,6 +288,12 @@ The whole 262-residue fold: **79 s -> 12.4 s** on NVIDIA's OpenGL and 10.9 -> 10
 same trunk seams against WGSL in every arm. `fold-af3-webgl.js --pool-mib=512 --no-any-fit` is the fold as it was.
 Any-fit alone does not make 512 MiB enough at that length: what a block frees is more than that.
 
+🔴 **And an Apple renderer keeps the pool as it was** (`af3PoolFollowsFold`, 2026-11-15). On an M2 through ANGLE's
+Metal a fresh texture is cheap, so the same 262-token fold (48 + 4 blocks, 25 steps) is 28.3 s at a 1.64 GiB peak
+with the exact-match 512 MiB pool, 30.9 s at 1.96 with any-fit under the same bound (a taller texture under a
+shorter tensor is live bytes) and 27.0 s at 2.29 with both rules - the same structure in all three, in Chrome and
+in Firefox with `--no-webgpu`. `fold-af3-webgl.js --any-fit --pool-mib=<n>` is the arm with, there.
+
 🔴 **What was not run.** Mesa on Intel or AMD hardware, and Firefox on a hardware driver: under Xvfb both
 browsers get Mesa's llvmpipe unless EGL is pointed at the vendor's, which Chrome takes and Firefox does not.
 On llvmpipe the kernel gates pass in Firefox and in Chrome before and after (Mesa does not reassociate this),
