@@ -335,6 +335,7 @@ export class Storage {
    * pool handed its targets textures of different heights.
    */
   retexture(tensor, rows) {
+    if (tensor.drawn === true) throw new Error(`${tensor.label}: a written tensor cannot change its texture`);
     const gl = this.gl;
     const half = tensor.half === true;
     const format = half ? "f16" : "f32";
@@ -619,6 +620,7 @@ export class Storage {
   #writeHalves(tensor, halves) {
     const gl = this.gl;
     const startedAt = performance.now();
+    tensor.drawn = true;   // it holds the host's values: `retexture` must never swap its texture
     gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height, gl.RGBA, gl.HALF_FLOAT, halves);
     this.timing.uploadBytes += halves.length * 2;
@@ -641,6 +643,7 @@ export class Storage {
       return out;
     })();
     const startedAt = performance.now();
+    tensor.drawn = true;   // it holds the host's values: `retexture` must never swap its texture
     gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
     if (tensor.half) {
       // Rounded HERE, to nearest and ties to even, rather than by handing f32
