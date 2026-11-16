@@ -11,7 +11,7 @@ import { readZip, writeZip } from "../web/zip.js";
  * `DecompressionStream` in 16.4; before that an MSA search ended in "This
  * browser cannot decompress the MMseqs2 result" - and the other two doors, a
  * dropped fold archive and a saved session, failed the same way for the same
- * reason. The decoder was already in the tree for the design page's `.cif.gz`.
+ * reason. A DEFLATE decoder was already in the tree.
  *
  * 🔴 AND THE ARM IS FORCED, BECAUSE IT RUNS NOWHERE ELSE. Node has the API and
  * so does every browser this repository is measured in, so the fallback is

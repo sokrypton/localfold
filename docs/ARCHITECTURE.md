@@ -1006,7 +1006,7 @@ is the measurement of, rather than the assertion.
 
 Asked after the reorganisation, and answered by counting rather than by
 impression. **817 tracked files, 0 untracked-but-unignored**; excluding
-`web/vendor/`, `web/public/`, `tools/fixtures/` and `oracle-dumps/` - data and
+`web/vendor/`, `web/public/` (since removed), `tools/fixtures/` and `oracle-dumps/` - data and
 other projects' code - **780**.
 
 | area | files | how each one is reached |
@@ -1106,6 +1106,12 @@ Two of the five are still exercised: `mutate.js` and `hydrophobicity.js` by
 explanation in its own header. A dead-code sweep would delete all four, because
 the evidence that nothing imports a file is not evidence that nothing needs it -
 the same trap as the WebGL2 kernels above, one directory over.
+
+**Settled 2026-11-16: the two pages are not coming back.** `main.js`,
+`viewer.js`, `mutate.js`, `hydrophobicity.js` and `plddt.js` were deleted with
+`test/mutate.test.js`, `test/hydrophobicity.test.js` and the mutation-panel
+case in `test/browser/webgpu.spec.js` (`hunter.js` had gone earlier) - a
+deliberate decision, not the sweep this paragraph warns against.
 
 🔴 **AND "NOTHING IMPORTS IT" AND "NO PAGE REACHES IT" ARE DIFFERENT QUESTIONS,
 which is worth stating because the first answer here was the wrong one of the

@@ -202,9 +202,9 @@ Nothing is written to disk and no `File` is manufactured. Extensions decide what
 
 🔴 **py2Dmol's own fetch panel is still in the page, hidden, and has to stay.** `app/main.js` binds listeners to `#fetch-id`, `#fetch-btn`, `#upload-button` and the option toggles during `initializeApp`, and one missing element throws inside `setupEventListeners` — which silently aborts the *rest* of `initializeApp`. The symptom is not an error message; it is that the MSA panel never wires itself up and a fold appears to hang. Hidden is safe. Deleted is not.
 
-`single.html` is the teaching version and is still LocalFold's own standalone page: one sequence, no alignment, click a residue in the structure to mutate it and re-fold, with the change morphed into the picture. It is next to move onto the same application.
+`single.html`, the teaching version (one sequence, no alignment, click a residue in the structure to mutate it and re-fold), was held back at `b0dc258` and retired on 2026-11-16 with `proteinhunter.html`; the modules only they loaded went with them.
 
-`index.html` loads `web/vendor/py2Dmol.full.min.js` (the `full` target: the website, the panels, *and* the embed API, since the morph needs `framesFromText`), vendored rather than fetched from a CDN so the page draws with no network access. `single.html` used to load the smaller `py2Dmol.embed.min.js`; that bundle is **no longer vendored**, because the page is held back and nothing in the tree loads it - `tools/sync-py2dmol.py` says in one line how to bring it back with the page. Confidence colouring is a single `setColor("plddt")` against py2Dmol's own AlphaFold ramp, read out of the B-factor column the PDB writer already fills.
+`index.html` loads `web/vendor/py2Dmol.full.min.js` (the `full` target: the website, the panels, *and* the embed API, since the morph needs `framesFromText`), vendored rather than fetched from a CDN so the page draws with no network access. `single.html` used to load the smaller `py2Dmol.embed.min.js`; that bundle is **no longer vendored**, because nothing in the tree loads it. Confidence colouring is a single `setColor("plddt")` against py2Dmol's own AlphaFold ramp, read out of the B-factor column the PDB writer already fills.
 
 `dev.html` is a kernel diagnostic and is not part of either page.
 
@@ -224,11 +224,6 @@ of py2Dmol's `src/app/style.css` and into the bundle, so a stale copy here would
 have styled the panel twice. **It is a straight copy of that file now** — the one
 local patch it used to carry, `box-sizing` and 948px on the canvas container, was
 upstreamed.
-
-`single.html` deliberately has none of this: it calls `py2Dmol.show` with `play:
-true` and no `controls`, which is the play-bar-only shell, and its control column
-is hidden. Asking for the panel there means asking for `controls: true`, which
-brings the Style panel, Capture and Orient with it.
 
 Styling: `web/localfold.css` holds only what LocalFold adds to py2Dmol's page, and **no rule in it uses a bare element selector**. `web/style.css` — the dark theme for the standalone pages — sets `body` and restyles `textarea, input, select` globally; loaded over py2Dmol's light application it keeps their layout while turning every text box black.
 

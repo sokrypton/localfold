@@ -3,8 +3,8 @@
  * Safari cannot parse (regex lookbehind before 16.4, class static blocks, ...) fails here instead of in a
  * visitor's browser, where one bad literal stops a whole module from loading. macOS only; skips elsewhere.
  *
- * From rfd4-proteina-webgpu, where one lookbehind in a library bundled by Mol* stopped its viewer on Safari 16.3
- * (docs/RFD4P-FROM-LOCALDESIGN.md section 5). Tests (`*.test.*`) are not shipped and are skipped.
+ * From rfd4-proteina-webgpu, where one lookbehind in a library bundled by Mol* stopped its viewer on Safari 16.3.
+ * Tests (`*.test.*`) are not shipped and are skipped.
  *
  *     npm run check:safari
  */

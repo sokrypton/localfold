@@ -696,7 +696,7 @@ function chainLetterAt(index) {
  * `bondedAtomPairs` - the one place this featuriser takes a bond, which `token_bonds` carries to the model. The ends
  * are the AlphaFold 3-lineage path's (web/entities.js expandEntities): an NHS-ester end to K NZ / S OG / T OG1 / Y OH
  * or residue 1's N, a diazirine end to the residue's last side-chain atom. The bridge's id is the first letter no
- * chain has. (cuda/featurise/bioemu2_features.h is the twin.)
+ * chain has. (cuda/cpp/featurise/bioemu2_features.h is the twin.)
  */
 function crosslinkChains(crosslinks, chains, bonds) {
   const used = new Set(chains.map((chain) => chain.id));

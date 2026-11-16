@@ -141,7 +141,7 @@ export function linkLine(a, b) {
 /**
  * LINK records for declared bonds over a PDB's own atom records - each end `[chain, residue, atom]` as the records
  * spell it (the chain letter in column 22) - for a writer that has no batch: BioEmu2's (shared/bioemu2/structure.js,
- * cuda/bioemu2/export_input.mjs). An end the records do not have is left out.
+ * tools/native-ref/bioemu2/export_input.mjs). An end the records do not have is left out.
  */
 export function pdbLinkRecords(records, bonds) {
   if (bonds === undefined || bonds.length === 0) return [];

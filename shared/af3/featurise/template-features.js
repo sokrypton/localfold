@@ -80,11 +80,11 @@ export const AF2_ATOM37 = { slots: 37, pseudoBeta: 3, backbone: [2, 1, 0] };
  * PDB atom name of each slot in AF2's 37-atom representation, in the
  * reference's own `atom_order`. Slots 0-4 are the backbone plus C-beta.
  *
- * 🔴 IT LIVES BESIDE THE LAYOUT IT DESCRIBES, NOT UNDER `design/`. It was in
- * `design/mpnn/constants.js`, which is where ProteinMPNN happened to need it
- * first - and importing it from here created an `af3 <-> design` cycle that
- * `test/no-import-cycles.test.js` refused. The table is AF2's, `mpnn/pdb.js`
- * re-exports it from here, and `AF2_ATOM37_MONOMER` below indexes into it:
+ * 🔴 IT LIVES BESIDE THE LAYOUT IT DESCRIBES. It was in the ProteinMPNN
+ * mirror's constants, which is where ProteinMPNN happened to need it first -
+ * and importing it from here created an `af3 <-> design` cycle that
+ * `test/no-import-cycles.test.js` refused. The table is AF2's, and
+ * `AF2_ATOM37_MONOMER` below indexes into it:
  * `pseudoBeta: 3` is CB and `backbone: [2, 1, 0]` is C, CA, N.
  */
 export const ATOM37 = [

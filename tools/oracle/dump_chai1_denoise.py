@@ -8,13 +8,13 @@
 (`token_pair_structure_input_feats`, chai1.py): relRMS 9.2 apart on 6MRR, measured on chai-lab's own tensors.
 Fixed there since (its c38fec3, model.Chai1StructurePair, 2.4e-7 from this file's structure_pair). This
 still hands the reference head chai's structure pair in that slot, so it reads the same on either side of it - built here from the bundle's
-`diffuser/chai1_structure_token_pair` weights (tools/export_chai1_structure_pair.py) - and the oracle is chai at
+`diffuser/chai1_structure_token_pair` weights (colabfold-cuda's dev/tools/export_chai1_structure_pair.py) - and the oracle is chai at
 that seam and af3-any-model everywhere else. `Z_STRUCT_OUT=<file.npy>` writes the structure pair too, for the check
 against chai-lab's captured diffusion input.
 
 The trunk's outputs (single, pair, the diffusion's target_feat) come from oracle-dumps/af3-oracle-trunk-chai1.json,
 so the step sees the conditioning a real fold would. Writes oracle-dumps/af3-oracle-denoise-chai1.json (inputs and
-output, at NOISE) and af3-oracle-stages-chai1.json (the head's seams), the formats cuda/af3/export-model.mjs reads.
+output, at NOISE) and af3-oracle-stages-chai1.json (the head's seams), the formats tools/native-ref/af3/export-model.mjs reads.
 """
 import os, sys, json, pathlib
 os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")

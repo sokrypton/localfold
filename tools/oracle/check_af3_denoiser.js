@@ -115,7 +115,7 @@ async function main() {
 
   const tokens = dump.tokens;
   const dense = 24;
-  // 🔴 DERIVED, NOT 9 - see check_af3_trunk.js. A constant here means the
+  // 🔴 DERIVED, NOT 9. A constant here means the
   // denoiser is only ever checked on the 12-token dump the number was taken
   // from, and silently reads a fraction of the atoms on anything larger.
   const shape = { tokens, dense, queries: 32, keys: 128,

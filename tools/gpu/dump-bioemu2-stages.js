@@ -1,5 +1,5 @@
 // webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a
-// cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
+// cuda/cpp/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 //
 //     node tools/gpu-chrome.mjs tools/gpu/dump-bioemu2-stages.js --job=/tools/fixtures/bioemu2/6mrr.json \
 //       [--model=/model-bioemu2-int5] [--sigmas=160,16,1,0.05] [--mode=structure]

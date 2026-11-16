@@ -3902,7 +3902,7 @@ SMILES ligand on the WebGPU port.
 weights - and on the full model in half to two thirds of its memory; on the 600M model upstream is lighter below
 ~500 tokens and ours above.** Upstream is biohub's `esm` at repo main, 3.4.1.post1 (`43b4548`,
 the speedups co-authored with Claude: the `fused` Triton kernels, the cuEquivariance backend, bf16 autocast),
-against `cuda/ef2/localfold-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
+against `cuda/cf-ef2` on this A100-SXM4-40GB. `tools/esmc/compare-upstream-esmfold2.py` produces every
 number below.
 
 **Same settings on both sides**: one diffusion sample, seed 1, the checkpoint's own sampler (fast 15 scheduled / 11
@@ -3942,7 +3942,7 @@ Command to structure, cold: upstream ~18 s (imports and the model load), ours 0.
 | 1TIM | 1.30 | 1.52 | **1.22** |
 
 Upstream's three backends agree within 0.02 A, and its default 0.3 dropout changes little. The two complexes the
-int5 bundle loses are its quantisation (cuda/ef2/README.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
+int5 bundle loses are its quantisation (cuda/dev/ef2.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
 the port matches or beats upstream on all four. The page ships int5 for its download; the native binaries could ship
 float32 (2.9 GB) or int8 instead.
 
@@ -3976,7 +3976,7 @@ tower resident as int8). Upstream's model load alone is 10.5 s; ours is 1.6-4 s 
 
 The same tool on a G4 session (RTX PRO 6000 Blackwell, sm_120, CUDA 13.0), upstream installed by
 `pip install "esm[fused,cueq] @ git+https://github.com/evolutionaryscale/esm"` - torch 2.11.0+cu130, triton 3.6,
-cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`localfold-ef2 warm`: its
+cuEquivariance 0.12.0, no flash-attention or xformers - and the port **timed warm too** (`cf-ef2 warm`: its
 resident server folds each case three times and the third is read; see below why the one-shot column is not that):
 
 | target | tokens | upstream PyTorch | upstream cuEquivariance | upstream fused | **ours, warm** | ours, one-shot |
@@ -4056,7 +4056,7 @@ fix to a cache cuda/ef2 never links (`triInGemmWeights` - the include graph said
 stopped reproducing on its own, and uninitialized device memory, ruled out by folding after filling the card with
 NaN. **Fixed in `447ed96`**; `LOCALFOLD_SLOW_UPLOAD_MS` makes the slow disk on demand (pLDDT 26 unfixed, byte-identical
 fixed), `test:standalone` holds a slow upload to a fast one, and `test/cuda-derived-caches.test.js` requires every
-device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/ef2/README.md, "Traps it cost".
+device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/dev/ef2.md, "Traps it cost".
 
 ### Upstream's own problems, met on the way
 
@@ -4078,7 +4078,7 @@ device-weight cache in cuda/ef2's include graph to register a forget hook. See c
 To reproduce: a Python 3.12 venv with `torch` from the cu128 index, `pip install "esm[fused,cueq12] @ git+https://github.com/evolutionaryscale/esm"`,
 then `pip uninstall cuequivariance-ops-torch-cu13 cuequivariance-ops-cu13` and `pip install cuequivariance==0.8.1
 cuequivariance-torch==0.8.1 cuequivariance-ops-cu12==0.8.1 cuequivariance-ops-torch-cu12==0.8.1 gemmi`, and `xformers`
-from the cu128 index; `--model` takes localfold-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
+from the cu128 index; `--model` takes cf-ef2's names (`ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2`), each defaulting to its
 upstream checkpoint (`--checkpoint=` overrides: biohub's `ESMFold2-Experimental-Fast-base600M-step1500k` for the site's), the full one
 `biohub/ESMFold2` (26 GB, fetched by `from_pretrained`).
 
@@ -4139,7 +4139,14 @@ passes it, and lands a backbone the denoiser shrank. Every failing arm above fai
 shorter.
 
 So the default stays Euler and a long input takes the per-atom floor, 64 scheduled (45 run): `ESMFOLD2_LONG_RESIDUES`
-(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/featurise/standalone.cpp and held together by
+(web/esmfold2-model.js), mirrored by python/localfold/worker.py and cuda/cpp/featurise/standalone.cpp and held together by
 test/esmfold2-atomised-steps.test.js. It costs the sampler's time only, which past that length is a few percent of a
 fold: 45 copies 785 ms of sampler (45 steps) against a 31 s trunk, the wall clock the same at 15 and 25. 45 copies
 through `cuda/ef2/fold` now: 0.6% out of band, median 3.78 (15.9% / 3.68 before).
+
+## Checkers of the confidence head that no gate runs (named 2026-11-16)
+
+Two differentials of ESMFold2's confidence head, run by hand when it changes (each header has its arguments):
+`node tools/check-esmfold2-confidence.js <head bundle> ...` holds the host reference to Synthyra's own head, and
+`node tools/gpu-chrome.mjs tools/gpu/check-esmfold2-confidence-gpu.js ...` holds the device head to that host
+reference.

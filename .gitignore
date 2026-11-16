@@ -67,7 +67,7 @@ natives
 
 # The AF2 distogram/pLDDT training set, written by
 # tools/gpu/probe-af2-dgram-plddt.js: 108 single-sequence targets over four
-# recycles, ~250 MB. Collected once and kept; see HANDOFF.md.
+# recycles, ~250 MB. Collected once and kept.
 /plddt-data/
 
 # ESM-C and ESMFold2, downloaded from Hugging Face by tools/esmc/fetch.py.
@@ -92,13 +92,6 @@ natives
 /model-esmfold2-*/
 /model-esmfold2-trunk-f32
 /esmfold2-fold.pdb
-
-# 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, not deleted. Both pages were
-# built against a model row that has moved under them; they stay on disk while
-# that is sorted out, and tools/build_site.py and tools/mobile-layout.py skip a
-# page they cannot find rather than failing on it.
-/single.html
-/proteinhunter.html
 
 # tools/gpu/bench-jaxjs-matmul.js wants @jax-js/jax's dist copied here.
 /.jaxjs-tmp
@@ -125,19 +118,8 @@ tools/_*.py
 # by using the page rather than by developing it.
 /py2dmol_state_*.json
 /_merge_state.json
-# af3-any-model's published blobs, fetched for the CUDA ports (cuda/featurise/fetch-weights <model>)
+# af3-any-model's published blobs, fetched for the CUDA ports (cuda/cpp/featurise/fetch-weights <model>)
 /af3am-*
-
-# the native featurisers (cuda/build.sh: one binary and the names linked to it)
-cuda/featurise/featurise
-cuda/featurise/*-featurise
-cuda/featurise/chem-probe
-cuda/featurise/resolve-templates
-cuda/featurise/fetch-weights
-cuda/featurise/msa-search
-cuda/featurise/standalone.o
-cuda/featurise/*.stamp
-cuda/featurise/*.building
 
 # the localfold wheel's build products (python/build_wheel.sh)
 python/dist/
@@ -145,13 +127,9 @@ python/build/
 python/localfold/site/
 python/*.egg-info/
 
-# wwPDB's whole chemical component dictionary (cuda/featurise/fetch-weights ccd)
-/ccd/
+# wwPDB's whole chemical component dictionary (cuda/cpp/featurise/fetch-weights ccd)
+/ccd
 
-# the Metal port (metal/build.sh): the kernel sources embedded as a string, and the binaries
-metal/build/
-metal/*/localfold-*
-metal/**/*.combined
 .localfold-fetch.lock
 oracle-dumps-colab/
 
@@ -159,16 +137,3 @@ oracle-dumps-colab/
 /model-bioemu2-f32
 /model-bioemu2-int5
 
-# RFD4-Proteina's INT8 shards: ~420 MB, hosted rather than committed, exactly as
-# the nine fold bundles are. The config and the tensor manifest beside them ARE
-# tracked - they are what the tests read and what says where a tensor lives.
-# 🔴 RENAMED FROM `weights/` ONCE THE HOSTING DECISION WAS MADE: the shards are
-# served by sokrypton/rfd4-proteina-webgpu's Pages URL and are never kept here,
-# so a top-level directory called `weights/` named something this repository
-# does not have. It matches the nine fold bundles' `model-*` convention now, and
-# holds only the config and the tensor manifest - text the tests read offline.
-model-rfd4p-int8/*.bin
-model-rfd4p-int8/*.safetensors
-model-rfd4p-int8/shards/
-# metal/rfd4p/gate.py's reference trajectories: a CPU forward per arm, gigabytes, rebuilt on demand
-/.rfd4p-gate/

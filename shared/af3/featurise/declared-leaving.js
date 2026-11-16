@@ -8,7 +8,7 @@
  * keeps - a protein's C-terminal OXT when the bond is at its C (a head-to-tail cyclic peptide), a nucleotide's 5' OP3
  * at its P. A modified residue mid-chain has lost its leaving atoms already (polymerResidue).
  *
- * cuda/featurise/featurise.h carries the twin (declaredBondLeaving); test:featurise holds the two to the same bytes.
+ * cuda/cpp/featurise/featurise.h carries the twin (declaredBondLeaving); test:featurise holds the two to the same bytes.
  */
 
 /** the atoms (indices into component.atoms) of the first `count` leaving groups at `centre`, within one part */

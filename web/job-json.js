@@ -604,8 +604,8 @@ function checkVersion(job, dialect) {
  * The templates an AlphaFold 3 job carries inline (a protein chain's `templates`), lifted OUT of
  * the parsed job - which the page's reader then reads without them - as `[slot k] -> [{text,
  * chain, label, mapping?}]`: chain i's k-th template in slot k, up to four a chain, `chain` the
- * polymer chain copy it belongs to. The native exporters build them (cuda/af3/export-model.mjs,
- * cuda/af2/export_input.mjs); cuda/featurise/job.h `jobFromJson(..., &lifted)` is the twin.
+ * polymer chain copy it belongs to. The native exporters build them (tools/native-ref/af3/export-model.mjs,
+ * tools/native-ref/af2/export_input.mjs); cuda/cpp/featurise/job.h `jobFromJson(..., &lifted)` is the twin.
  *
  * @param {object | object[]} raw the parsed job (or list of jobs, the first read), changed in place
  * @returns {object[][]}

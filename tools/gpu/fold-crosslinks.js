@@ -79,7 +79,7 @@ export async function main(device, args) {
   // a report, not a gate: whether the model closes every bond is the model's behaviour (af3x notes that crosslinks
   // which cannot all be satisfied get broken), and a single no-MSA sample is not a fair test of it. Measured
   // 2026-10-28, Boltz-2 int5, seed 1: 3 of 6 bonds under 2 A, every CA-CA pulled in (32.3/32.7/20.3 A ->
-  // 20.3/11.6/13.0 A), ipTM 0.10 -> 0.23 - and CUDA's int8 fold of the same job (cuda/af3/README.md) alike.
+  // 20.3/11.6/13.0 A), ipTM 0.10 -> 0.23 - and CUDA's int8 fold of the same job (cuda/dev/af3.md) alike.
   const formed = report.reduce((n, r) => n + (r.bond1 < 2.0) + (r.bond2 < 2.0), 0);
   console.log(`${formed} of ${2 * report.length} residue-bridge bonds under 2 A`);
   return { report, formed };

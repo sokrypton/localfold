@@ -32,7 +32,7 @@ Found by the M2's AF2 gate taking 7 minutes, `5caj-msa` alone 345 s. Profiled, t
 | `transition1 hhh_64x64_NN_k16_e8 1024x65536x256` | 1243 | 19019 |
 | the same qkvg kernel at `1024x130x256 batched` | 808 | 800 |
 
-Reproduced with no fold around it: `./metal/bench/localfold-bench 1024 66816 256 0 hhh 3` - **12.4 ms at base, 189 at
+Reproduced with no fold around it: `./metal/cf-bench 1024 66816 256 0 hhh 3` - **12.4 ms at base, 189 at
 HEAD**, `1024 1024 256` 0.29 against 2.64. Bisected with that command (`git bisect run`, threshold 60 ms) to
 **`5646656b` "Port gemmCouplingCombine to Metal Apple8"**, then file by file (only `gemm.metal`), then hunk by hunk
 (only the fifth hunk: the store section).
@@ -168,8 +168,8 @@ export, so every tool that opens the monomer by its registry name 404s (`test:st
 
 ```bash
 git pull --rebase origin opus-55-opt && bash metal/build.sh selftest bench af3 af2 ef2 bioemu2
-./metal/selftest/localfold-selftest                         # matrix units: every epilogue "ok", none "not taken"
-LOCALFOLD_GEMM_TENSOR=0 ./metal/selftest/localfold-selftest # Apple10 lf_gemm: the e64 cases still taken (Apple9+)
+./metal/cf-selftest                         # matrix units: every epilogue "ok", none "not taken"
+LOCALFOLD_GEMM_TENSOR=0 ./metal/cf-selftest # Apple10 lf_gemm: the e64 cases still taken (Apple9+)
 python3 metal/af2/gate.py && python3 metal/ef2/gate.py && python3 metal/af3/gate.py    # against gate-baseline.m5.json
 ```
 
@@ -187,10 +187,10 @@ dynamic - but nobody has measured it:
 ```bash
 git worktree add ../lf-pre 5e874012 && (cd ../lf-pre && bash metal/build.sh bench af2 af3 ef2 bioemu2)
 for r in 1 2; do for root in ../lf-pre .; do (cd $root && LOCALFOLD_GEMM_TENSOR=0 \
-  ./metal/bench/localfold-bench 1024 66816 256 0,64 hhh 7 | tail -2); done; done
+  ./metal/cf-bench 1024 66816 256 0,64 hhh 7 | tail -2); done; done
 # partial tiles - the per-row 8 x 8 store 5a48c897 removed: a row count that is not a multiple of 64
 for r in 1 2; do for root in ../lf-pre .; do (cd $root && LOCALFOLD_GEMM_TENSOR=0 \
-  ./metal/bench/localfold-bench 1024 66850 256 0 hhh 7 | tail -1); done; done
+  ./metal/cf-bench 1024 66850 256 0 hhh 7 | tail -1); done; done
 ```
 
 then AF2 6MRR, ESMFold2, Boltz-2 and BioEmu2 at 68 and 255 residues under `TENSOR=0`, the commands in

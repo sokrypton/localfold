@@ -1,4 +1,4 @@
-// The per-pass MSA draw (shared/af3/msa-draw.js), and the values its C++ twin (cuda/featurise/msa_draw.h) must give:
+// The per-pass MSA draw (shared/af3/msa-draw.js), and the values its C++ twin (cuda/cpp/featurise/msa_draw.h) must give:
 // cuda/af3 and metal/af3 draw with the twin, the page with this, and a seed has to name the same rows on all three.
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -23,7 +23,7 @@ test("each pass draws afresh, and a seed and pass name one draw", () => {
   assert.ok(seen.size > 4500, `${seen.size} rows seen in eleven passes`);
 });
 
-test("the values cuda/featurise/msa_draw.h gives (checked against the C++ when written)", () => {
+test("the values cuda/cpp/featurise/msa_draw.h gives (checked against the C++ when written)", () => {
   // [seed, pass, rows[0], rows[1], rows[1023], sum of rows[i] * (i + 1)] at 5630 rows and 1024 drawn
   const golden = [
     [0, 0, 4, 9, 5623, 1966111906], [0, 1, 3, 11, 5627, 1929997402], [42, 2, 2, 8, 5625, 1952192954],

@@ -337,7 +337,7 @@ export function extractMmseqs2A3m(tarBytes, useEnvironmental = true) {
  * MMseqs2 result" on every Safari before 16.4, which is where
  * `DecompressionStream` landed - so an MSA search on an older Mac ended with
  * nothing the reader could do, while this repository's own DEFLATE sat in the
- * tree for the design page. shared/input/inflate.js returns the same bytes;
+ * tree. shared/input/inflate.js returns the same bytes;
  * test/inflate-fallback.test.js folds the search both ways and compares.
  */
 async function decompressGzip(archive) {

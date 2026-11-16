@@ -1,6 +1,6 @@
 # The page: layout, templates, the archive, and the progress bar
 
-`index.html`, `single.html`, `web/`, and the tools that drive them -
+`index.html`, `web/`, and the tools that drive them -
 `tools/fold-in-page.py`, `tools/mobile-layout.py`, `tools/model-terms.py`.
 
 ## Templates, from the page
@@ -92,7 +92,8 @@ gives `Emulation.setDeviceMetricsOverride`, which is a true viewport at any
 width, plus `Page.captureScreenshot`, which `--screenshot` cannot do on a page
 with a running rAF loop. `tools/mobile-layout.py` runs 320, 360 and 390 with
 1200 as the control, loading a structure and an alignment first - half the rows
-it measures are `display: none` on a bare page. It checks `single.html` too.
+it measures are `display: none` on a bare page. (It checked `single.html` and
+`proteinhunter.html` too until those pages were retired on 2026-11-16.)
 
 🔴 **AND "NO HORIZONTAL OVERFLOW" IS NOT THE TEST.** Under mobile emulation a
 page that cannot fit does not overflow: the LAYOUT VIEWPORT GROWS, so
@@ -402,7 +403,8 @@ mirror has drifted. Never edit the mirror.
 plus the embed API and `embed` is the embed API alone, so `full` looks like a
 superset and is nearly one - but `index.html` loads `full` while `single.html`
 and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
-the three pages on a stale viewer.
+the three pages on a stale viewer. (Since retired with those two pages: only
+`full` is vendored now.)
 
 
 ## A token is not a position, and a modified residue is where they part
@@ -1731,10 +1733,8 @@ still there.
 derivation below still stands and still guards anything else that falls out of
 use; what follows is why it was written.
 
-`py2Dmol.embed.min.js` is loaded by `single.html` and `proteinhunter.html`, both
-**held back at `b0dc258`** - out of the repository and gitignored until the model
-row they were built against stops moving, with every tool that touches them
-skipping a page it cannot find. `web/` is copied wholesale, so their bundle
+`py2Dmol.embed.min.js` was loaded by `single.html` and `proteinhunter.html`, both
+**held back at `b0dc258`** and retired for good on 2026-11-16. `web/` is copied wholesale, so their bundle
 shipped on every deploy to be fetched by nobody: the second-largest file on a
 site Pages caps at a gigabyte.
 
@@ -1753,13 +1753,13 @@ from **`dist/`**, and the build says so.
 dist/  240 files, 23.0 MiB
 ```
 
-Derived for the reason the model registry is - the day `single.html` returns its
-bundle returns with it, with no edit here and nothing to forget. Verified both
+Derived for the reason the model registry is - a bundle that falls out of use
+leaves the site with no edit here and nothing to forget. Verified both
 ways: a stub `single.html` loading that bundle gives **242 files, 23.6 MiB** with
 the bundle present, and removing it again gives 240 and 23.0. `.md` is excluded
 from the search because `SOURCE.md` names every bundle by definition, and only
-top-level files are considered because `mpnn/kernels.wasm` is loaded from
-JavaScript rather than from a page.
+top-level files are considered because an asset loaded from JavaScript would
+live in a subdirectory.
 
 ## Do AlphaFold 3's own examples work? Nine of fourteen, and now that is measured
 
@@ -4049,9 +4049,9 @@ stamped with the card and a hash of the sources - and starts the broker with
 `--cuda`; a CUDA fold that arrives mid-build waits on it, saying so.
 
 🔴 **NOTHING ABOUT A MOLECULE IS DECIDED IN THE WORKER.** Each exporter reads
-the reader's AF3 JSON with the page's own reader (`cuda/af2/export_input.mjs`
+the reader's AF3 JSON with the page's own reader (`tools/native-ref/af2/export_input.mjs`
 gained `--job`); template rows go through the page's `expandEntities` and
-`fetchStructure` (`cuda/resolve_templates.mjs`); a "from the MSA search"
+`fetchStructure` (`tools/native-ref/resolve_templates.mjs`); a "from the MSA search"
 template is the search's best hit per chain, as the page takes it
 (`--template-search-chains` on both exporters); AF2's templates are aligned and
 merged by the page's `buildTemplate`/`mergeAtom37Templates` instead of mapped by
@@ -4237,7 +4237,7 @@ result). On a 15 GB T4 the half-full rule keeps about two.
 
 **On the T4 itself**, profiled on Colab: a 262-residue AF3 fold is 4.0 s, 91% trunk, and its grid attention's
 flash kernel ran at 3.5-6 TFLOP/s - no cp.async and 64 KB of shared memory on Turing. A register-staged
-form (cuda/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
+form (cuda/dev/af3.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
 output; the T4 is power-capped, so a busier kernel lowers the clock for the rest (AF2: the flash kernels
 -1.6 s, the GEMMs +0.8 s, the fold -3%).
 
@@ -4322,10 +4322,10 @@ phases. `test:native`'s page lane starts the broker without the browser flags.
 
 ## The CUDA backend featurises natively: no JavaScript on a fold (2026-10-08)
 
-Every CUDA fold used to start with Node: each port's exporter (`cuda/af3/export-model.mjs --no-weights`,
-`cuda/af2/export_input.mjs`, `cuda/ef2/export_input.mjs`) ran the page's own featuriser over the job, and
-`cuda/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
-their modules was most of an export. All four are C++ now, in `cuda/featurise` (`af3-featurise`, `af2-featurise`,
+Every CUDA fold used to start with Node: each port's exporter (`tools/native-ref/af3/export-model.mjs --no-weights`,
+`tools/native-ref/af2/export_input.mjs`, `tools/native-ref/ef2/export_input.mjs`) ran the page's own featuriser over the job, and
+`tools/native-ref/resolve_templates.mjs` resolved the template rows - kept resident by `cuda/export_server.mjs`, because loading
+their modules was most of an export. All four are C++ now, in `cuda/cpp/featurise` (`af3-featurise`, `af2-featurise`,
 `ef2-featurise`, `resolve-templates` - one binary linked as each name, built by `cuda/build.sh` with g++ beside
 the ports: four compiles of the same headers were ~60 s of CPU here and twice that on a two-core Colab VM, one is 26 s), and `python/localfold/worker.py`
 and the three `cuda/*/fold` scripts call them: **a job JSON goes in and a structure comes out with no JavaScript
@@ -4344,7 +4344,7 @@ Three things had to be exact for that, and each is worth knowing before touching
 
 - 🔴 **glibc is not V8.** V8's `Math.sin`, `cos`, `asin`, `acos` and `atan` are fdlibm 5.3 and differ from glibc's
   in the last place on 3-8% of arguments (measured on 200,000 each); a distance-geometry conformer turns one ulp into
-  a different molecule. `cuda/featurise/jsmath.h` ports V8's, with its Kahan-summed `hypot` and its `round`
+  a different molecule. `cuda/cpp/featurise/jsmath.h` ports V8's, with its Kahan-summed `hypot` and its `round`
   (ceil, less one unless ceil - 1/2 <= x), all 0 of 200,000 apart from Node; everything compiles with
   `-ffp-contract=off`, since a fused multiply-add is a different rounding. A SMILES conformer is then the page's to
   the last bit: 74 of 74 corpus molecules and 904 of 904 RDKit re-writings.
@@ -4353,7 +4353,7 @@ Three things had to be exact for that, and each is worth knowing before touching
   once differs in the last place.
 - 🔴 **The exporter's walk is the format.** `export-model.mjs` writes every typed array under the batch object in key
   order, a plain number array as float32, and an EMPTY array of anything as a float32 entry of length zero (so
-  `batch.ligandSpans` is in the index of a fold with no ligand); `cuda/featurise/entries.h` reproduces that walk.
+  `batch.ligandSpans` is in the index of a fold with no ligand); `cuda/cpp/featurise/entries.h` reproduces that walk.
 
 AF2's nearest-centre search went to the card on a two-CPU runtime (`--nearest`, docs/AF2.md); the native search is
 eight residues a 64-bit word on a thread a recycle - an 8000-row, 255-residue alignment featurises in 0.50 s against
@@ -4372,7 +4372,7 @@ job JSON through its `fold` script: boltz2 the four AF3 jobs (KRAS 13.1 s with i
 🔴 **AND NO WEIGHT MAP EITHER (2026-10-08).** `cuda/af3/maps/*.map` and `cuda/af2/maps/*.map` cached, per model, which
 slice of which bundle tensor each native weight is - written offline by a VALUE search over a float32 export
 (`cuda/make_map.mjs`, `cuda/af2/make_map.py`), so a re-exported bundle meant regenerating them by hand. The ports now
-WALK the bundle at load (cuda/featurise/af3_weights.h ports shared/af3/weights/; af2_weights.h derives AF2's from the
+WALK the bundle at load (cuda/cpp/featurise/af3_weights.h ports shared/af3/weights/; af2_weights.h derives AF2's from the
 manifest's parameter paths), handed its tensor names and shapes by `common.cuh`'s `loadBundle`; `--family=` names the
 dialect where `--map=` named a file. AF2's walk is byte-identical to all ten maps. AF3's is line-for-line the eight
 maps but where the value search had matched a coincidence (a zero or duplicate tensor under another name - values
@@ -4383,10 +4383,10 @@ boltz2, intellifold2 and rosettafold3 too, so every family's walk is exercised t
 
 ## 🔴 Each port is one binary: a job in, a structure out (2026-10-08)
 
-`cuda/af3/localfold-af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
-`cuda/af2/localfold-af2` and `cuda/ef2/localfold-ef2`: any first argument that is a flag selects it (cuda/featurise/standalone.h),
+`cuda/cf-af3 --job=kras.json --out=kras.pdb --model=boltz2` is the whole protocol in one process, and so are
+`cuda/cf-af2` and `cuda/cf-ef2`: any first argument that is a flag selects it (cuda/cpp/featurise/standalone.h),
 while a featurised directory first, and `--serve`, are the resident server the worker drives, unchanged. It fetches
-the model's published weights natively the first time (cuda/featurise/fetch.h - the registry's pinned remotes,
+the model's published weights natively the first time (cuda/cpp/featurise/fetch.h - the registry's pinned remotes,
 generated into `bundles.inc` from shared/bundles/manifests/index.js, and af3-any-model's blobs, AlphaFold 3's only once
 its terms are accepted), featurises on a thread while CUDA starts and the weights go up, and folds. The KRAS job
 through boltz2 is 1.6 s command to PDB on the A100 with the weights on disk.
@@ -4402,19 +4402,19 @@ the same PDB bytes as the two-step path, and was watched failing with one flag d
 ESMFold2's warm-up fold - while the featuriser binary searches MMseqs2 beside it; moving the featurisation into the
 server would serialise the two on every model's first fold. What changed there: it reads the featuriser's output
 live, so the page's status line now shows the search waiting (`MMseqs2 search · queued` / `running`), and it fetches
-weights through `cuda/featurise/fetch-weights`, the same code as the binaries. `cuda/fetch_bundles.py` is deleted -
+weights through `cuda/cpp/featurise/fetch-weights`, the same code as the binaries. `cuda/fetch_bundles.py` is deleted -
 and with it the notebook's background prefetch, which downloaded `model-af3-int5`, a WebGPU bundle the CUDA port has
 not read since it moved to af3-any-model's blobs (and prefetching that blob instead would fetch DeepMind's weights
 before the page's terms dialog was accepted). `test:native` passes with a bundle moved aside and re-fetched by the
 worker mid-gate, byte-identical to the moved copy.
 
-## 🔴 `localfold-af3`, `localfold-af2`, `localfold-ef2`; the language models in `cuda/plm` (2026-10-08)
+## 🔴 `cf-af3`, `cf-af2`, `cf-ef2`; the language models in `cuda/plm` (2026-10-08)
 
-The three binaries are named for a PATH - `cuda/af3/localfold-af3`, `cuda/af2/localfold-af2`, `cuda/ef2/localfold-ef2` -
+The three binaries are named for a PATH - `cuda/cf-af3`, `cuda/cf-af2`, `cuda/cf-ef2` -
 with a later `pip install localfold` in mind, and the ESMFold2 port is `cuda/ef2` beside `af3` and `af2`, its models
 `ef2-fast-600m`, `ef2-fast-300m`, `ef2-fast`, `ef2` (the keys the page and the worker already used; biohub's own
 checkpoint names stay where they name a checkpoint). Each takes `--help`; `--weights-dir=<dir>` replaces
-`LOCALFOLD_HOME`; `cuda/featurise/fetch-weights <model>` fetches by the same names, so `--af3-any-model` - which only
+`LOCALFOLD_HOME`; `cuda/cpp/featurise/fetch-weights <model>` fetches by the same names, so `--af3-any-model` - which only
 told the website's int5 bundles from af3-any-model's blobs of the same names, and nothing native reads the former - is
 gone. ESM-C and ESM2 3B live in `cuda/plm` as components (Chai-1 stays in the AF3 family; its network is AlphaFold 3's).
 Every fold is byte-identical across the renames and the move; `cuda/crosscheck.sh`, which compiled the ports with a
@@ -4422,7 +4422,7 @@ bare nvcc line that cannot link the standalone object, builds through `cuda/buil
 
 ## 🔴 A wheel: `pip install localfold`, no compiler (2026-10-08)
 
-`.github/workflows/wheel.yml` builds one `py3-none-manylinux_2_28_x86_64` wheel carrying `localfold-af3`, `-af2` and
+`.github/workflows/wheel.yml` builds one `py3-none-manylinux_2_28_x86_64` wheel carrying `cf-af3`, `-af2` and
 `-ef2` compiled for sm_75, 80, 86, 89, 90, 100 and 120 with sm_120's PTX for anything newer (`python/manylinux_build.sh`:
 CUDA 12.8 from NVIDIA's RHEL 8 repository inside pypa's manylinux_2_28 image, then `python/build_wheel.sh`). No GPU
 is needed to build it; its test job installs it on a GPU-less runner and checks every binary loads and answers
@@ -4440,7 +4440,7 @@ until then a `v*` tag runs it. Publishing to PyPI is not in it.
 
 A CCD code was fetched from the RCSB a component at a time (cached in `~/.cache/localfold/ccd`), so a new ligand needed
 the network. `--ccd=<components.cif[.gz]>` now names a local dictionary - wwPDB's whole one, which AlphaFold 3 installs
-already carry - and `fetch-weights ccd` (`localfold-fetch ccd` in the wheel) downloads it into the weights directory
+already carry - and `fetch-weights ccd` (`cf-fetch ccd` in the wheel) downloads it into the weights directory
 uncompressed (519 MB, ~6 s; a lookup is ~0.1 s mapped, where inflating the 114 MB .gz is ~3 s), where the binaries and
 the worker read it by default. 🔴 **A RUN THAT READS A DICTIONARY READS THAT ALONE**: a code it lacks is refused, never
 fetched, and its blocks never enter the per-component cache, so a custom dictionary cannot leak into a later run.

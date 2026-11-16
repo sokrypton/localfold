@@ -204,7 +204,7 @@ export function fusedTemplateEmbedding(input, weights, dialect) {
   // 🔴 EXCEPT boltz2's, WHOSE EMPTY SLOTS WEIGH NOTHING (the visibility above):
   // its TemplateV2Module divides by the templates it HAS, at least one - by
   // the slot count its one template reached the trunk at a quarter of native
-  // Boltz-2's amplitude. See cuda/af3/export-model.mjs.
+  // Boltz-2's amplitude. See tools/native-ref/af3/export-model.mjs.
   const present = visibility
     ? Math.max(1, (input.slots ?? []).filter((slot) => slot !== undefined && slot !== null).length)
     : templates;

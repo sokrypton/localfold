@@ -1,0 +1,6 @@
+[submodule "cuda"]
+	path = cuda
+	url = https://github.com/sokrypton/colabfold-cuda.git
+[submodule "metal"]
+	path = metal
+	url = https://github.com/sokrypton/colabfold-metal.git

@@ -7,15 +7,9 @@
  * (shared/input/mmseqs2-api.js), a fold archive's members are raw DEFLATE
  * (web/zip.js), and a saved session is gzip (web/fold-session.js). A reader
  * there was told "This browser cannot decompress the MMseqs2 result", which
- * reads as the page not working rather than as one missing API - and the
- * decoder was already in the tree, serving the design page.
- *
- * 🔴 AND FOR THE DESIGN PAGE IT IS NOT A FALLBACK. Upstream reads a condition
- * spec's `input:` as plain, gzip or Zstandard, and RCSB serves `.cif.gz`; that
- * structure path is synchronous end to end, which rules out
- * `DecompressionStream` whether or not the browser has it.
- * tools/check-rfd4p-load.py loads gzipped inputs through it against atomworks,
- * and test/inflate-fallback.test.js holds it to the browser's own decoder.
+ * reads as the page not working rather than as one missing API - and a
+ * decoder was already in the tree. test/inflate-fallback.test.js holds it to
+ * the browser's own decoder.
  *
  * Stored, fixed-Huffman and dynamic-Huffman blocks, and every member of a
  * multi-member gzip file.

@@ -111,7 +111,7 @@ The other `metal-3` values (`trianglePairProjectTile`, the f16 half tiles, `sing
 ### Step 1: correctness
 
 ```bash
-./metal/selftest/localfold-selftest          # the M2's GEMM is the shipped path here; nothing to force
+./metal/cf-selftest          # the M2's GEMM is the shipped path here; nothing to force
 python3 metal/af2/gate.py
 python3 metal/ef2/gate.py
 python3 metal/af3/gate.py
@@ -140,7 +140,7 @@ alternate them, after one untimed run of each:
 git worktree add ../lf-base 9b61f8b4 && (cd ../lf-base && bash metal/build.sh af2 ef2 af3 bioemu2)
 SEQ=GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE
 for r in 1 2 3; do for root in ../lf-base .; do
-  (cd $root && ./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep -E "^(trunk|sampler) ")
+  (cd $root && ./metal/cf-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep -E "^(trunk|sampler) ")
 done; done
 ```
 
@@ -165,10 +165,10 @@ both, or race the two forms at startup as `grid-attend-race.js` does.
 ### Step 4: Metal kernels in 3B
 
 ```bash
-for v in 1 0 1 0; do AF3_SCALAR_ATOM_ATTENTION=$v ./metal/af3/localfold-af3 --sequence=$SEQ --model=boltz2 --out=/tmp/x.pdb | grep total; done
-for v in 1 4 1 4; do LOCALFOLD_TRI_BLOCKS=$v ./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep trunk; done
-./metal/ef2/localfold-ef2 --sequence=$SEQ --out=/tmp/x.pdb --profile        # the ada_ln rows, against ../lf-base
-./metal/bioemu2/localfold-bioemu2 --sequence=$SEQ --samples=2 --out=/tmp/x.pdb --profile
+for v in 1 0 1 0; do AF3_SCALAR_ATOM_ATTENTION=$v ./metal/cf-af3 --sequence=$SEQ --model=boltz2 --out=/tmp/x.pdb | grep total; done
+for v in 1 4 1 4; do LOCALFOLD_TRI_BLOCKS=$v ./metal/cf-ef2 --sequence=$SEQ --out=/tmp/x.pdb | grep trunk; done
+./metal/cf-ef2 --sequence=$SEQ --out=/tmp/x.pdb --profile        # the ada_ln rows, against ../lf-base
+./metal/cf-bioemu2 --sequence=$SEQ --samples=2 --out=/tmp/x.pdb --profile
 ```
 
 An `ada_ln` kernel slower than `9b61f8b4`'s on the M2 takes its unrolled form only on Apple9+.
@@ -282,7 +282,7 @@ Pro to the M5's: same GPU family, same kernels, same order - only the fit check 
 `6mrr-x12-monomer` and fixed its cross-chain relpos: on the monomer every cross-chain pair took the multimer's row 65,
 which the monomer's weights have as zeros. Metal had the same bug - 55.97 pLDDT, 1.304 A; ported, 66.59 / 1.702 (CUDA
 69.09 / 1.788). The other six AF2 cases unchanged. WebGPU encodes chains as the +200 break and was never affected.
-Then `26c14ecf` (each chain's own query row in a single-sequence complex, through `cuda/featurise`, which Metal shares)
+Then `26c14ecf` (each chain's own query row in a single-sequence complex, through `cuda/cpp/featurise`, which Metal shares)
 took it to **79.11 / 1.033** (CUDA 79.29 / 0.917, ColabFold 80.7 / 0.97); the M5's baseline is that.
 
 ### Asks for the M2
@@ -295,7 +295,7 @@ python3 metal/bench/gate.py --write                  # records bench-baseline.m2
 python3 metal/bench/gate.py                          # ok at ~1.0x
 # ...and that it catches what it was built for - 5646656b's bench must FAIL against the M2's baseline:
 git worktree add ../lf-bad 5646656b && (cd ../lf-bad && bash metal/build.sh bench)
-python3 metal/bench/gate.py --bench=$PWD/../lf-bad/metal/bench/localfold-bench    # expect FAIL, ~15x
+python3 metal/bench/gate.py --bench=$PWD/../lf-bad/metal/cf-bench    # expect FAIL, ~15x
 git worktree remove --force ../lf-bad
 ```
 
@@ -303,7 +303,7 @@ git worktree remove --force ../lf-bad
 bench at 2x fails every arm, exit 1. So the gate's mechanics are checked; whether its shapes catch the M2's problem
 is the M2's to show.)
 
-Then the routine, once: `./metal/selftest/localfold-selftest`, `LOCALFOLD_LF_GEMM_EXT=1 ./metal/selftest/localfold-selftest`
+Then the routine, once: `./metal/cf-selftest`, `LOCALFOLD_LF_GEMM_EXT=1 ./metal/cf-selftest`
 (the e64 kernels stay correctness-tested on Apple8), the three answer gates, `python3 metal/bench/gate.py`.
 
 If 5646656b's bench does not fail, the shapes or the 1.3x are wrong for the M2 - say which arm moved and by how much

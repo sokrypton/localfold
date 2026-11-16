@@ -9,7 +9,7 @@
 `msa_encoder.*` tensors, fed the port's z_init and s_inputs (EF2_SAVE_ZINIT and its ".s") and the rows, deletions and
 column mask the port's encoder read (EF2_SAVE_MSA) - so the comparison is the encoder alone, in float32 on the CPU.
 EF2_DETERMINISTIC=1 takes the alignment's first rows and masks no column, which is what makes the rows reproducible.
-The deletion feature is (pi / 2) atan(d / 3), the vendor's transform (cuda/ef2/README.md).
+The deletion feature is (pi / 2) atan(d / 3), the vendor's transform (cuda/dev/ef2.md).
 """
 import argparse
 import math

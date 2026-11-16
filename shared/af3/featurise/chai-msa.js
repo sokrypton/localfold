@@ -14,7 +14,7 @@
  * 🔴 AND A QUERY-ONLY ALIGNMENT IS NO ALIGNMENT (ColabFold ebbd90d): with no row anywhere that is not a chain's own
  * query, chai-1 takes its single-sequence path, as it does with none - `applyChaiMsa` returns false.
  *
- * cuda/featurise/chai_msa.h is the native twin; test:featurise holds the two to the same bytes.
+ * cuda/cpp/featurise/chai_msa.h is the native twin; test:featurise holds the two to the same bytes.
  */
 
 const PROTEIN = "ARNDCQEGHILKMFPSTWYV";

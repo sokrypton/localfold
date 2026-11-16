@@ -258,7 +258,7 @@ found because 12 copies of 6MRR, single sequence, read pLDDT 50 where ColabFold 
   dropped each chain's query row). AlphaFold 2 itself collapses many copies on one row: ColabFold's own JAX, patched
   to one row, reads 21.8 at 30 copies, as did we.
 
-The second is in cuda/featurise, which metal links (`standalone.o`), so it reaches the M2 with no metal edit. The A100:
+The second is in cuda/cpp/featurise, which metal links (`standalone.o`), so it reaches the M2 with no metal edit. The A100:
 12 copies pLDDT **79.3** native, **79.1** on the page (WebGPU), ColabFold 80.7, ~0.9 A a chain. On the M2:
 
 ```
@@ -273,7 +273,7 @@ cuda/af2's gate gained `6mrr-x12-monomer` for this (69.1 -> 79.3); metal/af2/gat
 **3. ESMFold2's long-input step floor: 4fa29d9f.** Past 2,048 residues the checkpoint's 15 scheduled steps (11 run)
 leave the backbone SHORT - 45 copies (3,060 residues) had 15.9% of CA-CA outside 3.6-4.0 A, 60 copies 91.5% - so a
 long input now takes the per-atom floor, 64 scheduled (45 run), in the page, python/localfold/worker.py and
-cuda/featurise/standalone.cpp (which metal links). Euler is kept: the exponential update measured WORSE there at every
+cuda/cpp/featurise/standalone.cpp (which metal links). Euler is kept: the exponential update measured WORSE there at every
 count (docs/EF2FAST.md, "Long inputs" - it never passes the denoiser's shrunken answer, where Euler's 1.638 step
 overshoots it). Only if the M2 has the memory for it:
 
@@ -295,7 +295,7 @@ look at the M2's own ceiling.
 On the M2 (Apple8, 10 GPU cores, 16 GB, `recommendedMaxWorkingSetSize` 11.45 GB), at `6ac580e8`.
 
 🔴 **`bash metal/build.sh` WITH NO ARGUMENTS BUILDS ESMFold2 ALONE** (`ports=(ef2)` is its default), so the command
-above left `localfold-af2` and `localfold-af3` as they were and the first gate run measured the OLD binaries. Build
+above left `cf-af2` and `cf-af3` as they were and the first gate run measured the OLD binaries. Build
 what you mean to gate: `bash metal/build.sh ef2 af2 af3 selftest`. Everything below is on binaries rebuilt that way.
 
 **1. e573a0a2 compiles clean (no warnings) and does what it says.** All three gates pass on the rebuilt binaries -

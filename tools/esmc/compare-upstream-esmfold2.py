@@ -4,10 +4,10 @@
     <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=ef2 --loops=3,20           # ESMFold2
     <venv with esm>/bin/python tools/esmc/compare-upstream-esmfold2.py --model=ef2-fast --loops=3,20      # ESMFold2-Fast
 
---model takes localfold-ef2's own names; --checkpoint overrides the upstream checkpoint each one defaults to.
+--model takes cf-ef2's own names; --checkpoint overrides the upstream checkpoint each one defaults to.
 
 Upstream runs in this process (its fastest kernel backend, `fused`, unless --backends says otherwise) and
-`cuda/ef2/localfold-ef2` as a subprocess, on the same targets (the crystals in tools/fixtures) and settings: ONE
+`cuda/cf-ef2` as a subprocess, on the same targets (the crystals in tools/fixtures) and settings: ONE
 diffusion sample, seed 1, the checkpoint's own step count (fast 15 scheduled / 11 run, full 14), and upstream's extra
 `lm_dropout` OFF - the port has none; the full model's own per-loop dropout (0.25, part of the architecture) runs on
 both. Upstream is timed warm (each case once untimed, then timed, CUDA synchronised); the port reports its own stage
@@ -39,7 +39,7 @@ TARGETS = [("6mrr", ["A"]), ("1brs", ["A", "D"]), ("5caj", ["A"]), ("1tim", ["A"
 A3M = {"5caj": ["oracle-dumps/5caj-a.a3m"], "1tim": ["oracle-dumps/1tim-a.a3m"] * 2}
 
 
-# localfold-ef2's --model names -> upstream's checkpoint, and (the released two) the local exports the port reads
+# cf-ef2's --model names -> upstream's checkpoint, and (the released two) the local exports the port reads
 UPSTREAM = {"ef2-fast-600m": "biohub/ESMFold2-Experimental-Fast-base600M-step1500k",
             "ef2-fast-300m": "biohub/ESMFold2-Experimental-Fast-base300M-step1500k",
             "ef2-fast": "biohub/ESMFold2-Fast", "ef2": "biohub/ESMFold2"}
@@ -160,25 +160,24 @@ def ours_warm(args, cases, work):
     """the port timed WARM, as upstream is: its resident server (--serve, the Colab worker's mode) folds each case
     three times and the third fold's stage times are read - a one-shot binary since b7118c9 skips its warm-up when the
     input is already written, so its stage times carry every kernel's first launch (6MRR's trunk 128 ms cold, 39 warm)"""
-    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    binary = os.path.join(ROOT, "cuda", "cf-ef2")
     model = args.model
     if experimental(model):
-        r = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "fetch-weights"), model], capture_output=True, text=True)
+        r = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "fetch-weights"), model], capture_output=True, text=True)
         dirs = re.findall(re.escape(model) + r": (/\S+)", r.stdout + r.stderr)
-    else:                       # (the released models' bundles are local exports: cuda/ef2/README.md, "The released models")
+    else:                       # (the released models' bundles are local exports: cuda/dev/ef2.md, "The released models")
         r = subprocess.CompletedProcess([], 1, "", "no local export")
         dirs = [os.path.join(ROOT, RELEASED[model]), os.path.join(ROOT, "model-esmc-6b-int8")]
         dirs = dirs if all(os.path.isdir(d) for d in dirs) else []
     if len(dirs) != 2:
-        return [dict(side="localfold-ef2 warm", target=n, loops=l, error="fetch-weights: " + (r.stdout + r.stderr)[-160:])
+        return [dict(side="cf-ef2 warm", target=n, loops=l, error="fetch-weights: " + (r.stdout + r.stderr)[-160:])
                 for l in args.loop_list for n, *_ in cases]
     serve = os.path.join(work, "serve"); os.makedirs(serve, exist_ok=True)
     log = open(os.path.join(serve, "server.log"), "w")
     proc = subprocess.Popen([binary, "-", f"--fold-bundle={dirs[0]}", f"--esmc-bundle={dirs[1]}", "--fast", "--warm=96,800",
-                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                            env=dict(os.environ, EF2_PASSES=str(args.loop_list[0] + 1)))
-    if len(args.loop_list) > 1:
-        print("(the warm server takes the first --loops only)", flush=True)
+                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+    # (the trunk's passes are a fold flag, --passes=N, per job on a server too - colabfold-cuda's EF2_PASSES became it
+    # in 46f5323 and no variable is read since b351032)
     rows, count = [], 0
     def job(inputs, flags):
         nonlocal count
@@ -193,18 +192,18 @@ def ours_warm(args, cases, work):
         for loops in args.loop_list:
             for name, chains, seqs, a3ms in cases:
                 inputs = os.path.join(work, f"in-{name}")
-                f = subprocess.run([os.path.join(ROOT, "cuda", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs),
+                f = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "ef2-featurise"), inputs, "--sequence=" + ":".join(seqs),
                                     f"--fold-bundle={dirs[0]}"], capture_output=True, text=True)
                 if f.returncode != 0 or a3ms:
-                    rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, error=(f.stdout + f.stderr)[-160:] or "alignment"))
+                    rows.append(dict(side="cf-ef2 warm", target=name, loops=loops, error=(f.stdout + f.stderr)[-160:] or "alignment"))
                     continue
                 pdb = os.path.join(work, f"lfw-{name}-L{loops}.pdb")
                 peak = GpuPeak()
                 for k in range(3):
-                    code, said = job(inputs, [f"--out={pdb}", "--seed=1"])
+                    code, said = job(inputs, [f"--out={pdb}", "--seed=1", f"--passes={loops + 1}"])
                 peak.stop = True
                 stages = {m.group(1): float(m.group(2)) for m in re.finditer(r"^([a-z][a-z ]+?) ([0-9.]+) ms", said, re.M)}
-                rows.append(dict(side="localfold-ef2 warm", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
+                rows.append(dict(side="cf-ef2 warm", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
                                  rmsd=rmsd(pdb, name, chains) if code == 0 else None,
                                  **({} if code == 0 else {"error": said.strip()[-160:]})))
                 print(json.dumps(rows[-1]), flush=True)
@@ -216,21 +215,21 @@ def ours_warm(args, cases, work):
 
 
 def ours(args, cases, work):
-    binary = os.path.join(ROOT, "cuda", "ef2", "localfold-ef2")
+    binary = os.path.join(ROOT, "cuda", "cf-ef2")
     rows = []
     for loops in args.loop_list:
         for name, chains, seqs, a3ms in cases:
             pdb = os.path.join(work, f"lf-{name}-L{loops}.pdb")
             cmd = [binary, f"--model={args.model}", "--sequence=" + ":".join(seqs),
-                   "--seed=1", f"--out={pdb}"] + ([f"--a3m={','.join(os.path.join(ROOT, a) for a in a3ms)}"] if a3ms else [])
+                   "--seed=1", f"--passes={loops + 1}", f"--out={pdb}"] + ([f"--a3m={','.join(os.path.join(ROOT, a) for a in a3ms)}"] if a3ms else [])
             peak = GpuPeak()
             t = time.time()
-            r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, EF2_PASSES=str(loops + 1)))
+            r = subprocess.run(cmd, capture_output=True, text=True)
             wall = time.time() - t
             peak.stop = True
             said = r.stdout + r.stderr
             stages = {m.group(1): float(m.group(2)) for m in re.finditer(r"^([a-z][a-z ]+?) ([0-9.]+) ms", said, re.M)}
-            rows.append(dict(side="localfold-ef2", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
+            rows.append(dict(side="cf-ef2", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
                              command_s=wall, rmsd=rmsd(pdb, name, chains) if r.returncode == 0 else None,
                              **({} if r.returncode == 0 else {"error": said.strip()[-160:]})))
             print(json.dumps(rows[-1]), flush=True)
@@ -239,7 +238,7 @@ def ours(args, cases, work):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--model", choices=list(UPSTREAM), default="ef2-fast-600m", help="localfold-ef2's --model")
+    p.add_argument("--model", choices=list(UPSTREAM), default="ef2-fast-600m", help="cf-ef2's --model")
     p.add_argument("--checkpoint", default="", help="upstream's checkpoint (default: the model's own, UPSTREAM)")
     p.add_argument("--loops", default="", help="comma-separated; default 3")
     p.add_argument("--backends", default="fused", help="upstream kernel backends: none, fused, cuequivariance")
