@@ -329,3 +329,11 @@ Default, so a Default fold is byte for byte what it was). Rows are kept in the a
 cap always took them; ESMFold2's encoder still subsamples past its bundle's 1024 when more are left. Held JS-native by
 `tools/check-native-featuriser.py --only=max-msa`; measured: ubiquitin on the page 4092 rows -> 16, and natively on
 Metal a 30-row alignment -> 5 for both BioEmu2 and ESMFold2 (`msa encoder ... (5 rows)`).
+
+## The native featuriser's and steering's parity gates (named 2026-11-16)
+
+Not in any npm script, so run by hand when either side changes:
+`node tools/check-native-bioemu2.mjs` (cuda/cpp/featurise/bioemu2_features.h against the JavaScript featuriser,
+byte for byte, over `tools/fixtures/bioemu2/heteromer.json`, `smiles.json` and `rna-dna.json`) and
+`node tools/check-native-bioemu2-steering.mjs` (cuda/cpp/bioemu2/src/steer.h against the JavaScript's steering and
+af3-any-model's). Each builds its probe binary unless handed one with `--probe=`.

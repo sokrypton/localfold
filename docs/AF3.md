@@ -6929,3 +6929,9 @@ same input). Unreachable while every trunk read 1024 rows. CUDA and Metal now ho
 1024 rows - the contraction scaled by 2^-k, the f32 projection by 2^k, k <= 4 - which is exact and moves nothing at or
 under 1024 rows (4,096 rows: pLDDT 68.99 before and after). The page sums a k step in f16 and accumulates in f32, with
 the count applied before its f16 output GEMM, so it has no such sum to overflow.
+
+## Checkers of shipped code that no gate runs (named 2026-11-16)
+
+`node tools/gpu-chrome.mjs tools/gpu/check-af3-sampler-gpu.js --steps=20` - AF3's diffusion sampler on the GPU,
+asked whether it folds anything at all (not a differential: the walk depends on a PRNG draw). Run it by hand when
+the sampler changes; the oracle-level answer is `check-af3-denoise.js`.

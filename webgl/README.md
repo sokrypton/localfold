@@ -3262,6 +3262,55 @@ three control arms for the optimisations above: `--no-linear-block`, `--no-trian
 `--no-triangle-coalesce`, `--no-triangle-transpose`, `--no-half-weights` and `--no-int5-weights`
 (which nest: dropping the codes falls back to float16, dropping both to float32).
 
+### The per-stage checkers and probes, by name
+
+Each is run as `node tools/gpu-chrome.mjs tools/gpu/<name>` and states its own arms in its header; a
+checker compares one WebGL2 stage against the WGSL stage or the CPU reference it names. None is in a
+gate list, so each is run by hand when its stage changes. Listed here so they can be found from this
+file and not only from `docs/TOOLS.md`.
+
+| checker | what it checks |
+|---|---|
+| `check-webgl-af3-atom-block.js` | AF3's atom cross-attention block in WebGL2 against `cpu/af3/diffusion/atom-encoder.js`. |
+| `check-webgl-af3-atom-conditioning.js` | AF3's per-atom conditioning in WebGL2 against `cpu/af3/diffusion/atom-conditioning.js`. |
+| `check-webgl-af3-atom-encoder.js` | AF3's atom cross-attention encoder in WebGL2 against `cpu/af3/diffusion/atom-encoder.js`. |
+| `check-webgl-af3-block-bundle.js` | WebGL2's pairformer block on a REAL bundle's block - any family, any stack - against cpu/af3/trunk/pairformer.js. |
+| `check-webgl-af3-confidence.js` | AF3's confidence head in WebGL2 against `cpu/af3/confidence/confidence.js`. |
+| `check-webgl-af3-diffusion-conditioning.js` | AF3's diffusion conditioning in WebGL2 against `cpu/af3/diffusion/diffusion.js`. |
+| `check-webgl-af3-diffusion-head.js` | AF3's whole diffusion head - one denoising step - in WebGL2 against `cpu/af3/diffusion/diffusion.js`. |
+| `check-webgl-af3-diffusion-transformer.js` | AF3's 24-block diffusion transformer in WebGL2 against `cpu/af3/diffusion/diffusion.js`. |
+| `check-webgl-af3-embedder.js` | AF3's trunk embedder in WebGL2, against TWO references. |
+| `check-webgl-af3-sampler.js` | AF3's diffusion sampler in WebGL2: a whole walk, against the f64 reference's. |
+| `check-webgl-af3-template.js` | AF3's template embedder in WebGL2, against TWO references. |
+| `check-webgl-af3-trunk.js` | AF3's whole trunk in WebGL2 against `cpu/af3/trunk/trunk.js`. |
+| `check-webgl-attention-block.js` | The whole attention block in WebGL2 against the WGSL block and a CPU reference - the cross-API differential this backend's attention has lacked. |
+| `check-webgl-confidence.js` | pLDDT, PAE and pTM in WebGL2 against the WGSL confidence head. |
+| `check-webgl-distogram.js` | The contact map in WebGL2 against the shipped host reference. |
+| `check-webgl-esmfold2-atom.js` | ESMFold2's atom transformer in WebGL2 against `cpu/esmfold2/atom-transformer.js`. |
+| `check-webgl-esmfold2-diffusion.js` | ESMFold2's diffusion head in WebGL2 against `cpu/esmfold2/diffusion.js`. |
+| `check-webgl-geometry.js` | Atom coordinates against the WGSL geometry stage. |
+| `check-webgl-input-embedder.js` | The input embedder against the WGSL one - three embeddings and the recycle. |
+| `check-webgl-ipa.js` | Invariant point attention against the WGSL one. |
+| `check-webgl-multimer-block.js` | AF2-MULTIMER's two block kinds in WebGL2 against the WGSL multimer block. |
+| `check-webgl-multimer-template.js` | AF2-MULTIMER's template embedder in WebGL2 against the WGSL one. |
+| `check-webgl-sidechain.js` | The sidechain torsion head against the WGSL one. |
+| `check-webgl-structure-initialize.js` | The structure module's starting point, against the WGSL one. |
+| `check-webgl-structure-iteration.js` | One structure-module iteration against the WGSL one - and the frame update is the point of it. |
+| `check-webgl-structure-module.js` | AF2's whole structure module in WebGL2 against the WGSL one. |
+| `check-webgl-template.js` | AF2-monomer's template stack in WebGL2 against the WGSL one. |
+| `check-webgl-transition.js` | The transition in WebGL2 against the WGSL one and a CPU reference. |
+
+| probe | what it asks |
+|---|---|
+| `probe-webgl-af3-programs.js` | Which of the WebGL2 AF3 fold's programs depend on the sequence length: the programs a fold draws with (`foldPrograms`, a dry run, no draws) at several lengths, and the kernels whose source differs between them - each of which a page compiles again for every new length. |
+| `probe-webgl-column-layout.js` | Which activation order, and which OUTPUT order, does the WGSL attention block use when `transpose` is set? |
+| `probe-webgl-linear-shapes.js` | `linear` at given shapes against a float64 host product - in-major weights, with and without kept planes, a residual and a multiplier - to place a shape-dependent fault in one projection. |
+| `probe-webgl-upload-compile.js` | Can the WebGL2 AF3 fold's shader compile hide behind its weight upload? The programs found by a dry run on a VIRTUAL upload (shapes, no textures - so before any real upload), then: the real upload alone; the real upload with those programs compiled between its pieces (each piece's GPU wait); and the programs alone. Hidden means upload-with-compile < upload + compile. |
+
+Two are not run on their own: `af2-synthetic-structure.js` (synthetic AF2 structure-module weights and
+geometry tables, for `check-webgl-structure-module.js`) and `af3-synthetic-head.js` (a synthetic AF3
+diffusion head, for `check-webgl-af3-diffusion-head.js` and `check-webgl-af3-sampler.js`).
+
 ## Making it selectable
 
 Two lines: `tools/build_site.py`'s `DIRECTORIES` does not copy this tree, so it is not on the site;

@@ -4143,3 +4143,10 @@ So the default stays Euler and a long input takes the per-atom floor, 64 schedul
 test/esmfold2-atomised-steps.test.js. It costs the sampler's time only, which past that length is a few percent of a
 fold: 45 copies 785 ms of sampler (45 steps) against a 31 s trunk, the wall clock the same at 15 and 25. 45 copies
 through `cuda/ef2/fold` now: 0.6% out of band, median 3.78 (15.9% / 3.68 before).
+
+## Checkers of the confidence head that no gate runs (named 2026-11-16)
+
+Two differentials of ESMFold2's confidence head, run by hand when it changes (each header has its arguments):
+`node tools/check-esmfold2-confidence.js <head bundle> ...` holds the host reference to Synthyra's own head, and
+`node tools/gpu-chrome.mjs tools/gpu/check-esmfold2-confidence-gpu.js ...` holds the device head to that host
+reference.

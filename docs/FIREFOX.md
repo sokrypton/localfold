@@ -362,3 +362,12 @@ ANGLE): 262 residues is 10.8 s before and 10.5 after, so the 79 s was Chrome's G
 
 🔴 **What was not run.** Mesa on Intel or AMD hardware - none on this box, and no free cloud offers it. The reader's
 GPU is still not known; NVIDIA's OpenGL is the one driver shown to give their symptom, in both browsers.
+
+## Comparing two browsers' batches (named 2026-11-16)
+
+`tools/gpu/probe-batch-digest.js` digests the featurised AF3 batch field by field, so the same model's batch can be
+compared between two BROWSERS - the batch is built on the host, so it is the JavaScript engine's (V8 against
+SpiderMonkey):
+
+    node tools/gpu-chrome.mjs tools/gpu/probe-batch-digest.js --model=/model-openbind0-int5/manifest.json
+    LOCALFOLD_GPU_FIREFOX=1 node tools/gpu-chrome.mjs tools/gpu/probe-batch-digest.js --model=...
