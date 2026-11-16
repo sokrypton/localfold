@@ -7,7 +7,7 @@
  * 🔴 AF2 HAS NO OFFICIAL-VALUE GATE ON THIS MACHINE and this is the second
  * hole it fills, after tools/gpu/check-triangle-residual.js. `npm run test:gpu`
  * cannot load Dawn here, and `test/fixtures/evoformer/` is gitignored, so
- * test/evoformer-transition.gpu.test.js cannot run - which leaves the kernel
+ * its Dawn test could not run (deleted 2026-11-16) - which leaves the kernel
  * that is 31 ms of AF2's 118 ms block at 512 MSA rows with nothing checking it.
  *
  * The reference is LayerNorm, a linear with ReLU, and a linear - written here

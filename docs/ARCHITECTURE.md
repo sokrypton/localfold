@@ -1006,7 +1006,7 @@ is the measurement of, rather than the assertion.
 
 Asked after the reorganisation, and answered by counting rather than by
 impression. **817 tracked files, 0 untracked-but-unignored**; excluding
-`web/vendor/`, `web/public/`, `tools/fixtures/` and `oracle-dumps/` - data and
+`web/vendor/`, `web/public/` (since removed), `tools/fixtures/` and `oracle-dumps/` - data and
 other projects' code - **780**.
 
 | area | files | how each one is reached |

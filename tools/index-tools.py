@@ -95,8 +95,8 @@ def header_line(path: Path) -> str | None:
         if match:
             return _first(match.group(2))
         # 🔴 ELSE A RUN OF LEADING `#` LINES, WHICH THE .js BRANCH BELOW HAS ALWAYS ACCEPTED AND THIS ONE DID
-        # NOT. Fourteen tracked tools in tools/ppi-bench open with `# <name>.py <args>: what it does` - a header
-        # line saying what the tool is, which is exactly what this gate asks for - and every one of them was
+        # NOT. Fourteen tools in tools/ppi-bench (since moved out of the tree) opened with `# <name>.py <args>: what
+        # it does` - a header line saying what the tool is, which is exactly what this gate asks for - and every one was
         # reported as having no header at all, with the advice to "add a docstring" that was advice to rewrite a
         # header already there. The gate was red on committed files for as long as they have existed, which also
         # blocked `--write` and so blocked indexing any NEW tool. Same shape as the shebang note below: a reader

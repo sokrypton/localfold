@@ -7,11 +7,10 @@
  * 🔴 THIS IS THE ONLY OFFICIAL-VALUE GATE FOR AF2 THAT CAN RUN ON THIS MACHINE.
  * `npm run test:gpu` cannot: the Dawn node binding fails to load here - "built
  * for macOS 26.0 which is newer than running OS" - and it never has, which is
- * why tools/gpu-chrome.mjs exists. Worse,
- * test/evoformer-attention.gpu.test.js, the per-kernel attention check, names a
- * fixture that is not in the repository at all
- * (evoformer/model1-query-59-block0), so it could not run even with Dawn
- * working. The stack fixture beside it IS checked in, and a whole-stack
+ * why tools/gpu-chrome.mjs exists. Worse, the per-kernel attention check
+ * (evoformer-attention's Dawn test, deleted 2026-11-16) named a fixture
+ * that was never in the repository (evoformer/model1-query-59-block0), so it
+ * could not run even with Dawn working. The stack fixture beside it IS checked in, and a whole-stack
  * comparison is the stronger gate anyway: it is 48 blocks of every kernel
  * against the reference implementation's output rather than one kernel against
  * one stage.

@@ -219,7 +219,7 @@ test("every source path named in python, yaml, html or markdown exists", () => {
     if (existsSync(root)) walkAny(root, files);
   }
   for (const loose of ["index.html", "dev.html", "package.json",
-                       "CLAUDE.md", "AGENTS.md", "README.md", "HANDOFF.md"]) {
+                       "CLAUDE.md", "AGENTS.md", "README.md"]) {
     if (existsSync(join(ROOT, loose))) files.push(join(ROOT, loose));
   }
   assert.ok(files.length >= 20, `walked ${files.length} non-JS files`);

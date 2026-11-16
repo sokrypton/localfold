@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-521 tools. `tools/fixtures/` is data and is not listed.
+483 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (300)
+## `tools/gpu/` - the WebGPU lane (289)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -59,7 +59,6 @@ Each exports `async function main(device, args)` and is run as
 - **`bench-webgl-upload.js`** - What it costs to get weight bytes into a WebGL2 texture, and to read any back.
 - **`bench-webgl2-matmul.js`** - What WebGL2 can ACTUALLY do for a matmul on this device.
 - **`bench-webgl2-tf-matmul.js`** - A WebGL2 matmul through TRANSFORM FEEDBACK, which has four times the fragment path's output budget.
-- **`bench-weights.js`** - How long the AF3 checkpoint takes to reach usable Float32Arrays, and why.
 - **`bioemu2-dump.js`** - tools/oracle/dump_bioemu2.py's dumps, in a browser: every array is {shape, dtype, b64}, little-endian float32 or int32 (tools/bioemu2-dump.js is the node twin).
 - **`bond-geometry.js`** - Are a predicted structure's BONDS the right length - mainchain, sidechain, peptide and ligand, scored separately?
 - **`buffer-profile.js`** - Where a fold's time goes when it is NOT in a compute pass.
@@ -128,10 +127,8 @@ Each exports `async function main(device, args)` and is run as
 - **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
-- **`check-recovery.js`** - WebGPU device-loss recovery in the studio: destroy the device mid-generation and between runs; the failed run must say the GPU was reset, and the next Generate must succeed on a new device (web/app.js `_watchDevice`).
 - **`check-smiles-conformer-gpu.js`** - Does the device's conformer refinement compute the host's? And is it faster?
 - **`check-staged-matrix.js`** - Does the staged matrix projection compute what createLinearShader computes, in every buffer precision, with and without the residual, on ragged shapes?
-- **`check-structure-core.js`** - The eight-iteration structure core: what it computes, and what it costs.
 - **`check-subgroup-matrix-shapes.js`** - Which subgroup matrix shapes does THIS device offer, and what do the type parameters mean at a shape where the two readings differ?
 - **`check-subgroup-matrix.js`** - What do subgroupMatrixLoad and subgroupMatrixStore actually mean?
 - **`check-transition-split.js`** - The transition as three passes against the transition as one.
@@ -219,12 +216,10 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-batch-digest.js`** - A digest of the featurised AF3 batch, field by field - to compare two BROWSERS, not two models.
 - **`probe-bf16.js`** - Is bfloat16 available in WGSL, and would it beat the f16 storage already here?
 - **`probe-binding-ceiling.js`** - At what chain length does this fold stop BINDING, and which dispatch decides?
-- **`probe-budget.js`** - When a fold does not fit, does it slow down or give up?
 - **`probe-bus.js`** - What the host-device bus actually costs, in each direction.
 - **`probe-compiles.js`** - Where any tool's first run spends its SHADER COMPILATION, by wrapping another tool rather than by being one.
 - **`probe-confidence-kernels.js`** - Which kernel of the CONFIDENCE head's pairformer stops computing its reference - the trunk's own stack being the control.
 - **`probe-contract-f16.js`** - The triangle contraction in f16 arithmetic at several lane blocks, against the shipped 8 x 8 f32 kernel - the measurement behind webgpu/kernels/triangle/shaders.js's f16 contraction (outgoing, f32 channel-major a and b, uniform inputs; unscaled, so it also shows the precision the scaled shipped kernel has where nothing overflows).
-- **`probe-denoiser.js`** - Ask the diffusion head what it predicts from NOTHING.
 - **`probe-designed-binder-sampler.js`** - Which sampler configuration folds a DESIGNED BINDER onto its target?
 - **`probe-dispatch-aliasing.js`** - Does any dispatch bind the SAME buffer range twice?
 - **`probe-dispatch.js`** - What a dispatch costs before it computes anything.
@@ -239,7 +234,6 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-head-stages-vs-af3.js`** - Where inside the diffusion head does a REAL protein start to disagree?
 - **`probe-head-vs-af3-steps.js`** - Our denoiser against AF3's, at every noise level AF3's own sampler visited.
 - **`probe-kernel.js`** - Which attention kernel this device gets, and why.
-- **`probe-latency.js`** - Why the kernels sit at 270 billion instructions a second and the probe says 640: what the machine is waiting for, one variable at a time.
 - **`probe-ligand-flow.js`** - Where does a ligand's geometry actually resolve, and how few steps after it?
 - **`probe-limits.js`** - What is the largest protein this device can hold, and where does it stop?
 - **`probe-live-buffers.js`** - Every buffer a fold actually creates, against what the memory budget counts.
@@ -252,12 +246,9 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-nucleic.js`** - Does a folded DNA or RNA chain have the right chemistry, and is it a chain?
 - **`probe-occupancy.js`** - How many workgroups this device runs at once, measured.
 - **`probe-opendde-kernels.js`** - Which pair-track kernel stops computing its reference at OpenDDE's widths.
-- **`probe-opendde-target-feat.js`** - WHICH COLUMNS of OpenDDE's `target_feat` disagree with af3-any-model?
-- **`probe-opendde-template.js`** - OpenDDE's TEMPLATE EMBEDDER against af3-any-model, on a query with NO template.
 - **`probe-pack.js`** - What the diffusion transformer's FIRST call actually spends, and on what.
 - **`probe-pae-esmfold2.js`** - The same per-pair features as probe-pae-from-distogram.js, off EF2-fast.
 - **`probe-pae-from-distogram.js`** - Can a PAE matrix be predicted from a distogram and a structure?
-- **`probe-paired-search.js`** - Does the PAIRED MMseqs2 search work for a two-entity complex?
 - **`probe-platform.js`** - What this browser offers a numerical workload, beside WebGPU itself.
 - **`probe-progress-bar.js`** - Does the bar move at the speed the fold actually runs at?
 - **`probe-readback-latency.js`** - How long this browser takes to tell a page that GPU work is done: a trivial submit awaited three ways (onSubmittedWorkDone, mapAsync of a buffer the submit copied into, and both), each ten times.
@@ -306,9 +297,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-worker-overlap.js`** - Can the sampler's host work hide behind the GPU, in a Worker?
 - **`probe-workgroup-init.js`** - What a workgroup pays for the workgroup memory it DECLARES, whatever it uses: one kernel that touches 64 floats of a `var<workgroup>` array, with the array declared at 64 to 8192 floats, timed on the GPU's clock.
 - **`profile-af2-block.js`** - Per-kernel GPU time inside one AF2 evoformer block.
-- **`profile-af2-template.js`** - Per-kernel GPU time inside one AF2 TEMPLATE pair block.
 - **`profile-bioemu2.js`** - Where webgpu/bioemu2's time goes on a real input: the trunk by wall clock, the denoiser call per dispatch.
-- **`profile-esmc-block.js`** - Where does an ESM-C block's time actually go?
 - **`profile-webgl-af3-head.js`** - Where a real-shape AF3 denoiser call spends its time in WebGL2.
 - **`profile.js`** - Per-pass GPU time, by wrapping the device rather than editing the kernels.
 - **`relative-rms.js`** - One relative-RMS, guarded, because fifty-five tools each wrote their own.
@@ -319,28 +308,22 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 - **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.
 
-## `tools/oracle/` - the reference side (58)
+## `tools/oracle/` - the reference side (45)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
 
 - **`af3-bundle.js`** - Reading an AF3 export and an oracle dump, for the block checkers.
-- **`alphafold2_confidence.py`** - DeepMind's `predicted_tm_score`, the one RFD4-Proteina's AF2 worker scores a chain and a chain pair with.
 - **`bench_af3_native.py`** - Native AlphaFold 3 on this box, at settings LocalFold can actually match.
 - **`check_af3_atom.js`** - Check every per-atom conditioning embedding against AF3, term by term.
 - **`check_af3_block.js`** - Run our AF3 pairformer block against the oracle's, with the real weights.
 - **`check_af3_confidence.js`** - Check the confidence head against AF3: pLDDT, PAE and PDE.
 - **`check_af3_denoiser.js`** - Run one AF3 denoising step and compare the coordinates it produces.
-- **`check_af3_diffusion_conditioning.js`** - Check the diffusion head's conditioning against AF3.
-- **`check_af3_embedder.js`** - Run the embedder and the whole MSA stack, and compare against AF3.
 - **`check_af3_featurise.js`** - Check the JavaScript featuriser against AF3's own batch, array by array.
 - **`check_af3_msa_block.js`** - Run our AF3 MSA block against the oracle's, with the real weights.
 - **`check_af3_sampler.js`** - Check the sampler's arithmetic against AF3, exactly.
-- **`check_af3_stack.js`** - Run the whole 48-block pairformer stack and watch the error accumulate.
-- **`check_af3_target_feat.js`** - Build target_feat from chemistry and check it against AF3.
 - **`check_af3_template.js`** - Check the template embedder against AF3, on a protein with NO templates.
 - **`check_af3_template_geometry.js`** - Check the template embedder against AF3 with a REAL TEMPLATE in slot 0.
-- **`check_af3_trunk.js`** - Run AF3's whole trunk and compare the pair, the single and the distogram.
 - **`check_esmfold2_confidence_real.py`** - Synthyra's ConfidenceHead on OUR REAL trunk output, not on seeded normals.
 - **`check_opendde_confidence_real.py`** - af3-any-model's OpenDDE ConfidenceHead on OUR REAL trunk output.
 - **`dump_af3_atom.py`** - Dump AF3's atom-cross-attention LAYOUT, so the four atom checkers have an oracle.
@@ -356,7 +339,6 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_template.py`** - Dump a model's TEMPLATE EMBEDDER - its features, its inputs and its output.
 - **`dump_af3_trunk.py`** - Run the AF3 trunk on a toy protein, on CPU, and dump inputs and outputs.
 - **`dump_af3_trunk_taps.py`** - af3-any-model's whole TRUNK on the real 6MRR batch, stage by stage.
-- **`dump_af3_tx_supers.py`** - af3-any-model's token transformer at a TRUNCATED depth, for a bisect.
 - **`dump_batch_cpu.py`** - Dump the RFD4-Proteina *input pipeline* batch on CPU (no model, no GPU).
 - **`dump_bioemu2.py`** - BioEmu2's features and every stage of its network, from af3-any-model's own port.
 - **`dump_bioemu2_steering.py`** - BioEmu2's steered samplers on a toy denoiser, from af3-any-model's port.
@@ -371,17 +353,11 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
 - **`dump_rfd4p.py`** - Dump a deterministic RFD4-Proteina oracle from the upstream PyTorch code.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
-- **`dump_truncated.py`** - One evoformer block on each side, so a difference has one place to live.
-- **`embedder_reference.py`** - The embedder's pair init, computed straight from the inputs and weights.
-- **`oracle-io.mjs`** - Node helpers for reading RFD4-Proteina oracle dumps (`tools/oracle/dump_rfd4p.py`) and the released checkpoint, and for comparing tensors.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
-- **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
 - **`regen_batch_dumps.py`** - Re-dump every reference batch tools/check-batch-fields.js reads, from the af3-any-model installed in ~/.venv-lfjax.
-- **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
 - **`run_chai_lab.py`** - Genuine chai-lab 0.6.1 on one sequence, every exported module's inputs and outputs recorded - Chai-1's oracle.
 - **`score_modified_cif.py`** - Score a modified residue's own bonds in a predicted mmCIF.
 - **`template_reference.py`** - AF2-multimer's template embedder, in numpy.
-- **`triangle_reference.py`** - AF2's fused triangle multiplication on the toy pair, as a reference.
 
 ## `tools/esmc/` - ESM-C and ESMFold2 export (22)
 
@@ -411,7 +387,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (141)
+## `tools/` - everything else (127)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -476,8 +452,6 @@ go through CDP, and the deploy.
 - **`check-template-path.mjs`** - Every AF3-lineage model's TEMPLATE actually moves its fold.
 - **`check_remote_bundle.py`** - Is every shard a manifest names actually at the remote, at the right length?
 - **`chem-probe.mjs`** - The page's chemistry over SMILES on stdin, one line each - cuda/cpp/featurise/chem_probe.cpp's twin, for tools/check-native-featuriser.py.
-- **`compare-rfd4p-mlx-weights.py`** - This tree's int8 RFD4-Proteina trunk against bios-labs' MLX fp16 trunk, tensor by tensor.
-- **`contact-map-dividers.py`** - Does the contact map get its chain divider lines while a fold is running?
 - **`convert_multimer_params.py`** - Normalise AF2 monomer OR multimer parameters onto one graph.
 - **`deploy.py`** - Push, deploy, and prove the site is serving what was pushed.
 - **`diff-fold-coords.py`** - Fold twice under two configurations and compare the COORDINATES.
@@ -500,7 +474,6 @@ go through CDP, and the deploy.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.
-- **`fold-clears-msa.py`** - Pressing Fold must take the PREVIOUS job's alignment off the page.
 - **`fold-esmfold2.js`** - A whole ESMFold2 fold on the CPU: features in, a structure out.
 - **`fold-in-page.py`** - Drive a REAL fold in the real page, and report what the frames carry.
 - **`fold-in-safari.py`** - Fold in the real page in the REAL Safari, through safaridriver's WebDriver HTTP API.
@@ -532,15 +505,6 @@ go through CDP, and the deploy.
 - **`pack_delta_model.py`** - Store one AlphaFold 2 model as a DELTA on another, at three bits a weight.
 - **`pae-from-distogram.py`** - Can a PAE matrix be estimated from a distogram and a structure?
 - **`pae-transfer.py`** - Does EF2-fast's distogram carry the same aligned-error information?
-- **`ppi-bench/ci.py`** - ci.py <run.jsonl> ...: mean per-target pass rate, a bootstrap 95% CI over attempts within targets, and coverage
-- **`ppi-bench/cluster.py`** - Structural clusters of passing binders, standing in for the paper's Foldseek (TM-score 0.5) clustering, which could not be installed here. A small TM-align on CA traces: gapless-threading seeds, then Needleman-Wunsch on the TM-score similarity of the current superposition, a few rounds. Two binders join when the TM-score normalised by the SHORTER is >= 0.5 - the generous side, so clusters come out
-- **`ppi-bench/disco-score.py`** - disco-score.py <run.jsonl> ...: small-molecule rows (task-bench.mjs) under the paper's OTHER small-molecule criterion, `disco` (configs/metrics/pass_criteria/all_pass_criteria.yaml): binder backbone RMSD <= 2 A, and the ligand centroid - per ligand chain, after fitting the binder's backbone, the largest over ligands - within 2 A of the design's. It reads no confidence at all. Rescored from each row's own design and refold PDBs; beside rfd4_proteina_high's
-- **`ppi-bench/engine-probe.js`** - In-page (engine-probe.py): fold fixed [binder, ...target] complexes through the page's own AF3 (web/af3-model.js foldAf3, the target templated as bench.js does) on a chosen bundle - "int5" is the page's shipped one, read through loadAf3Weights; any other value is a bundle directory read the same way loadAf3Weights reads one - and return each fold's benchmark terms (binder pTM, min interface PAE).
-- **`ppi-bench/prep-tasks.py`** - RFD4-Proteina's DNA- and small-molecule-binder benchmark targets (their repo, BSD-3) -> tasks.json dna: data/benchmarks/dna_binder/dna_binder_denovo_val/<id>_sequence_context (the paper's "unfixed" DNA: the duplex is given as sequence only and co-folded), binder 120-150 sm:  data/benchmarks/small_molecule_binder/disco_figure_2c, the 77 keys of configs/.../disco_figure_2c.yaml; each
-- **`ppi-bench/prep.py`** - Benchmark targets (RFD4-Proteina repo data/benchmarks/ppi/ppi_all_atom, BSD-3) -> targets.json
-- **`ppi-bench/score.py`** - score.py <run.jsonl> ...: pass rates per target against the paper's (data.json, figure-2 PPI rows)
-- **`ppi-bench/task-score.py`** - task-score.py <run.jsonl> ...: DNA-, small-molecule-binder and AME pass rates (task-bench.mjs rows) per task, mean over targets with a bootstrap 95% CI over attempts within targets, beside the paper's models on the same targets - one-shot, and RFD4-Proteina's Search pipeline. A target's variant is its prefix: "U-" is AME's unfixed-ligand set (mcsa_unfixed), "F-" a fixed target (the *_fixed datasets); none is the figure-2 dataset.
-- **`ppi-bench/xscore.py`** - xscore.py: cross-evaluation summary - each design set's pass rate under each re-predictor, and how many of the designs that pass the AF3 evaluation also pass the other model (mean over targets, bootstrap 95% CI).
 - **`quantize_af3.py`** - Rewrite an exported AF3 model directory as int5, asymmetric, group 32.
 - **`quantize_model.py`** - Rewrite an exported model/ directory with quantised weight shards.
 - **`repack_shards.py`** - Lay an exported bundle into a few even shards instead of many uneven ones.
@@ -554,6 +518,4 @@ go through CDP, and the deploy.
 - **`stub_worker.py`** - A stand-in for python/localfold/worker.py that a gate drives, so the broker (python/localfold/server.py) and the reader's page are tested with no card.
 - **`sync-py2dmol.py`** - Mirror py2Dmol's built bundles from its own checkout into this one.
 - **`toy-oracle.html`** - toy oracle: AF2-multimer vs LocalFold
-- **`trunk-chains.py`** - Does a complex's contact map carry the RIGHT chain boundaries while it folds?
-- **`wgsl-check.html`** - WGSL compile check
 - **`write_manifest_module.py`** - Compile an export's manifest into the JS module the page loads.

@@ -124,10 +124,10 @@ repository's conversion against the platform's own.
 🔴 **AND MOST OF THAT SUITE NAMES FIXTURES THAT ARE NOT IN THE REPOSITORY.**
 Run for the first time on this box: 42 tests, 3 pass, 25 fail. **24 of the 25
 are `ENOENT`** - `test/fixtures/evoformer/model1-query-59-block0` and
-`model1-a3m-59-stack` are absent whole. So checking an
-attention change against official values still means the whole-stack checker,
-not `test/evoformer-attention.gpu.test.js`. Two more failures are the missing
-`shader-f16` above.
+`model1-a3m-59-stack` are absent whole. The nine `*.gpu.test.js` files that
+needed them were deleted on 2026-11-16, so checking an attention change against
+official values means the whole-stack checker (`check-evoformer-stack.js`). Two
+more failures were the missing `shader-f16` above.
 
 🔴 **AND "TEN `*_haiku_*.f32.bin` WEIGHTS ARE MISSING FROM THE
 `model1-query-59-stack` THAT IS PRESENT" WAS THIS FILE'S OWN CLAIM AND IT IS OFF
