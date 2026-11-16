@@ -156,7 +156,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (local < 8u) { reduce[local] += reduce[local + 8u]; } workgroupBarrier();
   if (local < 4u) { reduce[local] += reduce[local + 4u]; } workgroupBarrier();
   if (local < 2u) { reduce[local] += reduce[local + 2u]; } workgroupBarrier();
-  if (local == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
+  if (local == 0u) { reduce[local] += reduce[1]; } workgroupBarrier();
   let mean = reduce[0] / f32(C);
   workgroupBarrier();
   var variance = 0.0;
@@ -171,7 +171,7 @@ fn main(@builtin(workgroup_id) group: vec3<u32>,
   if (local < 8u) { reduce[local] += reduce[local + 8u]; } workgroupBarrier();
   if (local < 4u) { reduce[local] += reduce[local + 4u]; } workgroupBarrier();
   if (local < 2u) { reduce[local] += reduce[local + 2u]; } workgroupBarrier();
-  if (local == 0u) { reduce[0] += reduce[1]; } workgroupBarrier();
+  if (local == 0u) { reduce[local] += reduce[1]; } workgroupBarrier();
   let inverse = inverseSqrt(reduce[0] / f32(C) + EPSILON);
   workgroupBarrier();
 

@@ -118,7 +118,8 @@ ${dot}
     score *= scale;
 
     int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
-    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+    float maskValue = fetch1(maskTex, maskIndex);
+    float logit = score + (maskValue == 1.0 ? 0.0 : 1e9 * (maskValue - 1.0));
 ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
     logit = clamp(logit, -1e8, 1e8);`}
 
@@ -184,7 +185,8 @@ void main() {
 ${dot}
     score *= scale;
     int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
-    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+    float maskValue = fetch1(maskTex, maskIndex);
+    float logit = score + (maskValue == 1.0 ? 0.0 : 1e9 * (maskValue - 1.0));
 ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
     logit = clamp(logit, -1e8, 1e8);
     if (lane == 0) out4.x = logit;
@@ -288,7 +290,8 @@ ${load}
 ${dot}
     score *= scale;
     int maskIndex = transposeMask == 0 ? b * Q + k : k * BATCH + b;
-    float logit = score + 1e9 * (fetch1(maskTex, maskIndex) - 1.0);
+    float maskValue = fetch1(maskTex, maskIndex);
+    float logit = score + (maskValue == 1.0 ? 0.0 : 1e9 * (maskValue - 1.0));
 ${hasPairBias ? "    logit += fetch1(pairTex, (head * Q + q) * Q + k);" : ""}
     logit = clamp(logit, -1e8, 1e8);
     if (lane == 0) out4.x = logit;

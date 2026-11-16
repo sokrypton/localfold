@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-512 tools. `tools/fixtures/` is data and is not listed.
+521 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (291)
+## `tools/gpu/` - the WebGPU lane (300)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -192,6 +192,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-webgl-triangle.js`** - Triangle multiplication in WebGL2 against the CPU reference AND against the WGSL kernel, in one page - the first whole AlphaFold operation in this backend.
 - **`clash-geometry.js`** - Do a fold's atoms overlap each other? The question bonds cannot answer.
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/cpp/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
+- **`dump-shaders.js`** - The WGSL another tool compiles, by pipeline label: wraps a tool's `main`, records every shader module's text and the labels of the pipelines built from it, and returns the modules whose label matches --match=<regex>.
 - **`fold-af2-webgl.js`** - Fold AlphaFold 2's monomer in WebGL2, from a real weight bundle, beside the WGSL fold of the same weights.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-af3-webgl.js`** - Fold AlphaFold 3 in WebGL2, from a real weight bundle.
@@ -205,6 +206,7 @@ Each exports `async function main(device, args)` and is run as
 - **`fold.js`** - Fold a protein with AF3 on the GPU, end to end, and write a PDB.
 - **`gemm-matrix.js`** - A dense projection built on WebGPU's subgroup matrix units.
 - **`probe-ablate.js`** - When `maskPaddedKeys` matters, which is narrower than it looks.
+- **`probe-adapter-identity.js`** - What a browser says about its GPU, by every route a page has: adapter.info, the adapter's features, the platform strings and WebGL's renderer. Firefox leaves adapter.info blank, so a device prior has to be chosen from the rest.
 - **`probe-add-in-place.js`** - How many `addInPlace` dispatches a fold actually issues, and under which label - counted on the device rather than read off the source.
 - **`probe-af2-contacts.js`** - Does AF2's distogram head predict the structure AF2 actually built?
 - **`probe-af2-dgram-plddt.js`** - AF2 training set: distogram in, pLDDT out, one row per residue per recycle.
@@ -213,6 +215,8 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-alu-lanes.js`** - Does a vecN multiply-add actually cost what probe-alu.js prices it at?
 - **`probe-alu.js`** - What this device will actually do, in WGSL, with no memory in the way.
 - **`probe-attend-parts.js`** - grid.attend's tiled f16 kernel (the M5's shipped form) with parts of its logits removed, timed against itself.
+- **`probe-barrier-visibility.js`** - Does a lane see what ANOTHER lane wrote to workgroup memory before a barrier? Pattern by pattern.
+- **`probe-batch-digest.js`** - A digest of the featurised AF3 batch, field by field - to compare two BROWSERS, not two models.
 - **`probe-bf16.js`** - Is bfloat16 available in WGSL, and would it beat the f16 storage already here?
 - **`probe-binding-ceiling.js`** - At what chain length does this fold stop BINDING, and which dispatch decides?
 - **`probe-budget.js`** - When a fold does not fit, does it slow down or give up?
@@ -240,6 +244,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-limits.js`** - What is the largest protein this device can hold, and where does it stop?
 - **`probe-live-buffers.js`** - Every buffer a fold actually creates, against what the memory budget counts.
 - **`probe-load-dial.js`** - Does the download dial's fraction actually reach 1?
+- **`probe-loop-cost.js`** - What a loop, a storage read and a workgroup read each cost in this browser's shader compiler: the denoiser's dense inner loop (ffw-out's) cut into arms, each as a loop and unrolled eight to an iteration, timed on the GPU's clock.
 - **`probe-matrix-ceiling.js`** - What do this device's subgroup matrix units ISSUE at, with the operands already in registers?
 - **`probe-memory.js`** - Where the HOST memory of a fold goes.
 - **`probe-modified.js`** - Is a modified residue the right shape, and is it still attached to the chain?
@@ -255,6 +260,7 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-paired-search.js`** - Does the PAIRED MMseqs2 search work for a two-entity complex?
 - **`probe-platform.js`** - What this browser offers a numerical workload, beside WebGPU itself.
 - **`probe-progress-bar.js`** - Does the bar move at the speed the fold actually runs at?
+- **`probe-readback-latency.js`** - How long this browser takes to tell a page that GPU work is done: a trivial submit awaited three ways (onSubmittedWorkDone, mapAsync of a buffer the submit copied into, and both), each ten times.
 - **`probe-recycles-on-complexes.js`** - Do recycles help a COMPLEX, or entrench a wrong interface?
 - **`probe-register-gemm.js`** - How far a WGSL GEMM gets on this device's vector units, at the shapes AF3's pair transition runs - the ceiling the trunk's instruction-bound kernels are measured against.
 - **`probe-residual-binding-ceiling.js`** - How long a chain can `addInPlace` still bind, and what happens past it.
@@ -296,7 +302,9 @@ Each exports `async function main(device, args)` and is run as
 - **`probe-webgl2-limits.js`** - The WebGL2 limits that bound a GPGPU kernel, including the ones a fragment shader does not have but transform feedback might.
 - **`probe-webgl2-tf.js`** - The smallest transform feedback that works, and where the error comes from.
 - **`probe-webgl2.js`** - What WebGL2 exposes on this device, and whether any of it is compute.
+- **`probe-wgsl-support.js`** - Which WGSL constructs this browser's COMPILER accepts - beyond what `device.features` says.
 - **`probe-worker-overlap.js`** - Can the sampler's host work hide behind the GPU, in a Worker?
+- **`probe-workgroup-init.js`** - What a workgroup pays for the workgroup memory it DECLARES, whatever it uses: one kernel that touches 64 floats of a `var<workgroup>` array, with the array declared at 64 to 8192 floats, timed on the GPU's clock.
 - **`profile-af2-block.js`** - Per-kernel GPU time inside one AF2 evoformer block.
 - **`profile-af2-template.js`** - Per-kernel GPU time inside one AF2 TEMPLATE pair block.
 - **`profile-bioemu2.js`** - Where webgpu/bioemu2's time goes on a real input: the trunk by wall clock, the denoiser call per dispatch.
@@ -306,6 +314,7 @@ Each exports `async function main(device, args)` and is run as
 - **`relative-rms.js`** - One relative-RMS, guarded, because fifty-five tools each wrote their own.
 - **`sidechain-geometry.js`** - How close is a predicted structure to the chemistry it was given?
 - **`superpose.js`** - Superposing a model on a crystal, and the two numbers that come out of it.
+- **`time-shader.js`** - One kernel's GPU time on its own: a WGSL file compiled as this device's compiler is handed it, bound to buffers of deterministic noise and dispatched alone under a pair of timestamps, so no neighbouring pass shares its clock.
 - **`trunk-opendde.js`** - OpenDDE's trunk, sequence in and contact map out.
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 - **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.

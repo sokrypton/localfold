@@ -1,4 +1,5 @@
 import { deviceTuning } from "./device-profile.js";
+import { compilerText } from "./wgsl-compat.js";
 /**
  * What the pipeline cache was handed and threw away.
  *
@@ -28,6 +29,32 @@ export const pipelineCacheStats = {
 
 /** How long the cache must go without a new pipeline before upgrading one. */
 const UPGRADE_QUIET_MS = 2000;
+
+/**
+ * A pipeline, and when the browser refuses it, WHY. A refusal arrives as "ShaderModule with '<label>' label is
+ * invalid" and nothing else; the compiler's own message is on the module, and only if somebody asks for it.
+ * Firefox's WGSL front end (naga) refuses text Chrome's (Tint) accepts, so without the message a kernel that
+ * fails in one browser names neither its line nor its reason (issue #10).
+ */
+function compileNamed(device, label, moduleLabel, source, entryPoint) {
+  // (the text a compiler without the f16 width bitcasts is given: webgpu/runtime/wgsl-compat.js)
+  // (the text this device's compiler is given - the f16 width bitcasts rewritten, the loops unrolled, each where it
+  // wants that: webgpu/runtime/wgsl-compat.js)
+  const code = compilerText(device, source);
+  const module = device.createShaderModule({ label: moduleLabel, code });
+  return device.createComputePipelineAsync({ label, layout: "auto", compute: { module, entryPoint } })
+    .catch(async (cause) => {
+      let detail = "";
+      try {
+        const info = await module.getCompilationInfo();
+        detail = info.messages.filter((message) => message.type === "error").slice(0, 3)
+          .map((message) => ` - line ${message.lineNum}: ${message.message}`
+            + ` | ${(code.split("\n")[message.lineNum - 1] ?? "").trim().slice(0, 160)}`).join("");
+      } catch { /* the cause alone */ }
+      if (detail === "") throw cause;
+      throw new Error(`${cause.message}${detail}`, { cause });
+    });
+}
 
 export class ComputePipelineCache {
   device;
@@ -141,14 +168,7 @@ export class ComputePipelineCache {
         + "NVIDIA; see docs/A100.md.");
     }
     const generic = mode === "tiered" ? this.#lengthGeneric(key, stripped, entryPoint) : null;
-    const pipeline = generic ?? this.device.createComputePipelineAsync({
-        label: key,
-        layout: "auto",
-        compute: {
-          module: this.device.createShaderModule({ label: `${key}.wgsl`, code: compiled }),
-          entryPoint,
-        },
-      });
+    const pipeline = generic ?? compileNamed(this.device, key, `${key}.wgsl`, compiled, entryPoint);
     const target = { pipeline, requests: 1 };
     this.#pipelines.set(key, { code, entryPoint, target });
     this.#byContent.set(content, target);
@@ -207,14 +227,8 @@ export class ComputePipelineCache {
     let generic = this.#bySkeleton.get(groupKey);
     if (generic === undefined) {
       const source = genericLengthSource(stripped, plan);
-      generic = source === null ? null : this.device.createComputePipelineAsync({
-        label: `${key}.generic`, layout: "auto",
-        compute: {
-          module: this.device.createShaderModule({ label: `${key}.generic.wgsl`,
-            code: this.runtimeLoopBounds === false ? source : withRuntimeLoopBounds(source) }),
-          entryPoint,
-        },
-      });
+      generic = source === null ? null : compileNamed(this.device, `${key}.generic`, `${key}.generic.wgsl`,
+        this.runtimeLoopBounds === false ? source : withRuntimeLoopBounds(source), entryPoint);
       this.#bySkeleton.set(groupKey, generic);
       const asked = generic;
       asked?.catch(() => { if (this.#bySkeleton.get(groupKey) === asked) this.#bySkeleton.delete(groupKey); });
@@ -254,11 +268,7 @@ export class ComputePipelineCache {
         const { key, target, code, entryPoint, pipeline } = this.#pendingUpgrades.splice(pick, 1)[0];
         try {
           await pipeline;
-          const unrolled = await this.device.createComputePipelineAsync({
-            label: `${key}.unrolled`, layout: "auto",
-            compute: { module: this.device.createShaderModule({ label: `${key}.unrolled.wgsl`,
-              code }), entryPoint },
-          });
+          const unrolled = await compileNamed(this.device, `${key}.unrolled`, `${key}.unrolled.wgsl`, code, entryPoint);
           target.upgraded = Promise.resolve(unrolled);
         } catch { /* the opaque kernel stays; it computes the same thing */ }
       }

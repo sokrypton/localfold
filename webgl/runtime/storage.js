@@ -137,6 +137,14 @@ export class Storage {
     this.pooledBytes = 0;
     /** @type {Map<string, number>} each pooled shape's bytes a texture, for eviction */
     this.poolEntryBytes = new Map();
+    /** A pooled shape's width, rows and format by its key, for `#take`'s search. */
+    this.poolEntries = new Map();
+    /** Serve a tensor from a taller pooled texture when none is its own height (`#take`). */
+    this.anyFit = options.anyFit ?? true;
+    this.tallerReuses = 0;
+    this.createdBytes = 0;
+
+    this.retextures = 0;
     this.reuses = 0;
     /**
      * Keep a released texture for the next tensor of its rectangle.
@@ -279,6 +287,104 @@ export class Storage {
     return tensor;
   }
 
+  /**
+   * Delete a texture, and tell whoever holds it attached (`onDeleteTexture`: the framebuffer cache).
+   *
+   * 🔴 A DELETED TEXTURE STILL ATTACHED TO A FRAMEBUFFER KEEPS ITS MEMORY. GL frees a texture's storage only when
+   * nothing references it, and `Execution`'s framebuffer cache keeps up to 256 attachment sets alive - so every
+   * texture the pool evicted stayed resident until its framebuffer aged out. Mol-1 with an 8076-row alignment
+   * counted 3.8 GB here while NVIDIA's OpenGL held 17.7 GB and refused the next target (0x8cdd: that driver takes
+   * ~16 GB of float textures in one context); through Vulkan the same leak passed unseen. Unpooled the cache is not
+   * used, which is why `--no-pool` folded.
+   */
+  #deleteTexture(texture) {
+    this.onDeleteTexture?.(texture);
+    this.gl.deleteTexture(texture);
+  }
+
+  /**
+   * A pooled texture for a tensor of `height` rows: one of exactly that height, else the SHORTEST taller one.
+   *
+   * 🔴 A POOL THAT ONLY MATCHES A SHAPE EXACTLY HOLDS EVERY SHAPE'S SPARE AT ONCE, AND THAT IS WHAT THE BOUND RAN
+   * OUT OF. A pairformer block at 262 tokens asks for a dozen shapes in turn; each one's spare texture sat idle
+   * while the others were in use, ~1.5 GiB of them, so a 512 MiB pool deleted and re-created them every block -
+   * and a fresh texture is the expensive thing (0.86 ms a MiB through NVIDIA's OpenGL: that fold was 79 s where
+   * the same draws through Vulkan are 10.6). A kernel addresses a tensor by element index and draws its own
+   * rectangle, so a taller texture serves a shorter tensor as it stands: the rows past the tensor are never
+   * read or written. Rounding heights to classes was tried and shares nothing (webgl/README.md); this shares
+   * across them. `anyFit: false` is the exact-match pool.
+   */
+  #take(width, height, format) {
+    let best = null;
+    let bestRows = Infinity;
+    const exact = poolKey(width, height, format);
+    if ((this.pool.get(exact)?.length ?? 0) > 0) {
+      best = exact;
+      bestRows = height;
+    } else if (this.anyFit) {
+      for (const [key, textures] of this.pool) {
+        if (textures.length === 0) continue;
+        const entry = this.poolEntries.get(key);
+        if (entry.format !== format || entry.width !== width) continue;
+        if (entry.rows > height && entry.rows < bestRows) {
+          best = key;
+          bestRows = entry.rows;
+        }
+      }
+    }
+    if (best === null) return null;
+    const textures = this.pool.get(best);
+    const texture = textures.pop();
+    this.pooledBytes -= this.poolEntryBytes.get(best);
+    this.reuses += 1;
+    if (bestRows !== height) this.tallerReuses += 1;
+    // a take moves its shape to the recent end of the pool's order
+    this.pool.delete(best);
+    this.pool.set(best, textures);
+    return { texture, rows: bestRows };
+  }
+
+  /**
+   * Give an undrawn tensor a texture of exactly `rows` rows, pooled or new - for a draw into several targets,
+   * whose attachments must be one size (a WebGL context refuses the framebuffer otherwise, 0x8CD9), where the
+   * pool handed its targets textures of different heights.
+   */
+  retexture(tensor, rows) {
+    if (tensor.drawn === true) throw new Error(`${tensor.label}: a written tensor cannot change its texture`);
+    const gl = this.gl;
+    const half = tensor.half === true;
+    const format = half ? "f16" : "f32";
+    const old = { ...tensor };
+    const key = poolKey(tensor.width, rows, format);
+    const free = this.pool.get(key);
+    let texture;
+    if (free !== undefined && free.length > 0) {
+      texture = free.pop();
+      this.pooledBytes -= this.poolEntryBytes.get(key);
+      this.reuses += 1;
+    } else {
+      texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texImage2D(gl.TEXTURE_2D, 0, half ? gl.RGBA16F : gl.RGBA32F, tensor.width, rows, 0,
+        gl.RGBA, half ? gl.HALF_FLOAT : gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this.timing.creates += 1;
+      this.createdBytes += tensor.width * rows * CHANNELS_PER_TEXEL * (half ? 2 : 4);
+    }
+    this.retextures += 1;
+    // the old texture goes back as a released tensor's would
+    this.live.add(old);
+    this.release(old);
+    tensor.texture = texture;
+    tensor.rows = rows;
+    tensor.bytes = tensor.width * rows * CHANNELS_PER_TEXEL * (half ? 2 : 4);
+    this.bytes += tensor.bytes;
+    this.peakBytes = Math.max(this.peakBytes, this.bytes + this.pooledBytes);
+  }
+
   allocate(elements, label = "tensor", half = false) {
     if (!Number.isInteger(elements) || elements <= 0) {
       throw new RangeError(`${label}: a tensor needs a positive integer element count, got ${elements}`);
@@ -294,17 +400,15 @@ export class Storage {
     const { width, height } = textureShape(elements);
     if (this.virtual) return this.#virtualTensor({ elements, width, height, label, half });
     this.allocationLabels.set(label, (this.allocationLabels.get(label) ?? 0) + 1);
-    const key = poolKey(width, height, half ? "f16" : "f32");
-    const free = this.poolLabelPattern === null || this.poolLabelPattern.test(label)
-      ? this.pool.get(key) : undefined;
-    const bytes = width * height * CHANNELS_PER_TEXEL * (half ? 2 : 4);
+    const format = half ? "f16" : "f32";
+    const poolable = this.poolLabelPattern === null || this.poolLabelPattern.test(label);
+    // `rows` is the texture's own height, which a pooled texture taken for a shorter tensor exceeds (`#take`)
+    const taken = poolable ? this.#take(width, height, format) : null;
+    const rows = taken === null ? height : taken.rows;
+    const bytes = width * rows * CHANNELS_PER_TEXEL * (half ? 2 : 4);
     let texture;
-    if (free !== undefined && free.length > 0) {
-      texture = free.pop();
-      this.pooledBytes -= bytes;
-      this.reuses += 1;
-      this.pool.delete(key);
-      this.pool.set(key, free);
+    if (taken !== null) {
+      texture = taken.texture;
     } else {
       const createdAt = performance.now();
       texture = gl.createTexture();
@@ -320,13 +424,14 @@ export class Storage {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       this.timing.createMs += performance.now() - createdAt;
       this.timing.creates += 1;
+      this.createdBytes += width * height * CHANNELS_PER_TEXEL * (half ? 2 : 4);
       if (this.fillFresh !== null) {
         gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, width, height, gl.RGBA, gl.FLOAT,
           new Float32Array(width * height * CHANNELS_PER_TEXEL).fill(this.fillFresh));
       }
     }
     /** @type {Tensor} */
-    const tensor = { texture, elements, width, height, label, bytes, half };
+    const tensor = { texture, elements, width, height, label, bytes, half, rows, drawn: false };
     this.live.add(tensor);
     this.allocations += 1;
     this.bytes += bytes;
@@ -530,6 +635,7 @@ export class Storage {
   #writeHalves(tensor, halves) {
     const gl = this.gl;
     const startedAt = performance.now();
+    tensor.drawn = true;   // it holds the host's values: `retexture` must never swap its texture
     gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, tensor.width, tensor.height, gl.RGBA, gl.HALF_FLOAT, halves);
     this.timing.uploadBytes += halves.length * 2;
@@ -552,6 +658,7 @@ export class Storage {
       return out;
     })();
     const startedAt = performance.now();
+    tensor.drawn = true;   // it holds the host's values: `retexture` must never swap its texture
     gl.bindTexture(gl.TEXTURE_2D, tensor.texture);
     if (tensor.half) {
       // Rounded HERE, to nearest and ties to even, rather than by handing f32
@@ -620,10 +727,10 @@ export class Storage {
     if (tensor.texture === null) return;
     this.bytes -= tensor.bytes;
     if (!this.pooling || tensor.bytes > this.poolLimitBytes) {
-      this.gl.deleteTexture(tensor.texture);
+      this.#deleteTexture(tensor.texture);
       return;
     }
-    const key = poolKey(tensor.width, tensor.height, tensorFormat(tensor));
+    const key = poolKey(tensor.width, tensor.rows ?? tensor.height, tensorFormat(tensor));
     // ...and past the limit the LEAST RECENTLY USED shapes go first (the Map's order: a take or a put moves its
     // shape to the end), so the shapes a fold recycles every block stay pooled and a one-off does not squat.
     for (const [oldKey, textures] of this.pool) {
@@ -631,13 +738,13 @@ export class Storage {
       if (oldKey === key) continue;
       const each = this.poolEntryBytes.get(oldKey);
       while (textures.length > 0 && this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
-        this.gl.deleteTexture(textures.pop());
+        this.#deleteTexture(textures.pop());
         this.pooledBytes -= each;
       }
       if (textures.length === 0) this.pool.delete(oldKey);
     }
     if (this.pooledBytes + tensor.bytes > this.poolLimitBytes) {
-      this.gl.deleteTexture(tensor.texture);
+      this.#deleteTexture(tensor.texture);
       return;
     }
     const free = this.pool.get(key) ?? [];
@@ -645,6 +752,7 @@ export class Storage {
     this.pool.set(key, free);
     free.push(tensor.texture);
     this.poolEntryBytes.set(key, tensor.bytes);
+    this.poolEntries.set(key, { width: tensor.width, rows: tensor.rows ?? tensor.height, format: tensorFormat(tensor) });
     this.pooledBytes += tensor.bytes;
   }
 
@@ -656,7 +764,7 @@ export class Storage {
   /** Delete every pooled texture, which is what actually frees the memory. */
   drainPool() {
     for (const textures of this.pool.values()) {
-      for (const texture of textures) this.gl.deleteTexture(texture);
+      for (const texture of textures) this.#deleteTexture(texture);
     }
     this.pool.clear();
     this.pooledBytes = 0;
@@ -670,6 +778,9 @@ export class Storage {
       bytes: this.bytes,
       peakBytes: this.peakBytes,
       pooledBytes: this.pooledBytes,
+      tallerReuses: this.tallerReuses,
+      createdMiB: Math.round(this.createdBytes / 2 ** 20),
+      retextures: this.retextures,
       reuses: this.reuses,
       capacityFloats: this.capacity,
       allocationLabels: this.allocationLabels,

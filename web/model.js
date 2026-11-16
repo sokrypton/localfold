@@ -24,7 +24,7 @@ import { MODEL_BUNDLES, bundleBaseUrl, graphFamily, loadManifest }
 import { DeltaTensorStore } from "../shared/bundles/delta-tensor-store.js";
 import { requestAlphaFoldDevice } from "../webgpu/runtime/device.js";
 import { settleGridAttendTiling } from "../webgpu/af3/trunk/grid-attend-race.js";
-import { webgl2FoldAvailable } from "../webgl/af3/model/fold-batch.js";
+import { webgl2FoldAvailable, webgl2FoldIsSoftware } from "../webgl/af3/model/fold-batch.js";
 import { devUseDevice } from "./dev-log.js";
 import { withAbort } from "../webgpu/runtime/abort.js";
 
@@ -174,7 +174,13 @@ export function getDevice() {
   // "No compatible WebGPU adapter was found" until a reload, and a lost device (a crashed GPU process, a driver reset)
   // had every later fold run against a dead device. The next fold asks again.
   const request = (async () => {
-    if (navigator.gpu === undefined) throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox.");
+    // 🔴 AND NOT ON LINUX, WHERE THE SENTENCE WAS WRONG (issue #10): Firefox 160 for Linux has no navigator.gpu
+    // until `dom.webgpu.enabled` is set, and then folds at Chrome's numbers (docs/FIREFOX.md, "Linux").
+    if (navigator.gpu === undefined) {
+      const linux = /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+      throw new Error("This browser has no WebGPU. It ships in current Chrome, Edge, Safari and Firefox"
+        + (linux ? " - though on Linux Firefox has it off until dom.webgpu.enabled is set in about:config." : "."));
+    }
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (adapter === null) throw new Error("No compatible WebGPU adapter was found");
     // 🔴 THE PAGE IS THE ONE CALLER THAT HAS TO SURVIVE BEING WRONG. A bench
@@ -223,6 +229,14 @@ export function foldBackend() {
       return "webgpu";
     } catch (cause) {
       if (!webgl2FoldAvailable()) throw cause;
+      // 🔴 AND A WebGL2 DRAWN ON THE CPU IS REFUSED BY NAME, NOT STARTED: hundreds of times slower, so the fold
+      // reads as a hang (webgl2SoftwareRenderer).
+      const software = webgl2FoldIsSoftware();
+      if (software !== null) {
+        throw new Error(`This browser has no WebGPU, and its WebGL2 is a software renderer (${software}), which`
+          + " folds hundreds of times slower than a GPU - minutes for the smallest fold. Turn on hardware"
+          + " acceleration in the browser's settings, or fold in a browser that reaches the GPU.");
+      }
       return "webgl2";
     }
   })();

@@ -236,6 +236,9 @@ export function webglExecutionOptions(args, defaults = {}) {
     // `--pool-mib=<n>` caps the pool (Storage.poolLimitBytes); the driver's cap, else unbounded, without it
     poolLimitBytes: option(args, "pool-mib", null) !== null ? Number(option(args, "pool-mib", "0")) * 2 ** 20
       : defaults.poolLimitBytes ?? Infinity,
+    // `--no-any-fit`: the pool matches a shape exactly, as it did (Storage.anyFit)
+    // ...and `--any-fit` forces it where the driver's default is off (an Apple renderer)
+    anyFit: flag(args, "no-any-fit") ? false : flag(args, "any-fit") ? true : defaults.anyFit ?? true,
     halfWeights: !flag(args, "no-half-weights"),
     // `--half-floor=<n>`: the smallest weight held in float16 (Storage.halfWeightFloor); the driver's, else 65536
     ...(option(args, "half-floor", null) !== null ? { halfWeightFloor: Number(option(args, "half-floor", "0")) }

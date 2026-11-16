@@ -133,7 +133,7 @@ export function createModulateShader({ atoms, channels }, shiftIndex, scaleIndex
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
   steps.push(`  if (local.x == 0u) {
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
                + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();`);
@@ -206,7 +206,7 @@ function createResidualModulateShader({ atoms, channels }, gateIndex, shiftIndex
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
   steps.push(`  if (local.x == 0u) {
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
                + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();`);
@@ -290,7 +290,7 @@ function createBroadcastModulateShader({ atoms, channels }, shiftIndex, scaleInd
     steps.push(`  if (local.x < ${s}u) { squares[local.x] += squares[local.x + ${s}u]; } workgroupBarrier();`);
   }
   steps.push(`  if (local.x == 0u) {
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6]))
                + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();`);
@@ -417,9 +417,9 @@ export function createSwaPrepareShader({ atoms, channels, heads }, precision) {
   }
   if (headDim >= 8) {
     reduceSteps.push(`  if (d == 0u) {
-    squaresQ[0] = ((squaresQ[0] + squaresQ[4]) + (squaresQ[2] + squaresQ[6]))
+    squaresQ[d] = ((squaresQ[0] + squaresQ[4]) + (squaresQ[2] + squaresQ[6]))
                 + ((squaresQ[1] + squaresQ[5]) + (squaresQ[3] + squaresQ[7]));
-    squaresK[0] = ((squaresK[0] + squaresK[4]) + (squaresK[2] + squaresK[6]))
+    squaresK[d] = ((squaresK[0] + squaresK[4]) + (squaresK[2] + squaresK[6]))
                 + ((squaresK[1] + squaresK[5]) + (squaresK[3] + squaresK[7]));
   }
   workgroupBarrier();`);

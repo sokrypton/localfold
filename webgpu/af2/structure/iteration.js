@@ -46,7 +46,6 @@ struct Parameters {
 @group(0) @binding(3) var<uniform> p: Parameters;
 @group(0) @binding(4) var<storage, read_write> output: array<f32>;
 var<workgroup> partial: array<f32, 64>;
-var<workgroup> mean_value: array<f32, 1>;
 @compute @workgroup_size(64)
 fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) group: vec3<u32>) {
   let row = group.x;
@@ -60,11 +59,12 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
     if (local.x < stride) { partial[local.x] += partial[local.x + stride]; }
     workgroupBarrier();
   }
-  if (local.x == 0u) { mean_value[0] = partial[0] / f32(p.channels); }
+  // (read by every lane rather than stored by one for the rest: tools/gpu/probe-barrier-visibility.js)
+  let row_mean = partial[0] / f32(p.channels);
   workgroupBarrier();
   var squared = 0.0;
   for (var c = local.x; c < p.channels; c += 64u) {
-    let centered = left[base + c] + right[base + c] - mean_value[0];
+    let centered = left[base + c] + right[base + c] - row_mean;
     squared += centered * centered;
   }
   partial[local.x] = squared;
@@ -76,7 +76,7 @@ fn main(@builtin(local_invocation_id) local: vec3<u32>, @builtin(workgroup_id) g
   let inverse_std = inverseSqrt(partial[0] / f32(p.channels) + p.epsilon);
   for (var c = local.x; c < p.channels; c += 64u) {
     let value = left[base + c] + right[base + c];
-    output[base + c] = (value - mean_value[0]) * inverse_std * weights[p.scale + c] + weights[p.offset + c];
+    output[base + c] = (value - row_mean) * inverse_std * weights[p.scale + c] + weights[p.offset + c];
   }
 }`;
 

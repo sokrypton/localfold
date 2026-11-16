@@ -275,8 +275,8 @@ ${wide
     // The product form penalises a pair only when BOTH are padded; the sum form
     // is an OR. Neither has a default.
     float maskBias = ${keyMasked
-    ? "-1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
-    : "1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
+    ? "(queryMask == 1.0 && keyMask == 1.0) ? 0.0 : -1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
+    : "(queryMask == 1.0 || keyMask == 1.0) ? 0.0 : 1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
     float logit = dot * scale + maskBias + fetch1(pairLogitsTex, biasBase + key);
     float newMax = max(runningMax, logit);
     float previousScale = exp(runningMax - newMax);
@@ -341,8 +341,8 @@ ${each((g) => `    { vec4 k4 = fetch4(kTex, keyBase / 4 + ${g});
       dot += q${g}.z * k4.z; dot += q${g}.w * k4.w; }`)}
     float keyMask = fetch1(keyMaskTex, keyIndex);
     float maskBias = ${keyMasked
-    ? "-1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
-    : "1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
+    ? "(queryMask == 1.0 && keyMask == 1.0) ? 0.0 : -1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
+    : "(queryMask == 1.0 || keyMask == 1.0) ? 0.0 : 1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
     float logit = dot * scale + maskBias + fetch1(pairLogitsTex, biasBase + key);
     float newMax = max(runningMax, logit);
     float previousScale = exp(runningMax - newMax);
@@ -398,8 +398,8 @@ void main() {
     float queryMask = fetch1(queryMaskTex, queryIndex);
     float keyMask = fetch1(keyMaskTex, keyIndex);
     float maskBias = ${keyMasked
-    ? "-1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
-    : "1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
+    ? "(queryMask == 1.0 && keyMask == 1.0) ? 0.0 : -1e9 * ((1.0 - queryMask) + (1.0 - keyMask))"
+    : "(queryMask == 1.0 || keyMask == 1.0) ? 0.0 : 1e9 * (queryMask - 1.0) * (keyMask - 1.0)"};
     float logit = dot * scale + maskBias + fetch1(pairLogitsTex, element);
     if (lane == 0) out4.x = logit;
     else if (lane == 1) out4.y = logit;

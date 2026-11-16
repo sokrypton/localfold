@@ -110,6 +110,14 @@ LINUX_FLAGS = ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=n
                "--ignore-gpu-blocklist", "--no-sandbox",
                "--enable-dawn-features=vulkan_enable_f16_on_nvidia"]
 
+# 🔴 AND `--use-angle=vulkan` IS NOT A LINUX READER'S WebGL2. Their WebGL2 is the vendor's desktop OpenGL, whose
+# GLSL compiler reassociated the attention mask into wrong folds (issue #10) where Vulkan computed it as written.
+# LOCALFOLD_GPU_ANGLE=gl-egl puts the page's WebGL2 there (WebGPU stays on Vulkan), as tools/gpu-chrome.mjs does;
+# under Xvfb pair it with __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json, or it is
+# Mesa's llvmpipe. docs/FIREFOX.md, "Linux".
+if os.environ.get("LOCALFOLD_GPU_ANGLE"):
+    LINUX_FLAGS = [f"--use-angle={os.environ['LOCALFOLD_GPU_ANGLE']}", "--enable-features=Vulkan"] + LINUX_FLAGS[3:]
+
 
 # 🔴 AND A CALLER MAY ADD TO THEM, because one machine's flags are not every
 # machine's. A Colab container has NO DISPLAY AT ALL, where Chrome's own

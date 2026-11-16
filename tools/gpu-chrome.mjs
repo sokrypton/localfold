@@ -22,7 +22,7 @@
  *     node tools/gpu-chrome.mjs tools/gpu/bench-triangle.js --lengths=300,600
  */
 import { spawn, spawnSync } from "node:child_process";
-import { createReadStream, rmSync } from "node:fs";
+import { createReadStream, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import { extname, join, relative, resolve } from "node:path";
@@ -84,6 +84,14 @@ function adb(...argv) {
 // does not implement and Mesa's llvmpipe does. So it runs HEADFUL against an
 // X server, which on a GPU box means Xvfb. `LOCALFOLD_HEADLESS=1` forces the
 // headless flag back on for a machine whose driver does have that extension.
+// 🔴 THE SAME HARNESS IN FIREFOX: `LOCALFOLD_GPU_FIREFOX=1` (LOCALFOLD_FIREFOX names the binary). Firefox's WebGPU
+// is wgpu and naga, not Dawn and Tint - another compiler and another validator over the same WGSL - and no gate
+// here had run through it until a reader's folds came out distorted there (issue #10). A visible window, a fresh
+// profile; none of the Chrome flags apply, so this is always the stock configuration.
+const FIREFOX = process.env.LOCALFOLD_GPU_FIREFOX === "1"
+  ? (process.env.LOCALFOLD_FIREFOX ?? (process.platform === "darwin"
+    ? "/Applications/Firefox.app/Contents/MacOS/firefox" : "firefox"))
+  : null;
 const LINUX_HEADLESS = process.env.LOCALFOLD_HEADLESS === "1";
 //
 // 🔴 AND `shader-f16` IS OFF ON EVERY NVIDIA GPU UNTIL A DAWN TOGGLE SAYS
@@ -124,11 +132,21 @@ const STOCK_FLAGS = process.env.LOCALFOLD_STOCK_FLAGS === "1";
 // with no GPU driver, such as a Colab TPU VM. Chrome gives WebGPU SwiftShader
 // only when told to; pair it with --allow-software.
 const SWIFTSHADER = process.env.LOCALFOLD_SWIFTSHADER === "1";
+// 🔴 WebGL2 THROUGH THE DESKTOP OpenGL DRIVER, WHICH IS WHAT A LINUX READER'S WebGL2 IS AND WHAT THIS HARNESS
+// NEVER RAN. `--use-angle=vulkan` above puts WebGL on the Vulkan driver, where the NVIDIA GLSL compiler - the one
+// that reassociated an attention mask into garbage (issue #10) - is never asked. `LOCALFOLD_GPU_ANGLE=gl-egl`
+// is that arm (WebGPU stays on Vulkan, so a WebGL2 tool keeps its WGSL reference). Under Xvfb the GL is Mesa's
+// llvmpipe unless EGL is pointed at the vendor's:
+//     __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json LOCALFOLD_GPU_ANGLE=gl-egl
+// and llvmpipe refuses a float render target once ~480 MiB of weight textures are live (0x8cdd), so a whole
+// fold needs the vendor's driver. The adapter line of a `--no-webgpu` run names the renderer.
+const ANGLE = process.env.LOCALFOLD_GPU_ANGLE ?? null;
 const PLATFORM_FLAGS = SWIFTSHADER
   ? ["--no-sandbox", "--use-webgpu-adapter=swiftshader", "--enable-unsafe-swiftshader",
      "--use-angle=swiftshader"]
   : process.platform === "linux"
-  ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native",
+  ? [...(ANGLE === null ? ["--use-angle=vulkan", "--enable-features=Vulkan", "--use-vulkan=native"]
+      : [`--use-angle=${ANGLE}`, "--enable-features=Vulkan"]),
      "--ignore-gpu-blocklist", "--no-sandbox",
      // 🔴 WITHOUT THIS A DISPLAY-LESS BOX BENCHES THE CPU AND SAYS SO ONLY IN
      // ONE LINE OF ADAPTER PRINT. A surface is a thing you present TO, and a
@@ -163,6 +181,37 @@ if (entry === undefined) {
  * console nobody reads.
  */
 function runnerPage(modulePath, moduleArgs) {
+  // 🔴 A BROWSER WITH NO WebGPU IS WHAT A LINUX FIREFOX READER HAS (issue #10), and the page folds in WebGL2
+  // there. --no-webgpu runs the module with a null device, in whatever browser this is - the WebGL2 tools' own
+  // arm (their WGSL reference needs --no-reference) - and reports the WebGL renderer in place of an adapter.
+  if (moduleArgs.includes("--no-webgpu")) {
+    return `<!doctype html><meta charset="utf-8"><title>gpu-chrome</title><body>
+<script type="module">
+const post = (body) => fetch("/__result", { method: "POST", body: JSON.stringify(body) });
+const logs = [];
+for (const level of ["log", "warn", "error"]) {
+  const original = console[level].bind(console);
+  console[level] = (...parts) => {
+    logs.push(parts.map((part) => typeof part === "string" ? part : JSON.stringify(part)).join(" "));
+    original(...parts);
+  };
+}
+try {
+  const gl = document.createElement("canvas").getContext("webgl2");
+  const info = gl?.getExtension("WEBGL_debug_renderer_info");
+  const module = await import(${JSON.stringify(modulePath)});
+  const value = await module.main(null, ${JSON.stringify(moduleArgs)});
+  post({ ok: true, value, logs, adapter: {
+    vendor: "webgl2", architecture: "", features: [], webgpu: Boolean(navigator.gpu),
+    description: gl ? String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER)) : "no webgl2",
+  } });
+} catch (error) {
+  post({ ok: false, error: error && error.stack
+    ? (String(error.stack).includes(String(error.message)) ? error.stack : String(error) + " @ " + error.stack)
+    : String(error), logs });
+}
+</script>`;
+  }
   return `<!doctype html><meta charset="utf-8"><title>gpu-chrome</title><body>
 <script type="module">
 // fetch rather than sendBeacon: a beacon is capped near 64 kB and fails
@@ -193,7 +242,10 @@ try {
   // refuses there. The limits twin of LOCALFOLD_STOCK_FLAGS.
   const device = await requestAlphaFoldDevice(adapter,
     { portableLimits: ${JSON.stringify(process.env.LOCALFOLD_SPEC_FLOOR === "1" ? "spec"
-      : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")} });
+      : process.env.LOCALFOLD_PORTABLE_LIMITS === "1")},
+      withholdFeatures: ${JSON.stringify((process.env.LOCALFOLD_GPU_WITHHOLD ?? "").split(",").filter(Boolean))},
+      // LOCALFOLD_GPU_NO_PUMP=1: the waits as the browser gives them (webgpu/runtime/completion-pump.js's control arm)
+      ...(${JSON.stringify(process.env.LOCALFOLD_GPU_NO_PUMP === "1")} ? { completionPump: false } : {}) });
   if (${JSON.stringify(process.env.LOCALFOLD_PORTABLE_LIMITS === "1"
       || process.env.LOCALFOLD_SPEC_FLOOR === "1")}) {
     console.log("[gpu-chrome] portable limits: workgroup storage "
@@ -228,6 +280,28 @@ try {
     const { setDeviceTuning } = await import("/webgpu/runtime/device-profile.js");
     setDeviceTuning(device, { runtimeLoopBounds: false });
     console.log("[gpu-chrome] runtimeLoopBounds off for a benchmark");
+  }
+  // --rewrite-f16-bitcasts: compile what a compiler that refuses the f16 width bitcasts is handed (naga, so
+  // Firefox), in a browser that takes them - the arm that prices webgpu/runtime/wgsl-compat.js's rewrite alone.
+  if (${JSON.stringify(moduleArgs)}.includes("--rewrite-f16-bitcasts")) {
+    const { recordWgslSupport } = await import("/webgpu/runtime/device-profile.js");
+    recordWgslSupport(device, { f16WidthBitcast: false });
+    console.log("[gpu-chrome] f16 width bitcasts rewritten as for naga");
+  }
+  // --no-pool: every tensor a fresh (zeroed) buffer, never a recycled one, for any tool - a kernel that reads what it
+  // did not write then differs from the pooled run (webgpu/runtime/allocator.js's setBufferPooling; it leaks by design).
+  if (${JSON.stringify(moduleArgs)}.includes("--no-pool")) {
+    const { setBufferPooling } = await import("/webgpu/runtime/allocator.js");
+    setBufferPooling(false);
+    console.log("[gpu-chrome] buffer pooling off");
+  }
+  // --unroll-loops / --no-unroll-loops: the constant-count loops unrolled as for naga, or left as written in
+  // Firefox - the two arms of webgpu/runtime/wgsl-compat.js's withUnrolledLoops.
+  for (const [flag, unrollLoops] of [["--unroll-loops", true], ["--no-unroll-loops", false]]) {
+    if (!${JSON.stringify(moduleArgs)}.includes(flag)) continue;
+    const { recordWgslSupport } = await import("/webgpu/runtime/device-profile.js");
+    recordWgslSupport(device, { unrollLoops });
+    console.log("[gpu-chrome] loops " + (unrollLoops ? "unrolled" : "as written"));
   }
   const priorAs = ${JSON.stringify(moduleArgs)}.find((a) => a.startsWith("--prior="));
   if (priorAs !== undefined) {
@@ -312,7 +386,9 @@ try {
     description: adapter.info?.description, features: [...device.features],
   } });
 } catch (error) {
-  post({ ok: false, error: error && error.stack ? error.stack : String(error), logs });
+  post({ ok: false, error: error && error.stack
+    ? (String(error.stack).includes(String(error.message)) ? error.stack : String(error) + " @ " + error.stack)
+    : String(error), logs });
 }
 </script>`;
 }
@@ -375,7 +451,21 @@ async function main() {
   // server sends no-store above.
   const profile = ANDROID ? null
     : join(process.env.TMPDIR ?? "/tmp", `gpu-chrome-${process.pid}-${Date.now()}`);
-  const chrome = ANDROID ? null : spawn(CHROME, [
+  if (FIREFOX !== null) {
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(join(profile, "user.js"), [
+      "browser.shell.checkDefaultBrowser=false", "browser.aboutwelcome.enabled=false", "app.update.enabled=false",
+      "datareporting.policy.dataSubmissionEnabled=false", "toolkit.telemetry.reportingpolicy.firstRun=false",
+      "browser.sessionstore.resume_from_crash=false", "dom.min_background_timeout_value=4",
+      // LOCALFOLD_FIREFOX_PREFS=key=value,...: Firefox for Linux ships WebGPU off, and a reader can turn it on -
+      // `dom.webgpu.enabled=true,gfx.webgpu.ignore-blocklist=true` is that browser (docs/FIREFOX.md, "Linux")
+      ...(process.env.LOCALFOLD_FIREFOX_PREFS ?? "").split(",").filter((line) => line !== ""),
+    ].map((line) => { const [key, value] = line.split("="); return `user_pref("${key}", ${value});`; }).join("\n") + "\n");
+  }
+  const chrome = ANDROID ? null : FIREFOX !== null
+    ? spawn(FIREFOX, ["-profile", profile, "-no-remote", "-new-instance", `http://127.0.0.1:${port}/__runner`],
+      { stdio: ["ignore", "ignore", "pipe"] })
+    : spawn(CHROME, [
     // LOCALFOLD_HEADED=1 opens a visible window instead (macOS): a visitor's page competes with the compositor at
     // their device pixel ratio, which headless does not, and a change can measure 1.06x visible where it measured
     // 1.02x headless (docs/RFD4P-FROM-LOCALDESIGN.md section 5).

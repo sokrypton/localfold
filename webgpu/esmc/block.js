@@ -65,8 +65,8 @@ ${stageRow ? "    rowBuf[c] = value;\n" : ""}    total += value;
   if (local.x < 16u) { sums[local.x] += sums[local.x + 16u]; squares[local.x] += squares[local.x + 16u]; } workgroupBarrier();
   if (local.x < 8u) { sums[local.x] += sums[local.x + 8u]; squares[local.x] += squares[local.x + 8u]; } workgroupBarrier();
   if (local.x == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[local.x] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[local.x] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
   let mean = sums[0] / ${channels}.0;
@@ -331,8 +331,8 @@ fn reduce(lane: u32) {
   if (lane < 16u) { sums[lane] += sums[lane + 16u]; squares[lane] += squares[lane + 16u]; } workgroupBarrier();
   if (lane < 8u) { sums[lane] += sums[lane + 8u]; squares[lane] += squares[lane + 8u]; } workgroupBarrier();
   if (lane == 0u) {
-    sums[0] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
-    squares[0] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
+    sums[lane] = ((sums[0] + sums[4]) + (sums[2] + sums[6])) + ((sums[1] + sums[5]) + (sums[3] + sums[7]));
+    squares[lane] = ((squares[0] + squares[4]) + (squares[2] + squares[6])) + ((squares[1] + squares[5]) + (squares[3] + squares[7]));
   }
   workgroupBarrier();
 }
