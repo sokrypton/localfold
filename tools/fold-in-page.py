@@ -27,6 +27,7 @@ import http.server
 import re
 import json
 import os
+import pathlib
 import socketserver
 import sys
 import threading
@@ -303,6 +304,11 @@ def main():
     parser.add_argument("--remote-weights", action="store_true",
                         help="fetch the AF3 bundle from its pinned remote"
                              " (~150 MB) instead of ./model-af3-int5/")
+    parser.add_argument("--proteinebm-from", default=None,
+                        help="with --model proteinebm: start the dynamics from this PDB (the From row's file box)"
+                             " rather than from the last fold")
+    parser.add_argument("--proteinebm-steps", type=int, default=None,
+                        help="with --model proteinebm: the Langevin step count")
     parser.add_argument("--tab-trace", action="store_true",
                         help="record every state the first slot's tab row"
                              " passes through, from rAF")
@@ -1005,6 +1011,23 @@ def main():
                    json.dumps(args.recycles),
                    json.dumps(msa_mode), json.dumps(msa_mode), json.dumps(args.plm),
                    json.dumps(args.steps)))
+        # ProteinEBM runs dynamics FROM a structure: its starting PDB is handed to the From row's file box
+        if args.model == "proteinebm" and (args.proteinebm_from or args.proteinebm_steps):
+            text = pathlib.Path(args.proteinebm_from).read_text() if args.proteinebm_from else None
+            print("proteinebm:", cdp.evaluate(ws, """(() => {
+              const from = document.getElementById('proteinebm-from');
+              if (%s !== null) {
+                from.value = 'upload';
+                from.dispatchEvent(new Event('change', { bubbles: true }));
+                const carrier = new DataTransfer();
+                carrier.items.add(new File([%s], %s, { type: 'chemical/x-pdb' }));
+                document.getElementById('proteinebm-x0-file').files = carrier.files;
+              }
+              if (%s !== null) document.getElementById('proteinebm-steps').value = String(%s);
+              return JSON.stringify({ from: from.value, steps: document.getElementById('proteinebm-steps').value,
+                file: document.getElementById('proteinebm-x0-file').files[0]?.name ?? null });
+            })()""" % (json.dumps(text), json.dumps(text), json.dumps(pathlib.Path(args.proteinebm_from or "x").name),
+                       json.dumps(args.proteinebm_steps), json.dumps(args.proteinebm_steps))))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;
@@ -1387,6 +1410,20 @@ def main():
             tabs: [...document.querySelectorAll('#heatmapContainer [role="tab"]')]
               .map((t) => t.dataset.mapKey),
           });
+        })()"""))
+        # ...and py2Dmol's scatter plot, which BioEmu2's ensemble (PCA) and ProteinEBM's dynamics (energy by step) fill:
+        # how many frames carry a point, and whether its canvas is on screen
+        print("scatter:", cdp.evaluate(ws, """(() => {
+          const registry = window.py2dmol_viewers || {};
+          const r = (registry[Object.keys(registry)[0]] || {}).renderer;
+          const o = r && r.objectsData ? r.objectsData[r.currentObjectName] : null;
+          const c = document.getElementById('scatterCanvas');
+          const shown = (el) => { for (let n = el; n; n = n.parentElement) {
+            if (getComputedStyle(n).display === 'none') return false; } return true; };
+          return JSON.stringify({ points: o ? o.frames.filter((f) => Array.isArray(f.scatter)).length : 0,
+            config: o ? o.scatterConfig || null : null, canvas: c ? { shown: shown(c), w: c.width, h: c.height } : null,
+            slots: (() => { try { const g = r.getSlots(); return { list: [...g], big: g.big, small: g.small }; }
+                            catch (e) { return String(e); } })() });
         })()"""))
         print("status:", cdp.evaluate(ws,
             "(document.getElementById('status-message')||{}).textContent"))

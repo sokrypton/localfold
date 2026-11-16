@@ -7,7 +7,7 @@ import {
   searchCacheEntry,
 } from "../shared/input/mmseqs2-api.js";
 import { foldsAsSingleSequence, parseA3m } from "../shared/input/a3m.js";
-import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES, SINGLE_SEQUENCE_FAMILIES, graphFamily }
+import { AF3_FAMILIES, FOLDING_FAMILIES, MODEL_BUNDLES, PROTEINEBM_FAMILIES, SINGLE_SEQUENCE_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
 import { mergeChainA3ms, mergeRowAlignedChainA3ms, mergeUnpairedChainA3ms }
   from "../shared/input/chains.js";
@@ -413,7 +413,8 @@ describe("re-merging a search for another model", () => {
   // fails if a family is ever added that nothing can merge for.
   it("has a merge for every family that can fold a complex", () => {
     for (const family of FOLDING_FAMILIES) {
-      if (SINGLE_SEQUENCE_FAMILIES.includes(family)) continue;
+      // (and ProteinEBM, which reads a structure and no alignment: the page never searches for it)
+      if (SINGLE_SEQUENCE_FAMILIES.includes(family) || PROTEINEBM_FAMILIES.includes(family)) continue;
       // ...the family in the assertion rather than beside it: this harness's
       // `expect` takes no message, so a bare not.toThrow() names nothing.
       let thrown;

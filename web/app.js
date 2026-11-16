@@ -49,6 +49,9 @@ import { BIOEMU2_COUNTS, BIOEMU2_DEFAULT_STEPS, bioemu2Features, bioemu2Network,
   bioemu2ContactsFromRows, loadBioemu2Weights, releaseBioemu2, x0FromPdb } from "./bioemu2-model.js";
 import { alignSequentially, ensembleContacts, ensemblePca, orderAlongPc1, representativeAtoms, representativeWeights }
   from "./bioemu2-ensemble.js";
+import { loadProteinEbmWeights, proteinEbmNetwork, releaseProteinEbm, startingTrace } from "./proteinebm-model.js";
+import { LANGEVIN_DEFAULTS, langevin } from "../shared/proteinebm/langevin.js";
+import { caPdb } from "../shared/proteinebm/model.js";
 import { weightedRigidAlign } from "../cpu/af3/diffusion/rigid-align.js";
 import { BIOEMU2_MAX_BATCH, bioemu2Batches, foldBioemu2 } from "../webgpu/bioemu2/fold.js";
 import { alphaCarbonSpacings, bioemu2Pdb } from "../shared/bioemu2/structure.js";
@@ -62,7 +65,7 @@ import { GpuBufferAllocator } from "../webgpu/runtime/allocator.js";
 import { foldBackend, getDevice, loadModel, releaseModel } from "./model.js";
 import { releaseAllWeights } from "../webgpu/runtime/resident.js";
 import { AF3_FAMILIES, ALL_ATOM_FAMILIES, BIOEMU2_FAMILIES, MODEL_BUNDLES, MODELS_WITHOUT_CONFIDENCE,
-  SINGLE_SEQUENCE_FAMILIES, WEBGL2_FAMILIES, graphFamily }
+  PROTEINEBM_FAMILIES, SINGLE_SEQUENCE_FAMILIES, WEBGL2_FAMILIES, graphFamily }
   from "../shared/bundles/manifests/index.js";
 import { devBeginRun, devEndRun, devNote, devPhase, devStatus, devUseDevice } from "./dev-log.js";
 import { installDevPanel } from "./dev-panel.js";
@@ -628,8 +631,9 @@ const NATIVE_ONLY_FAMILIES = ["ef2-fast", "ef2"];
  * alignment features - the released Fast reads an alignment's profile and Full encodes it. Asked as one question
  * ("the single-sequence tier"), choosing the 6B Fast hid the row it was chosen on and sent AlphaFold 3's step count.
  */
-const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family);
-const isEsmfold2 = (family) => readsNoAlignment(family) || NATIVE_ONLY_FAMILIES.includes(family);
+// (ProteinEBM reads none either: its input is a structure of the sequence, not an alignment)
+const readsNoAlignment = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family) || PROTEINEBM_FAMILIES.includes(family);
+const isEsmfold2 = (family) => SINGLE_SEQUENCE_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 const supportsAllAtom = (family) => ALL_ATOM_FAMILIES.includes(family) || NATIVE_ONLY_FAMILIES.includes(family);
 /**
  * Which models read a declared covalent bond - a Bond row, and a Crosslink row, which is a bridge ligand bonded to two
@@ -678,6 +682,7 @@ const MODEL_STEMS = {
   "ef2-fast": "esmfold2_fast",
   ef2: "esmfold2",
   bioemu2: "bioemu2",
+  proteinebm: "proteinebm",
 };
 
 /** What to call each model while its weights download. */
@@ -734,6 +739,7 @@ const MODEL_LABELS = {
   "ef2-fast": "ESMFold2-Fast (ESM-C 6B)",
   ef2: "ESMFold2",
   bioemu2: "BioEmu2",
+  proteinebm: "ProteinEBM",
   // 🔴 AND THE FIVE AF2 MODELS SAY WHICH ONE IS LOADING, DERIVED RATHER THAN
   // TYPED. A delta downloads its BASE as well as itself, so the dial reading
   // "AlphaFold 2 · 73 / 116 MiB" under model 2 is the only place a reader is
@@ -975,7 +981,9 @@ const FOLD_CONTROLS = ["model-family", "af2Model", "plm-mode", "msa-mode",
                        "af3-count", "random-seed",
                        // BioEmu2's own: its mode, its sample count and its propagation (its contacts are Contact rows)
                        "bioemu2-mode", "bioemu2-samples", "bioemu2-lag",
-                       "bioemu2-propagation-steps", "bioemu2-propagate-from"];
+                       "bioemu2-propagation-steps", "bioemu2-propagate-from",
+                       // ProteinEBM's: its steps, temperature, time level, self-conditioning and starting structure
+                       "proteinebm-steps", "proteinebm-temp", "proteinebm-t", "proteinebm-selfcond", "proteinebm-from"];
 
 /** What the form says now, in one object the session can carry. */
 function formInputs() {
@@ -1303,6 +1311,7 @@ function startModelPreload(family, signal) {
   // 300M one down AlphaFold 2's branch, which is the `family === "af3"` mistake
   // this file already records once.
   const load = BIOEMU2_FAMILIES.includes(family) ? loadBioemu2Weights(report)
+    : PROTEINEBM_FAMILIES.includes(family) ? loadProteinEbmWeights(report)
     : SINGLE_SEQUENCE_FAMILIES.includes(family)
     ? loadEsmfold2Weights(report,
                           { languageModel: needsLanguageModel, family })
@@ -2629,6 +2638,11 @@ function syncModelControls() {
   if (countNode !== null) countNode.hidden = !sampled;
   // ...and BioEmu2's own rows: its mode, its samples, its contacts, and - in propagation - the lag and the steps
   syncBioemu2Controls(bioemu2);
+  // ...and ProteinEBM's, which also has no recycles to set (one energy evaluation a step, no trunk to recycle)
+  const proteinebm = PROTEINEBM_FAMILIES.includes(family);
+  syncProteinEbmControls(proteinebm);
+  const recyclesNode = document.getElementById("recyclesGroup");
+  if (recyclesNode !== null) recyclesNode.hidden = proteinebm;
   // 🔴 ESMFold2 FOLDS FROM ITS LANGUAGE MODEL, AND AN ALIGNMENT IS AN OPT-IN.
   // Its experimental tier reads ESM-C alone (`disable_msa_features` in its
   // checkpoint), so it has no MSA row: a search left live would run, take a
@@ -2744,6 +2758,14 @@ function syncBioemu2Controls(shown = BIOEMU2_FAMILIES.includes(chosenFamily())) 
   if (node !== null) node.hidden = !(shown && propagating);
   const upload = document.getElementById("bioemu2-x0-file");
   if (upload !== null) upload.hidden = document.getElementById("bioemu2-propagate-from")?.value !== "upload";
+}
+
+/** ProteinEBM's row (index.html's proteinebmGroup), and its file box only when the source is a PDB file. */
+function syncProteinEbmControls(shown = PROTEINEBM_FAMILIES.includes(chosenFamily())) {
+  const node = document.getElementById("proteinebmGroup");
+  if (node !== null) node.hidden = !shown;
+  const upload = document.getElementById("proteinebm-x0-file");
+  if (upload !== null) upload.hidden = document.getElementById("proteinebm-from")?.value !== "upload";
 }
 
 /** The count dial, rebuilt for the sampler - see AF3_COUNTS for why. */
@@ -4367,6 +4389,189 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
 }
 
 /**
+ * ProteinEBM's Langevin dynamics on this page's WebGPU (webgpu/proteinebm), FROM a structure of the sequence in the box.
+ *
+ * 🔴 EACH STEP IS A FORWARD AND A BACKWARD PASS: the score is the gradient of the energy, so the run is
+ * shared/proteinebm/langevin.js's update over webgpu/proteinebm's evaluate - both held to the vendor's torch
+ * (tools/gpu/check-proteinebm.js replays its noise step for step).
+ *
+ * 🔴 THE FRAMES ARE THE DENOISED PREDICTION, NOT THE SAMPLER'S STATE. At t = 0.1 the walker is a sample of the
+ * NOISED marginal - about 3 A of noise a coordinate, consecutive CA ~6.5 A apart - and the structure it stands for is
+ * compute_score's pred_coords, which is what run_dynamics.py logs. Each frame carries [step, energy] for py2Dmol's
+ * scatter, as the vendor's notebook plots it; Stop keeps the frames so far.
+ */
+async function runProteinEbm({ chains, chainKinds, signal, modelLoad, templates }) {
+  const family = "proteinebm";
+  const modelName = MODEL_LABELS[family];
+  const started = performance.now();
+  if (chains.length !== 1 || chainKinds[0] !== "protein") {
+    throw new Error("ProteinEBM dynamics runs one protein chain here - give the entity list a single protein");
+  }
+  if (templates.length > 0) throw new Error("ProteinEBM takes no template; its starting structure is the From row");
+  const sequence = chains[0];
+  const value = (id) => document.getElementById(id)?.value;
+  const steps = Math.round(Number(value("proteinebm-steps")));
+  const tempScaling = Number(value("proteinebm-temp"));
+  const t = Number(value("proteinebm-t"));
+  if (!(steps >= 1)) throw new Error("ProteinEBM's step count must be at least 1");
+  if (!(tempScaling >= 0)) throw new Error("ProteinEBM's temperature scaling must be a number of at least 0");
+  if (!(t > 0 && t <= 1)) throw new Error("ProteinEBM's time level t must be in (0, 1]");
+  const selfCondition = value("proteinebm-selfcond") === "current" ? "current" : "none";
+  // the starting structure: an uploaded PDB, or the last fold on this page - each must be OF this sequence
+  let text;
+  let where;
+  if ((value("proteinebm-from") ?? "last") === "upload") {
+    const file = document.getElementById("proteinebm-x0-file")?.files?.[0];
+    if (file === undefined) throw new Error("Choose a PDB to start ProteinEBM from, or start from the last fold");
+    text = await file.text();
+    where = file.name;
+  } else {
+    text = lastPrediction?.pdb;
+    where = `the last fold (${lastPrediction?.stem ?? "unnamed"})`;
+    if (typeof text !== "string") {
+      throw new Error("ProteinEBM simulates a structure: fold this sequence with any model first, or choose a PDB file");
+    }
+  }
+  const trace = startingTrace(text, sequence, where);
+  status(`${modelName} · loading`);
+  const loaded = await modelLoad;
+  throwIfAborted(signal);
+  const device = await getDevice();
+  throwIfAborted(signal);
+  status(`${modelName} · recording ${sequence.length} residues`);
+  const net = await proteinEbmNetwork(device, loaded.read, trace);
+  throwIfAborted(signal);
+
+  predictionCount += 1;
+  const stem = foldStem(`${MODEL_STEMS[family]}_${predictionCount}`);
+  openBlankFold(stem);
+  viewer = undefined;
+  viewerObject = undefined;
+  const api = window.py2Dmol;
+  // about a hundred frames whatever the length of the run, each superposed on the first so the play bar does not drift
+  const every = Math.max(1, Math.round(steps / 100));
+  const frames = [];
+  let reference;
+  let scatterAsked = false;
+  const draw = (frame) => {
+    if (api?.frameFromText === undefined) return;
+    const registry = window.py2dmol_viewers ?? {};
+    const renderer = registry[Object.keys(registry)[0]]?.renderer;
+    const object = renderer?.objectsData?.[renderer?.currentObjectName];
+    if (renderer === undefined || object === undefined) return;
+    try {
+      foldIsShowing(renderer);
+      const shown = api.frameFromText(frame.pdb);
+      shown.name = shown.label = shown.title = frame.label;
+      shown.scatter = [frame.step, frame.energy];
+      renderer.addFrame(shown, renderer.currentObjectName);
+      object.scatterConfig = { xlabel: "Step", ylabel: "Energy", xlim: null, ylim: null };
+      renderer.setFrame(object.frames.length - 1);
+      if (!scatterAsked) { setColourMode("auto"); orientBestView(renderer); }
+      showEnsembleScatter(renderer, !scatterAsked);
+      scatterAsked = true;
+    } catch (cause) {
+      console.warn("live frame skipped:", cause);
+    }
+  };
+  const evaluate = (pos, sc) => net.evaluate(pos, { sc, t });
+  const seed = randomSeed();
+  let stopped = false;
+  let last;
+  for await (const frame of langevin(evaluate, trace.ca, { ...LANGEVIN_DEFAULTS, steps, t, tempScaling, selfCondition, seed })) {
+    last = frame;
+    if (frame.step % every === 0 || frame.step === steps - 1) {
+      const atoms = sequence.length;
+      reference ??= frame.denoised;
+      const placed = weightedRigidAlign(frame.denoised, reference, new Float32Array(atoms).fill(1), atoms);
+      const one = { step: frame.step, energy: frame.energy, label: `step_${frame.step}`, xyz: placed,
+                    pdb: caPdb(placed, sequence, trace.residueIdx) };
+      frames.push(one);
+      draw(one);
+    }
+    status(`${modelName} · step ${frame.step + 1}/${steps} · energy ${frame.energy.toFixed(1)}`);
+    progress((frame.step + 1) / steps);
+    if (signal.aborted) { stopped = true; break; }
+  }
+  if (frames.length === 0) throwIfAborted(signal);
+  // the finished run as the object's frames, the last one the saved structure
+  const final = frames[frames.length - 1];
+  // the contact map is how often each CA pair is within 8 A across the frames - the trajectory's own answer
+  const n = sequence.length;
+  const contactProbs = new Float32Array(n * n);
+  for (const { xyz } of frames) {
+    for (let i = 0; i < n; i += 1) {
+      for (let j = 0; j < n; j += 1) {
+        const d = Math.hypot(xyz[i * 3] - xyz[j * 3], xyz[i * 3 + 1] - xyz[j * 3 + 1], xyz[i * 3 + 2] - xyz[j * 3 + 2]);
+        if (d < 8) contactProbs[i * n + j] += 1 / frames.length;
+      }
+    }
+  }
+  const scores = { sequence, energy: frames.map((f) => [f.step, Number(f.energy.toFixed(4))]),
+                   contact_probs: Array.from({ length: n }, (_, i) =>
+                     Array.from(contactProbs.subarray(i * n, i * n + n), (v) => Number(v.toFixed(3)))) };
+  const registry = window.py2dmol_viewers ?? {};
+  const liveRenderer = registry[Object.keys(registry)[0]]?.renderer;
+  const camera = { ...(liveRenderer?.viewerState ?? {}) };
+  const live = liveRenderer?.objectsData?.[liveRenderer?.currentObjectName];
+  if (live?.frames !== undefined) live.frames.length = 0;
+  await loadIntoViewer({ stem, pdb: frames[0].pdb, scores, confidence: undefined, frameName: frames[0].label });
+  if (viewer !== undefined && Object.keys(camera).length > 0) {
+    Object.assign(viewer.viewerState, camera);
+    viewer.render?.("localfold.restore-camera");
+  }
+  if (api?.frameFromText !== undefined && viewer !== undefined) {
+    const object = viewer.objectsData?.[viewerObject];
+    // (the trajectory's contact frequency is one map for the whole run, so every frame carries it)
+    const contact = contactMapFor(contactProbs, undefined);
+    const first = object?.frames?.[0];
+    if (first !== undefined) {
+      first.name = first.label = first.title = frames[0].label;
+      first.scatter = [frames[0].step, frames[0].energy];
+      if (contact !== undefined) first.maps = { ...first.maps, contact };
+    }
+    for (const frame of frames.slice(1)) {
+      const shown = api.frameFromText(frame.pdb);
+      shown.name = shown.label = shown.title = frame.label;
+      shown.scatter = [frame.step, frame.energy];
+      if (contact !== undefined) shown.maps = { ...shown.maps, contact };
+      viewer.addFrame(shown, viewerObject);
+    }
+    if (object !== undefined) object.scatterConfig = { xlabel: "Step", ylabel: "Energy", xlim: null, ylim: null };
+    setColourMode("auto");
+    viewer.setFrame(frames.length - 1);
+    showEnsembleScatter(viewer, true);
+    viewer.render("proteinebm-final");
+  }
+  updateScoresCard(undefined);
+  recordPrediction({
+    stem, pdb: final.pdb, chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
+    chainLengths: chains.map((chain) => chain.length),
+    contactSource: { contactProbs },
+    model: modelName,
+    ...foldContext,
+    settings: {
+      seed, steps: last ? last.step + 1 : 0, "temperature scaling": tempScaling, t, "self-conditioning": selfCondition,
+      dt: LANGEVIN_DEFAULTS.dt, start: where, "final energy": Number(final.energy.toFixed(4)),
+    },
+  }, family);
+  void rememberSessionWhenSettled(lastPrediction);
+  // the chain gate the CLI tools assert, as a warning here, on the last denoised frame
+  const spacings = [];
+  const xyz = last.denoised;
+  for (let i = 1; i < sequence.length; i += 1) {
+    spacings.push(Math.hypot(xyz[i * 3] - xyz[i * 3 - 3], xyz[i * 3 + 1] - xyz[i * 3 - 2], xyz[i * 3 + 2] - xyz[i * 3 - 1]));
+  }
+  const verdict = chainGeometryVerdict(chainGeometryOf(spacings));
+  const seconds = ((performance.now() - started) / 1000).toFixed(1);
+  status(`${modelName} · ${sequence.length} res · ${last.step + 1}${stopped ? ` of ${steps}` : ""} steps`
+    + `${stopped ? " (stopped)" : ""} · t ${t} · temp ${tempScaling}`
+    + ` · energy ${frames[0].energy.toFixed(1)} -> ${final.energy.toFixed(1)} · ${seconds}s`
+    + (verdict.ok ? "" : " · NOT A CHAIN"));
+  progress(null);
+}
+
+/**
  * WHERE THIS FOLD HAPPENS, AND HOW TO ASK.
  *
  * 🔴 THE PAGE IS SERVED BY THE THING THAT FOLDS, so this is SAME-ORIGIN and
@@ -5006,6 +5211,11 @@ async function fold(event) {
       throw new Error(`${MODEL_LABELS[family] ?? family} folds on a native backend only - run \`localfold serve\``
         + " with its export on disk (metal/README.md)");
     }
+    // 🔴 ProteinEBM HAS NO NATIVE PORT YET: its forward and backward are webgpu/proteinebm's alone
+    if (PROTEINEBM_FAMILIES.includes(family) && remoteBackend() !== null) {
+      throw new Error("ProteinEBM runs on this page's WebGPU only - it has no native port yet;"
+        + " open the page without a backend to run it");
+    }
     if (remoteBackend() !== null) {
       await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,
                             templates: request.templates ?? [], family, signal });
@@ -5034,6 +5244,7 @@ async function fold(event) {
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family && backend === "webgpu") {
       releaseAllWeights(await getDevice());
       releaseBioemu2(await getDevice());
+      releaseProteinEbm(await getDevice());
     }
     lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
@@ -5300,6 +5511,10 @@ async function fold(event) {
     if (BIOEMU2_FAMILIES.includes(family)) {
       await foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications,
                               constraints: request.constraints });
+      return;
+    }
+    if (PROTEINEBM_FAMILIES.includes(family)) {
+      await runProteinEbm({ chains, chainKinds, signal, modelLoad, templates: request.templates ?? [] });
       return;
     }
     if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {
@@ -6181,6 +6396,7 @@ document.getElementById("plm-mode")?.addEventListener("change", () => {
 for (const id of ["bioemu2-mode", "bioemu2-propagate-from"]) {
   document.getElementById(id)?.addEventListener("change", () => syncBioemu2Controls());
 }
+document.getElementById("proteinebm-from")?.addEventListener("change", () => syncProteinEbmControls());
 // 🔴 URL FIRST, THEN BOTH SYNCS, IN THE LISTENER'S ORDER. `?model=` moves the
 // row after syncMode() has already read it above, so the controls have to be
 // brought back into agreement exactly as a change event would - and

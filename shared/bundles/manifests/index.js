@@ -367,6 +367,22 @@ export const MODEL_BUNDLES = {
     variable: "LOCALFOLD_INCLUDE_BIOEMU2_MODEL",
     load: () => import("./bioemu2.js"),
   },
+  // ProteinEBM (Roney et al. 2025, jproney/ProteinEBM, MIT): an ENERGY of a CA trace given its sequence, whose
+  // gradient is the score - so the page runs Langevin DYNAMICS from a structure rather than folding a sequence.
+  // A forward and a backward pass a step (webgpu/proteinebm/network.js), held to the vendor's torch at 4e-6 on the
+  // score (tools/gpu/check-proteinebm.js). No confidence head.
+  //
+  // model_1_frozen_1m_md (the checkpoint the paper's dynamics and decoy ranking use), 426 tensors, 84 M parameters,
+  // float32 for now (321 MiB). 🔴 NOT PUBLISHED: `remote: null`, so the site build leaves the option out and a
+  // checkout with the export (tools/export_proteinebm_model.py) offers it.
+  proteinebm: {
+    model: "proteinebm",
+    directory: "./model-proteinebm-1-f32/",
+    remote: null,
+    release: "proteinebm-1-f32",
+    variable: "LOCALFOLD_INCLUDE_PROTEINEBM_MODEL",
+    load: () => import("./proteinebm.js"),
+  },
   // ESMFold2-Experimental-Fast: no alignment, no template, one sequence.
   //
   // 🔴 IT IS TWO BUNDLES AND THE FIRST ENTRY IN THIS TABLE THAT IS. The folding
@@ -476,10 +492,13 @@ export const ALL_ATOM_FAMILIES = ["af3", "openbind0", "opendde", "boltz2",
  * needs a TM term, which AlphaFold 3's head emits and OpenDDE's does not, and
  * deriving one from the PAE would be a different quantity wearing pTM's name.
  */
-export const MODELS_WITHOUT_CONFIDENCE = ["ef2-fast-600m", "ef2-fast-300m", "bioemu2"];
+export const MODELS_WITHOUT_CONFIDENCE = ["ef2-fast-600m", "ef2-fast-300m", "bioemu2", "proteinebm"];
 
 /** The families that run BioEmu2's own graph (webgpu/bioemu2), neither AF2's nor AF3's. */
 export const BIOEMU2_FAMILIES = ["bioemu2"];
+
+/** The families that run DYNAMICS from a structure on an energy model (webgpu/proteinebm) rather than fold. */
+export const PROTEINEBM_FAMILIES = ["proteinebm"];
 
 /** Which models fold from a single sequence and take no alignment at all. */
 export const SINGLE_SEQUENCE_FAMILIES = ["ef2-fast-600m", "ef2-fast-300m"];

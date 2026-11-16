@@ -208,6 +208,12 @@ BUNDLES = {
         "module": "shared/bundles/manifests/bioemu2.js",
         "model": "bioemu2",
     },
+    # ProteinEBM's model_1_frozen_1m_md, float32 (tools/export_proteinebm_model.py). Not published yet.
+    "proteinebm": {
+        "export": "model-proteinebm-1-f32",
+        "module": "shared/bundles/manifests/proteinebm.js",
+        "model": "proteinebm",
+    },
     # ESMFold2-Experimental-Fast's folding half: the trunk, the inputs embedder
     # and the whole structure head, at int5 group 32. 122 MiB.
     #

@@ -231,6 +231,10 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                        time; its own graph is webgpu/bioemu2 (a PairMixer trunk and a
                        dual-stream denoiser). Its rows below show with it. -->
                   <option value="bioemu2">BioEmu2</option>
+                  <!-- 🔴 DYNAMICS, NOT A FOLD. ProteinEBM (Roney et al. 2025, MIT) is an energy over a CA trace given
+                       its sequence; the page runs its Langevin dynamics FROM a structure of the sequence in the box
+                       (the last fold, or a PDB). Its rows below show with it. -->
+                  <option value="proteinebm">ProteinEBM dynamics</option>
                 </select>
               </div>
 
@@ -383,6 +387,30 @@ AI Context: STANDALONE WEB APP ENTRY POINT
                   <option value="upload">PDB file</option>
                 </select>
                 <input type="file" id="bioemu2-x0-file" accept=".pdb" hidden>
+              </div>
+
+              <!-- 🔴 ProteinEBM'S OWN ROWS, SHOWN WITH IT (syncProteinEbmControls). The update is the vendor's Langevin
+                   notebook's at a fixed time level t; Temp is its temperature scaling (the notebook's 0.85714), and
+                   self-conditioning is OFF by default because that is what the vendor's scripts actually run
+                   (shared/proteinebm/langevin.js says why). -->
+              <div class="fetch-option-group" id="proteinebmGroup" hidden>
+                <span class="fetch-option-title">Steps</span>
+                <input type="number" id="proteinebm-steps" value="200" min="1" max="100000" step="1" title="How many Langevin steps to run; each is one forward and one backward pass of the energy model.">
+                <span class="fetch-option-title">Temp</span>
+                <input type="number" id="proteinebm-temp" value="0.85714" min="0" step="any" title="Temperature scaling of the score (the vendor's notebook uses 0.85714; 1 is the model's own temperature, lower is colder).">
+                <span class="fetch-option-title">t</span>
+                <input type="number" id="proteinebm-t" value="0.1" min="0.001" max="1" step="any" title="The diffusion time level the energy is evaluated at (0.1 in the vendor's dynamics; larger is a smoother, noisier landscape).">
+                <span class="fetch-option-title">Self-cond</span>
+                <select id="proteinebm-selfcond" title="Off: a zero self-conditioning channel, which is what the vendor's dynamics scripts run. Current: the current coordinates, as the Langevin notebook passes them.">
+                  <option value="none" selected>Off</option>
+                  <option value="current">Current</option>
+                </select>
+                <span class="fetch-option-title">From</span>
+                <select id="proteinebm-from" title="The starting structure: the last fold of this same sequence (any model), or a PDB of it.">
+                  <option value="last" selected>Last fold</option>
+                  <option value="upload">PDB file</option>
+                </select>
+                <input type="file" id="proteinebm-x0-file" accept=".pdb" hidden>
               </div>
 
               <!-- MSA options on the right of the row -->

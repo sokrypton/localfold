@@ -11,9 +11,9 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-564 tools. `tools/fixtures/` is data and is not listed.
+569 tools. `tools/fixtures/` is data and is not listed.
 
-## `tools/gpu/` - the WebGPU lane (313)
+## `tools/gpu/` - the WebGPU lane (315)
 
 Each exports `async function main(device, args)` and is run as
 `node tools/gpu-chrome.mjs tools/gpu/<module>.js [--flags]`.
@@ -130,6 +130,7 @@ Each exports `async function main(device, args)` and is run as
 - **`check-opendde-structural.js`** - OpenDDE's structural expander and refiner, against af3-any-model's own.
 - **`check-opm-paths.js`** - The outer product mean's two paths, on ONE input, compared against each other.
 - **`check-pipeline-key-collisions.js`** - Do two models' trunks collide in ONE pipeline cache - the page's case?
+- **`check-proteinebm.js`** - Does webgpu/proteinebm compute jproney/ProteinEBM's energy and score - the forward AND the backward pass?
 - **`check-protenix2-empty-template.js`** - protenix2's template term as the TRUNK builds it: four EMPTY slots, 68 tokens.
 - **`check-quantised-upload.js`** - Does the SHIPPED GPU dequantiser decode what the host decoder decodes, at every codec a bundle in this repository uses?
 - **`check-recovery.js`** - WebGPU device-loss recovery in the studio: destroy the device mid-generation and between runs; the failed run must say the GPU was reset, and the next Generate must succeed on a new device (web/app.js `_watchDevice`).
@@ -203,6 +204,7 @@ Each exports `async function main(device, args)` and is run as
 - **`compare-rfd4p-arms.mjs`** - Compare two `check-rfd4p-length.js --arm=` runs on the host.
 - **`dump-bioemu2-stages.js`** - webgpu/bioemu2's stages, handed back as one base64 blob for tools/dump-bioemu2-webgpu.mjs to write as a cuda/featurise input directory - the oracle metal/bioemu2 reads with --oracle=.
 - **`dump-shaders.js`** - The WGSL another tool compiles, by pipeline label: wraps a tool's `main`, records every shader module's text and the labels of the pipelines built from it, and returns the modules whose label matches --match=<regex>.
+- **`dynamics-proteinebm.js`** - ProteinEBM Langevin dynamics on WebGPU, from a structure: a trajectory, its energy, and whether it stays a protein.
 - **`fold-af2-webgl.js`** - Fold AlphaFold 2's monomer in WebGL2, from a real weight bundle, beside the WGSL fold of the same weights.
 - **`fold-af2.js`** - An AlphaFold 2 monomer fold, end to end, so a kernel change can be compared against the tree before it.
 - **`fold-af3-webgl.js`** - Fold AlphaFold 3 in WebGL2, from a real weight bundle.
@@ -332,7 +334,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 - **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.
 
-## `tools/oracle/` - the reference side (67)
+## `tools/oracle/` - the reference side (69)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -389,6 +391,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_msap.py`** - MSA Pairformer's reference tensors for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
 - **`dump_msap_variants.py`** - MSA Pairformer's conservation and categorical Jacobian from the reference, for cuda/msap's --conservation and --jacobian.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.
+- **`dump_proteinebm.py`** - ProteinEBM's own energy and score, dumped for the WebGPU port to be held to.
 - **`dump_rdkit_smiles.py`** - RDKit's own answer for a corpus of SMILES, as the reference this port is held to.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
 - **`dump_rfd4p.py`** - Dump a deterministic RFD4-Proteina oracle from the upstream PyTorch code.
@@ -398,6 +401,7 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`oracle-io.mjs`** - Node helpers for reading RFD4-Proteina oracle dumps (`tools/oracle/dump_rfd4p.py`) and the released checkpoint, and for comparing tensors.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`probe_af3_sidechain_harness.py`** - Why does fold_check's AF3 contract side chains where run_alphafold's does not?
+- **`proteinebm_dynamics.py`** - ProteinEBM's Langevin dynamics run by the vendor's own code, for the WebGPU port's trajectory statistics.
 - **`regen_batch_dumps.py`** - Re-dump every reference batch tools/check-batch-fields.js reads, from the af3-any-model installed in ~/.venv-lfjax.
 - **`relative_encoding.py`** - Layer 1: the relative-position encoding, ours against AF2-multimer's.
 - **`run_chai_lab.py`** - Genuine chai-lab 0.6.1 on one sequence, every exported module's inputs and outputs recorded - Chai-1's oracle.
@@ -433,7 +437,7 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (162)
+## `tools/` - everything else (163)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
@@ -536,6 +540,7 @@ go through CDP, and the deploy.
 - **`export_msap.py`** - MSA Pairformer's weights for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
+- **`export_proteinebm_model.py`** - Export a ProteinEBM checkpoint (jproney/ProteinEBM, MIT) as a float32 bundle the page reads.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.
 - **`export_rfd4p_model.py`** - Export an RFD4-Proteina checkpoint (`model.safetensors` + `config.json`) into a `../localfold`-style sharded bundle (`manifest.json` + `shard_XXX.bin`) with symmetric per-block INT8 quantization (`block=64` + `float16` scale per block).
 - **`fold-clears-msa.py`** - Pressing Fold must take the PREVIOUS job's alignment off the page.
