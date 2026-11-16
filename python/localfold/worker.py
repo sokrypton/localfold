@@ -148,7 +148,9 @@ def fold_breakdown(said, fold_ms):
     confidence, ESMFold2's language model, embedder, trunk, sampler and confidence, AF2's passes - and what is left
     of the fold's time beside them (reading the input, writing the structure)."""
     rows = []
-    found = re.search(r"fold: trunk ([\d.]+) ms \((\d+) passes\), diffusion ([\d.]+) ms \((\d+) steps x (\d+)\), "
+    # (cf-af3 prints "fold 1: trunk ... ms (4 passes[, ...]), diffusion ... ms (200 steps x 1[, ...])": the fold's number
+    # and a suffix inside each parenthesis are optional here, so the stage breakdown reaches the page)
+    found = re.search(r"fold(?: \d+)?: trunk ([\d.]+) ms \((\d+) passes[^)]*\), diffusion ([\d.]+) ms \((\d+) steps x (\d+)[^)]*\), "
                       r"confidence ([\d.]+) ms", said)
     if found:
         trunk, passes, diffusion, steps, samples, confidence = found.groups()
