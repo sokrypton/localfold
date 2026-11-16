@@ -11,7 +11,7 @@ it is organised by the question a tool answers and says which arms are traps,
 which is what you want when you know what you are asking. Come here when you
 do not know whether a tool already exists.
 
-483 tools. `tools/fixtures/` is data and is not listed.
+475 tools. `tools/fixtures/` is data and is not listed.
 
 ## `tools/gpu/` - the WebGPU lane (289)
 
@@ -308,7 +308,7 @@ Each exports `async function main(device, args)` and is run as
 - **`trunk-oracle.js`** - af3-any-model's own trunk seams, compared against ours on the same batch.
 - **`webgl-execution-options.js`** - The WebGL2 backend's diagnostic switches, read off a tool's own arguments.
 
-## `tools/oracle/` - the reference side (45)
+## `tools/oracle/` - the reference side (41)
 
 These run against a checkout of the reference implementation, not against
 this port. They need its Python environment; see CLAUDE.md.
@@ -339,19 +339,15 @@ this port. They need its Python environment; see CLAUDE.md.
 - **`dump_af3_template.py`** - Dump a model's TEMPLATE EMBEDDER - its features, its inputs and its output.
 - **`dump_af3_trunk.py`** - Run the AF3 trunk on a toy protein, on CPU, and dump inputs and outputs.
 - **`dump_af3_trunk_taps.py`** - af3-any-model's whole TRUNK on the real 6MRR batch, stage by stage.
-- **`dump_batch_cpu.py`** - Dump the RFD4-Proteina *input pipeline* batch on CPU (no model, no GPU).
 - **`dump_bioemu2.py`** - BioEmu2's features and every stage of its network, from af3-any-model's own port.
 - **`dump_bioemu2_steering.py`** - BioEmu2's steered samplers on a toy denoiser, from af3-any-model's port.
 - **`dump_bioemu2_topology.py`** - BioEmu2's bonded graph, steering tables and physicality report, from af3-any-model's port.
 - **`dump_chai1_denoise.py`** - af3-any-model's diffusion head for Chai-1, one denoise step on the REAL trunk, with chai's own pair input.
 - **`dump_esmfold2_confidence.py`** - Synthyra's ESMFold2 ConfidenceHead, inputs and outputs, from THEIR code.
 - **`dump_monomer_template.py`** - Capture AF2-MONOMER's template embedder by running AF2's own module.
-- **`dump_msap.py`** - MSA Pairformer's reference tensors for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
-- **`dump_msap_variants.py`** - MSA Pairformer's conservation and categorical Jacobian from the reference, for cuda/msap's --conservation and --jacobian.
 - **`dump_multimer_template.py`** - Capture AF2-multimer's template embedder from JAX, with a REAL template.
 - **`dump_rdkit_smiles.py`** - RDKit's own answer for a corpus of SMILES, as the reference this port is held to.
 - **`dump_reference_conformers.py`** - Extract AF3's reference conformers for the 21 protein components.
-- **`dump_rfd4p.py`** - Dump a deterministic RFD4-Proteina oracle from the upstream PyTorch code.
 - **`dump_toy_multimer.py`** - Run AF2-multimer on a toy complex, on CPU, and dump inputs and outputs.
 - **`probe_af3_ptm_bonds.py`** - Does the REFERENCE inflate a modified residue too, or only this port?
 - **`regen_batch_dumps.py`** - Re-dump every reference batch tools/check-batch-fields.js reads, from the af3-any-model installed in ~/.venv-lfjax.
@@ -387,12 +383,11 @@ and turning it into a bundle.
 - **`safetensors_read.py`** - Read a .safetensors file into numpy arrays, without the safetensors package.
 - **`vector-quantise.py`** - Is a codebook worth a new decoder? Scalar codes against vector ones, at 2 bits.
 
-## `tools/` - everything else (127)
+## `tools/` - everything else (123)
 
 CPU checkers, the export and quantisation pipeline, the page drivers that
 go through CDP, and the deploy.
 
-- **`add_chai1_structure_to_blob.py`** - Add chai-lab's structure token-pair weights to af3-any-model's published chai1 blobs - the weights its converter drops.
 - **`add_distogram_head.py`** - Fold AlphaFold 2's distogram head into an exported bundle, as real tensors.
 - **`analyse_quantisation.py`** - What does each quantisation scheme cost AF3's weights, per bit of storage?
 - **`append_template_single.py`** - Add AlphaFold 2's template SINGLE features to the published monomer bundles, leaving every shard already there byte-identical.
@@ -430,7 +425,6 @@ go through CDP, and the deploy.
 - **`check-model-pending.py`** - One fold at a time, and a model row that starts a new session.
 - **`check-model-switch.py`** - Ten models folded in ONE page, as a reader switching models does.
 - **`check-modified-path.mjs`** - Does every model fold a MODIFIED RESIDUE, and does it hold together?
-- **`check-multigpu.py`** - One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
 - **`check-native-bioemu2-steering.mjs`** - Is cuda/cpp/bioemu2/src/steer.h - BioEmu2's steering natively - the JavaScript's, and af3-any-model's?
 - **`check-native-bioemu2.mjs`** - Is cuda/cpp/featurise/bioemu2_features.h the JavaScript featuriser, byte for byte?
 - **`check-native-bridge.py`** - The Colab bridge carries a CUDA fold both ways, and the feed is LIVE: npm run test:bridge.
@@ -464,13 +458,11 @@ go through CDP, and the deploy.
 - **`export_alphafold_structure_reference.py`** - Replay and export the official AF2 structure module from a trunk fixture.
 - **`export_alphafold_template_parameters.py`** - Add official model template parameters to an existing reference manifest.
 - **`export_bioemu2_model.py`** - Export BioEmu2 (af3-any-model's bioemu2.bin.zst) as a float32 bundle the page reads.
-- **`export_chai1_structure_pair.py`** - Add chai-lab's STRUCTURE token-pair weights to a Chai-1 bundle - the half af3-any-model's converter drops.
 - **`export_confidence_reference.py`** - Export AF2 pLDDT/PAE head parameters and final-recycle reference logits.
 - **`export_esmc6b.py`** - ESM-C 6B (the tower of the released ESMFold2 and ESMFold2-Fast) as a bundle the native port reads, with the tower's matrices kept int8 - from af3-any-model's own quantisation, not a second one.
 - **`export_esmc_model.py`** - ESM-C's tower and ESMFold2's shim -> the bundle format the browser reads.
 - **`export_esmfold2_trunk.py`** - ESMFold2's folding trunk -> a LocalFold bundle, in AF3's pairformer layout.
 - **`export_monomer_model.py`** - Write a LocalFold float32 monomer directory from AF2 params_model_N_ptm.npz.
-- **`export_msap.py`** - MSA Pairformer's weights for the native port (cuda/msap), in cuda/af3's model.idx/model.bin format.
 - **`export_multimer_model.py`** - Write a LocalFold float32 model directory from AF2-multimer parameters.
 - **`export_openfold_triangle.py`** - Export an OpenFold TriangleMultiplicationOutgoing differential-test bundle.
 - **`export_residue_geometry.py`** - Export AlphaFold residue geometry lookup tables into a fixture manifest.

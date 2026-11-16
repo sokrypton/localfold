@@ -1020,7 +1020,7 @@ the other. Stock Chrome, `LOCALFOLD_STOCK_FLAGS=1`, arms alternated. If an arm l
 6. The gates, now that every bundle is fetchable: `npm run test:stock`, `test:template`, `test:ligand` (with and
    without stock flags - the f16-only matrix units are what `matrixContractionOverflows` refuses).
 
-## 2026-10-15: memory - the CUDA ports' notes (docs/CUDA-TO-METAL.md on `opus-55-opt`), applied here
+## 2026-10-15: memory - the CUDA ports' notes (then docs/CUDA-TO-METAL.md on `opus-55-opt`, now colabfold-cuda's `dev/cuda-to-metal.md`), applied here
 
 The CUDA side's three memory items, done for Metal: the template stage, scratch shared between modules (with the
 scribble that proves it), and a fit check measured past the line. Traced with a new instrument first, because the
