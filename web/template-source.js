@@ -28,7 +28,7 @@ import {
   residueCode, templateSlot, templateSlotAtom37,
 } from "../shared/af3/featurise/template-input.js";
 import { ONE_LETTER } from "../webgpu/af3/fold.js";
-import { parseCIFAtoms } from "../cpu/design/mpnn/pdb.js";
+import { parseCIFAtoms } from "../shared/input/mmcif-atoms.js";
 
 const RCSB = "https://files.rcsb.org/download";
 const AFDB_API = "https://alphafold.ebi.ac.uk/api/prediction";

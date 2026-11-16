@@ -128,9 +128,9 @@ is a `Float32Array` and a parsed PDB coordinate is a double, so an exact
 comparison fails on a correct conversion.
 
 🔴 **AND THE TABLE MOVED TO `shared/af3/featurise/template-features.js`.** It was in
-`cpu/design/mpnn/constants.js`, and importing it from the featuriser is an
-`af3 <-> design` cycle. It sits beside `AF2_ATOM37_MONOMER` now - the layout and
-the dialect that describes it in one file - and mpnn re-exports it.
+the ProteinMPNN mirror's `constants.js` (since removed), and importing it from the
+featuriser was an `af3 <-> design` cycle. It sits beside `AF2_ATOM37_MONOMER` now -
+the layout and the dialect that describes it in one file.
 
 ### Stripping side chains changes NOTHING, which is the fact AF2BIND rests on
 
