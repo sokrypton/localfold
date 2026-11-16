@@ -222,7 +222,7 @@ def main():
             print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "
                   + ("byte-identical to a fast one" if ok else "differs from a fast one: " + arms[1][-120:].decode(errors="replace")))
 
-        # 🔴 THE BIG-INPUT PATH KEEPS THE PAIR bf16 PAST THE TRUNK (cuda/af3/README.md, "7,900 tokens on a 40 GB A100"):
+        # 🔴 THE BIG-INPUT PATH KEEPS THE PAIR bf16 PAST THE TRUNK (cuda/dev/af3.md, "7,900 tokens on a 40 GB A100"):
         # the distogram, the streamed diffusion preparation and the confidence head read bf16 rows there, and nothing
         # else folds that path below thousands of tokens. LOCALFOLD_BIG=1 runs it at any size, and its structure is the
         # same path's with the pair widened (LOCALFOLD_WIDEN_PAIR=1) to the byte - the diffusion reads exactly the values

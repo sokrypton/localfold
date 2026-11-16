@@ -10,7 +10,7 @@ and folds correctly on this box. Branch argon-ptx routed every f32 -> f16x2/bf16
 hand-written PTX (cvt.rn.f16x2.f32, cvt.rn.bf16x2.f32, max.f16x2: sm_80 instructions), and AF2 then failed ptxas for
 sm_75 with 13,688 errors, AF3 with 15,068 - the T4, and the wheel's multi-arch build (75 80 86 89 90 100 120) with it -
 while every gate on this machine stayed green. Compiling is the cheap half: whether a T4 FOLDS right is rehearsed on
-the A100 with compute_75 PTX and LOCALFOLD_EMULATE_CC=75 (cuda/af2/README.md), or run on Colab.
+the A100 with compute_75 PTX and LOCALFOLD_EMULATE_CC=75 (cuda/dev/af2.md), or run on Colab.
 
 Each port's one translation unit is compiled as cuda/build.sh compiles it (the same flags, -arch=sm_75) to an object
 in a temporary directory, the ports in parallel; nothing is linked or installed. A failure prints the compiler's

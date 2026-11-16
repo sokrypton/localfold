@@ -280,7 +280,7 @@ def cases(offline):
          "controls": be2(**{"bioemu2-mode": "propagate"}), "entities": [protein(s5)], "job": job([s5]),
          "bioemu2Frame": "previous"}, None, None, None, "atom(s) of this input"),
     ]
-    # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/README.md) where their bundles
+    # biohub's released ESMFold2-Fast and ESMFold2 (ESM-C 6B, local exports only: metal/dev/METAL.md) where their bundles
     # are on disk under the names fetch-weights gives them - nothing downloads them, so absent is a skip, not a failure
     weights = os.environ.get("LOCALFOLD_WEIGHTS_DIR") or os.path.expanduser("~/.cache/localfold")   # (fetch.h's home())
     released = lambda *dirs: all(os.path.exists(os.path.join(weights, d, "manifest.json")) for d in dirs)

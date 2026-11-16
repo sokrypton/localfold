@@ -4237,7 +4237,7 @@ result). On a 15 GB T4 the half-full rule keeps about two.
 
 **On the T4 itself**, profiled on Colab: a 262-residue AF3 fold is 4.0 s, 91% trunk, and its grid attention's
 flash kernel ran at 3.5-6 TFLOP/s - no cp.async and 64 KB of shared memory on Turing. A register-staged
-form (cuda/af3/README.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
+form (cuda/dev/af3.md, "On a T4") is 2.1x on that kernel and 5-6.5% on the fold, with identical
 output; the T4 is power-capped, so a busier kernel lowers the clock for the rest (AF2: the flash kernels
 -1.6 s, the GEMMs +0.8 s, the fold -3%).
 

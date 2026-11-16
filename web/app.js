@@ -5004,7 +5004,7 @@ async function fold(event) {
     // about the JOB, and the job is the same wherever it runs.
     if (NATIVE_ONLY_FAMILIES.includes(family) && remoteBackend() === null) {
       throw new Error(`${MODEL_LABELS[family] ?? family} folds on a native backend only - run \`localfold serve\``
-        + " with its export on disk (metal/README.md)");
+        + " with its export on disk (metal/dev/METAL.md)");
     }
     if (remoteBackend() !== null) {
       await foldOnBackend({ chains, chainKinds, ligandCodes, modifications,

@@ -359,7 +359,7 @@ def serve(port, token, host="127.0.0.1", worker=None, gpu=None, local=False):
                                         # (which native port folds: cuda/ or metal/)
                                         "native": NATIVE if worker is not None else None,
                                         # ...and the models it folds that the page's own WebGPU does not: biohub's
-                                        # released ESMFold2-Fast and ESMFold2, from local exports (metal/README.md)
+                                        # released ESMFold2-Fast and ESMFold2, from local exports (metal/dev/METAL.md)
                                         "models": native_models() if worker is not None else [],
                                         "gpu": gpu})
             return super().do_GET()

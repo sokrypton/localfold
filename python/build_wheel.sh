@@ -12,13 +12,13 @@ out="$(mkdir -p "${1:-$here/dist}" && cd "${1:-$here/dist}" && pwd)"
 py="${PYTHON:-python3}"
 # every card from a T4 (sm_75) to Blackwell (sm_100 B200, sm_120 RTX 50xx / RTX PRO 6000), and the newest's PTX for
 # a card newer still (its driver compiles that on first launch)
-export LOCALFOLD_CUDA_ARCHS="${LOCALFOLD_CUDA_ARCHS:-75 80 86 89 90 100 120}"
+archs="75 80 86 89 90 100 120"
 # the binaries sit in site-packages/localfold/bin and pip puts cuBLAS in site-packages/nvidia/cublas/lib
-export LOCALFOLD_RPATH='$ORIGIN/../../nvidia/cublas/lib'
+rpath='$ORIGIN/../../nvidia/cublas/lib'
 # one port at a time: each compiles its architectures in parallel (nvcc --threads 0), and all at once would
 # hold ~3x the memory of a CI runner's worth
 for port in af3 af2 ef2 bioemu2; do
-  bash "$repo/cuda/build.sh" "$port" || { tail -30 /tmp/localfold-cuda-build.log >&2; exit 1; }
+  bash "$repo/cuda/build.sh" --archs="$archs" --rpath="$rpath" "$port" || { tail -30 /tmp/localfold-cuda-build.log >&2; exit 1; }
 done
 bin="$here/localfold/bin"
 rm -f "$bin"/cf-*

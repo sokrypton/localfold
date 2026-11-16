@@ -33,7 +33,7 @@ done
 # front and in parallel instead of one at a time as each is first reached (run metal/<port>/gate.py first to fill it)
 mkdir -p "$bin/metal-specs"; rm -f "$bin"/metal-specs/*.specs
 for port in af3 af2 ef2 bioemu2; do
-  name="$(LOCALFOLD_METAL_SPECS_NAME=1 "$bin/cf-$port")"
+  name="$("$bin/cf-$port" --specs-name)"
   if [ -f "$HOME/.cache/localfold/metal/$name" ]; then
     cp "$HOME/.cache/localfold/metal/$name" "$bin/metal-specs/$name"
     echo "$port: $(wc -l < "$bin/metal-specs/$name" | tr -d ' ') kernel specialisations shipped"

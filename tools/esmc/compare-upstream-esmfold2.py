@@ -165,7 +165,7 @@ def ours_warm(args, cases, work):
     if experimental(model):
         r = subprocess.run([os.path.join(ROOT, "cuda", "cpp", "featurise", "fetch-weights"), model], capture_output=True, text=True)
         dirs = re.findall(re.escape(model) + r": (/\S+)", r.stdout + r.stderr)
-    else:                       # (the released models' bundles are local exports: cuda/ef2/README.md, "The released models")
+    else:                       # (the released models' bundles are local exports: cuda/dev/ef2.md, "The released models")
         r = subprocess.CompletedProcess([], 1, "", "no local export")
         dirs = [os.path.join(ROOT, RELEASED[model]), os.path.join(ROOT, "model-esmc-6b-int8")]
         dirs = dirs if all(os.path.isdir(d) for d in dirs) else []

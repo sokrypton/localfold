@@ -219,13 +219,11 @@ def model_weights(model, log):
     table), downloaded the first time piece by piece, each said, so a slow download (one revision came at 0.9 MB/s on
     a Colab T4) reads as a download and not a hang. AlphaFold 3's are Google DeepMind's, for academic non-commercial
     use: the page folds only once its model-terms dialog has been accepted, which is the acceptance passed on."""
-    env = dict(os.environ)
-    if model == "af3":
-        accepted = {n.strip() for n in env.get("LOCALFOLD_ACCEPT_MODEL_TERMS", "").split(",") if n.strip()}
-        env["LOCALFOLD_ACCEPT_MODEL_TERMS"] = ",".join(sorted(accepted | {"alphafold3"}))
     where = [f"--weights-dir={WEIGHTS_DIR}"]
+    if model == "af3":                  # (the fetcher reads no environment: the acceptance is a flag)
+        where.append("--accept-model-terms=alphafold3")
     fetcher = subprocess.Popen([featuriser("fetch-weights"), *where, model], cwd=REPO, stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent, env=env)
+                               stderr=subprocess.STDOUT, text=True, bufsize=1, preexec_fn=die_with_parent)
     said, dirs = [], []
     for line in fetcher.stdout:
         said.append(line)
@@ -397,13 +395,11 @@ class Server:
         shutil.rmtree(self.dir, ignore_errors=True)
         os.makedirs(self.dir)
         self.log = open(os.path.join(self.dir, "server.log"), "w")
-        # (AF2_STARTUP / EF2_STARTUP: their weights' load time in the log, as AF3 prints its own)
-        env = {**os.environ, "AF2_STARTUP": "1", "EF2_STARTUP": "1"}
         self.started = time.time()
         self.ready = None              # when it said it was serving: its weights are up
         self.reported = False          # (its load time in the report once, with the fold that waited for it)
         self.proc = subprocess.Popen([*command, f"--serve={self.dir}"], cwd=REPO, stdout=self.log,
-                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent, env=env)
+                                     stderr=subprocess.STDOUT, preexec_fn=die_with_parent)
         # 🔴 NOT WAITED FOR: the worker starts a model's server BEFORE it featurises the job, so the CUDA
         # context, the weights' upload and AF2's and ESMFold2's warm-up fold (--warm: every kernel, weight copy
         # and cuBLAS plan loaded) run beside the exporter or the MSA search; a job dropped meanwhile is taken
@@ -468,7 +464,7 @@ class MultiServer(Server):
     """AlphaFold 2's five models in ONE process (cuda/af2 --multi: a thread a model, each its own stream, every global
     of the binary thread-local): a short fold fills a fifth of the card, and five folding at once share it - "All 5"
     over 68 residues 322 -> 150 ms on an A100, 150 residues 634 -> 451, 261 1571 -> 1316, each model's structure
-    byte-identical to its own server's (cuda/af2/README.md, Round 5 Modules 8-9). `lanes` is each model's argument
+    byte-identical to its own server's (cuda/dev/af2.md, Round 5 Modules 8-9). `lanes` is each model's argument
     list as Server would run it (its binary, bundle, delta and warm-up); each lane serves its own directory."""
 
     def __init__(self, key, lanes):
@@ -482,12 +478,11 @@ class MultiServer(Server):
             os.makedirs(where)
             command += (["::"] if i else []) + [*lane[1:], f"--serve={where}"]
         self.log = open(os.path.join(self.dir, "server.log"), "w")
-        env = {**os.environ, "AF2_STARTUP": "1"}
         self.started = time.time()
         self.ready = None
         self.reported = False
         self.proc = subprocess.Popen(command, cwd=REPO, stdout=self.log, stderr=subprocess.STDOUT,
-                                     preexec_fn=die_with_parent, env=env)
+                                     preexec_fn=die_with_parent)
         self.count = 0
 
     def fold_all(self, inputs, flags, live=None, on_file=None):
@@ -827,7 +822,7 @@ class Worker:
             server = self.server_for(key, [binary("ef2"), "-", f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast",
                                            "--warm=96,800"], residues)
             at = time.time()
-            # ESMFold2 reads one alignment a protein chain and pairs none (cuda/ef2/README.md: the vendor's taxonomy
+            # ESMFold2 reads one alignment a protein chain and pairs none (cuda/dev/ef2.md: the vendor's taxonomy
             # pairing is not done) - so what it cannot read is said, not dropped
             proteins = protein_chain_count(job["job"])
             if "--search" in flags and proteins > 1:

@@ -3942,7 +3942,7 @@ Command to structure, cold: upstream ~18 s (imports and the model load), ours 0.
 | 1TIM | 1.30 | 1.52 | **1.22** |
 
 Upstream's three backends agree within 0.02 A, and its default 0.3 dropout changes little. The two complexes the
-int5 bundle loses are its quantisation (cuda/ef2/README.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
+int5 bundle loses are its quantisation (cuda/dev/ef2.md: 1BRS 0.53 -> 0.92), not the port: on float32 weights
 the port matches or beats upstream on all four. The page ships int5 for its download; the native binaries could ship
 float32 (2.9 GB) or int8 instead.
 
@@ -4056,7 +4056,7 @@ fix to a cache cuda/ef2 never links (`triInGemmWeights` - the include graph said
 stopped reproducing on its own, and uninitialized device memory, ruled out by folding after filling the card with
 NaN. **Fixed in `447ed96`**; `LOCALFOLD_SLOW_UPLOAD_MS` makes the slow disk on demand (pLDDT 26 unfixed, byte-identical
 fixed), `test:standalone` holds a slow upload to a fast one, and `test/cuda-derived-caches.test.js` requires every
-device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/ef2/README.md, "Traps it cost".
+device-weight cache in cuda/ef2's include graph to register a forget hook. See cuda/dev/ef2.md, "Traps it cost".
 
 ### Upstream's own problems, met on the way
 

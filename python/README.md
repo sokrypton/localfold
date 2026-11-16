@@ -69,8 +69,8 @@ an angstrom, and the AlphaFold 3 lineage to within a seed's spread. `chai1` has 
 ## Weights and licences
 
 AlphaFold 3's parameters are Google DeepMind's, for academic non-commercial use only: the first download asks you to
-accept the [terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md) (or set
-`LOCALFOLD_ACCEPT_MODEL_TERMS=alphafold3`). Every other model's weights carry their authors' licences; check them
+accept the [terms](https://github.com/google-deepmind/alphafold3/blob/main/WEIGHTS_TERMS_OF_USE.md) (or pass
+`--accept-model-terms=alphafold3`). Every other model's weights carry their authors' licences; check them
 before use beyond research.
 
 ## More
