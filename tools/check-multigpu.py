@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """One AlphaFold 3 fold across several GPUs (cuda/af3 --gpus=N): correctness against the one-GPU fold, then scaling.
 
-For a rented multi-GPU box (the port's development box has one GPU; the ranks can share it with --gpu-map=0,0 for a
-smoke test, which checks correctness and nothing about speed):
+For a rented multi-GPU box - every GPU a rank (colabfold-cuda's --gpu-map, which let ranks share one GPU for a smoke
+test, went in its 6809482 with --mg-times and --mg-simulate; this tool's --gpu-map, --times and --sim arms went with them
+and are refused by name):
 
   python3 tools/check-multigpu.py                      # build, correctness, scaling over 1..every GPU, a report
   python3 tools/check-multigpu.py --sizes=4,12,24      # complexes of 4, 12, 24 copies of 1TIM's chain (247 a copy)
   python3 tools/check-multigpu.py --big=41             # and one fold of 41 copies (10,127 tokens) on every GPU
-  python3 tools/check-multigpu.py --gpu-map=0,0 --gpus=2 --sizes=4 --skip-build   # the smoke test on one GPU
   python3 tools/check-multigpu.py --model=boltz2 --sizes=  # the correctness half for another model
-  python3 tools/check-multigpu.py --sizes=12,24 --sim  # and each size as ONE simulated rank of N (LOCALFOLD_MG_SIMULATE):
-                                                       # a rank's compute alone - the measured fold minus it is the interconnect
 
 Correctness: 5CAJ chain A and the 1TIM dimer, each self-templated, folded on one GPU and on N; both scored against
 their crystal, and the N-GPU fold against the one-GPU fold (the sharded trunk reorders sums - a few thousandths of
-an angstrom here, 0.003-0.009 A measured with ranks sharing one A100). Scaling: each size on 1, 2, 4, ... GPUs
+an angstrom, 0.003-0.009 A measured with ranks sharing one A100 while --gpu-map existed). Scaling: each size on 1, 2, 4, ... GPUs
 (--steps=25 --recycles=0 unless --full), the fold's own stage times and every GPU's peak memory (nvidia-smi, polled).
 Writes multigpu-report.md (and .json) under --out.
 """
@@ -65,13 +63,15 @@ class Peak:
     def __exit__(self, *a): self.stop = True; self.t.join()
 
 
-def fold(args, gpus, flags, out, env_extra=None):
-    env = dict(os.environ, LOCALFOLD_ACCEPT_MODEL_TERMS="alphafold3")
-    if args.gpu_map and gpus > 1: env["LOCALFOLD_GPU_MAP"] = args.gpu_map
-    if args.times and gpus > 1: env["LOCALFOLD_MG_TIMES"] = "1"
-    env.update(env_extra or {})
+# colabfold-cuda reads no environment variable since b351032: AlphaFold 3's terms are --accept-model-terms=alphafold3. A
+# cuda/ submodule from before then refuses the flag and reads LOCALFOLD_ACCEPT_MODEL_TERMS; its front end says which
+TERMS_FLAG = "accept-model-terms" in (ROOT / "cuda/cpp/featurise/standalone.h").read_text()
+
+
+def fold(args, gpus, flags, out):
+    env = dict(os.environ) if TERMS_FLAG else dict(os.environ, LOCALFOLD_ACCEPT_MODEL_TERMS="alphafold3")
     cmd = [str(BIN)] + flags + [f"--out={out}"] + ([f"--gpus={gpus}"] if gpus > 1 else []) + \
-          ([f"--model={args.model}"] if args.model else [])
+          ([f"--model={args.model}"] if args.model else []) + (["--accept-model-terms=alphafold3"] if TERMS_FLAG else [])
     t0 = time.time()
     with Peak() as pk:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=ROOT)
@@ -83,8 +83,6 @@ def fold(args, gpus, flags, out, env_extra=None):
            "peak_mib": dict(sorted(pk.peak.items()))}
     if m: res.update(trunk_ms=float(m[1]), diffusion_ms=float(m[2]), confidence_ms=float(m[3]), total_ms=float(m[4]))
     if p: res.update(plddt=float(p[1]), ptm=float(p[2]))
-    phases = re.findall(r"^  mg (.+?)\s+([\d.]+) ms$", log, re.M)
-    if phases: res["phases_ms"] = [[k.strip(), float(v)] for k, v in phases]
     if not res["ok"]: res["error"] = log.strip().splitlines()[-5:]
     return res
 
@@ -98,16 +96,23 @@ def rmsd(a, b, chain_ids):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gpus", type=int, default=0, help="the most GPUs to use (default: every one)")
-    ap.add_argument("--gpu-map", default="", help="LOCALFOLD_GPU_MAP, e.g. 0,0 to share one GPU (a smoke test)")
+    ap.add_argument("--gpu-map", default="", help=argparse.SUPPRESS)        # (removed: refused below)
     ap.add_argument("--sizes", default="4,12,24", help="scaling complexes, in copies of 1TIM's 247-residue chain")
     ap.add_argument("--big", type=int, default=0, help="also one fold of this many copies on every GPU, 100 steps")
     ap.add_argument("--full", action="store_true", help="scaling folds at 100 steps and 3 recycles, not 25 and 0")
     ap.add_argument("--skip-build", action="store_true")
-    ap.add_argument("--sim", action="store_true", help="also each size as one simulated rank of N (compute alone, no interconnect)")
-    ap.add_argument("--times", action="store_true", help="LOCALFOLD_MG_TIMES=1: every phase past the trunk, in the report")
+    ap.add_argument("--sim", action="store_true", help=argparse.SUPPRESS)   # (removed: refused below)
+    ap.add_argument("--times", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--model", default="", help="an AF3-lineage model other than alphafold3 (boltz2, protenix2, ...)")
     ap.add_argument("--out", default="multigpu-out")
     args = ap.parse_args()
+    # 🔴 REFUSED, NOT IGNORED: each drove a colabfold-cuda hook that 6809482 removed (--gpu-map, --mg-simulate,
+    # --mg-times), and the binaries no longer read the environment variables these set: run anyway, each would ask for
+    # nothing while the report named it (--sim's rows a whole one-GPU fold labelled as one rank's compute)
+    for name, gone in (("--gpu-map", args.gpu_map), ("--sim", args.sim), ("--times", args.times)):
+        if gone:
+            ap.error(f"{name} is gone: colabfold-cuda removed the hook it drove (its 6809482); "
+                     "run on a machine with the GPUs, every GPU a rank (--gpus=N)")
     most = args.gpus or gpu_count()
     out = (ROOT / args.out); out.mkdir(parents=True, exist_ok=True)
     if not args.skip_build:
@@ -142,12 +147,6 @@ def main():
             r.update(copies=copies, tokens=copies * len(TIM))
             report["scaling"].append(r)
             print(json.dumps(r)[:400], flush=True)
-            if args.sim and g > 1:     # (one process on GPU 0 standing for rank 0 of g: its fold is wrong, its times are a rank's)
-                r = fold(args, g, [f"--sequence={seq}", "--seed=1"] + speed, out / f"tim{copies}-{g}-sim.pdb",
-                         {"LOCALFOLD_MG_SIMULATE": "1", "CUDA_VISIBLE_DEVICES": "0"})
-                r.update(copies=copies, tokens=copies * len(TIM), simulated=True)
-                report["scaling"].append(r)
-                print(json.dumps(r)[:400], flush=True)
     if args.big:
         seq = ":".join([TIM] * args.big)
         r = fold(args, most, [f"--sequence={seq}", "--seed=1", "--steps=100", "--recycles=0"], out / f"tim{args.big}-{most}.pdb")
@@ -160,14 +159,14 @@ def main():
     for c in report["correctness"]:
         lines.append(f"| {c['case']} | {c.get('one_vs_crystal')} | {c.get('many_vs_crystal')} | {c.get('many_vs_one')} | "
                      f"{c['one'].get('plddt')} / {c['many'].get('plddt')} |")
-    lines += ["", "## Scaling", "", "(sim: one simulated rank of N on one GPU - a rank's compute without the interconnect)", "",
+    lines += ["", "## Scaling", "",
               "| tokens | GPUs | trunk ms | diffusion ms | confidence ms | total ms | wall s | x vs 1 GPU | peak MiB a GPU | ok |",
               "|---:|---|---:|---:|---:|---:|---:|---:|---|---|"]
     one = {r["tokens"]: r.get("total_ms") for r in report["scaling"] if r["gpus"] == 1 and r.get("total_ms")}
     for r in report["scaling"]:
         pk = max(r["peak_mib"].values()) if r["peak_mib"] else None
         x = f"{one[r['tokens']] / r['total_ms']:.2f}" if r.get("total_ms") and one.get(r["tokens"]) else ""
-        g = f"{r['gpus']} sim" if r.get("simulated") else str(r["gpus"])
+        g = str(r["gpus"])
         lines.append(f"| {r['tokens']} | {g} | {r.get('trunk_ms')} | {r.get('diffusion_ms')} | {r.get('confidence_ms')} | "
                      f"{r.get('total_ms')} | {r.get('wall_s')} | {x} | {pk} | {r['ok']} |")
     (out / "multigpu-report.md").write_text("\n".join(lines) + "\n")

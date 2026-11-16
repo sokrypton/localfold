@@ -175,10 +175,9 @@ def ours_warm(args, cases, work):
     serve = os.path.join(work, "serve"); os.makedirs(serve, exist_ok=True)
     log = open(os.path.join(serve, "server.log"), "w")
     proc = subprocess.Popen([binary, "-", f"--fold-bundle={dirs[0]}", f"--esmc-bundle={dirs[1]}", "--fast", "--warm=96,800",
-                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-                            env=dict(os.environ, EF2_PASSES=str(args.loop_list[0] + 1)))
-    if len(args.loop_list) > 1:
-        print("(the warm server takes the first --loops only)", flush=True)
+                             f"--serve={serve}"], cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+    # (the trunk's passes are a fold flag, --passes=N, per job on a server too - colabfold-cuda's EF2_PASSES became it
+    # in 46f5323 and no variable is read since b351032)
     rows, count = [], 0
     def job(inputs, flags):
         nonlocal count
@@ -201,7 +200,7 @@ def ours_warm(args, cases, work):
                 pdb = os.path.join(work, f"lfw-{name}-L{loops}.pdb")
                 peak = GpuPeak()
                 for k in range(3):
-                    code, said = job(inputs, [f"--out={pdb}", "--seed=1"])
+                    code, said = job(inputs, [f"--out={pdb}", "--seed=1", f"--passes={loops + 1}"])
                 peak.stop = True
                 stages = {m.group(1): float(m.group(2)) for m in re.finditer(r"^([a-z][a-z ]+?) ([0-9.]+) ms", said, re.M)}
                 rows.append(dict(side="cf-ef2 warm", target=name, loops=loops, ms=sum(stages.values()), gib=peak.gib(),
@@ -222,10 +221,10 @@ def ours(args, cases, work):
         for name, chains, seqs, a3ms in cases:
             pdb = os.path.join(work, f"lf-{name}-L{loops}.pdb")
             cmd = [binary, f"--model={args.model}", "--sequence=" + ":".join(seqs),
-                   "--seed=1", f"--out={pdb}"] + ([f"--a3m={','.join(os.path.join(ROOT, a) for a in a3ms)}"] if a3ms else [])
+                   "--seed=1", f"--passes={loops + 1}", f"--out={pdb}"] + ([f"--a3m={','.join(os.path.join(ROOT, a) for a in a3ms)}"] if a3ms else [])
             peak = GpuPeak()
             t = time.time()
-            r = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ, EF2_PASSES=str(loops + 1)))
+            r = subprocess.run(cmd, capture_output=True, text=True)
             wall = time.time() - t
             peak.stop = True
             said = r.stdout + r.stderr

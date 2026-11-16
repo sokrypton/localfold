@@ -22,7 +22,9 @@ import { hostTables } from "../shared/bioemu2/potentials.js";
 const option = (name) => process.argv.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 const repo = new URL("..", import.meta.url).pathname;
 const fixtures = join(repo, "tools/fixtures/ccd");
-const cache = process.env.LOCALFOLD_CCD_DIR ?? join(homedir(), ".cache/localfold/ccd");
+// the probe's component cache: ccd.h's default (colabfold-cuda reads no LOCALFOLD_CCD_DIR since b351032, and the
+// probe's own --ccd-dir is the fixtures' local directory, read first)
+const cache = join(homedir(), ".cache/localfold/ccd");
 const ccd = (code) => {
   for (const dir of [fixtures, cache]) if (existsSync(join(dir, `${code}.cif`))) return readFileSync(join(dir, `${code}.cif`), "utf8");
   throw new Error(`${code}: in neither ${fixtures} nor ${cache}`);
@@ -71,7 +73,7 @@ for (const c of CASES) {
   }
   let native;
   try {
-    native = JSON.parse(execFileSync(probe, args, { maxBuffer: 1 << 30, env: { ...process.env, LOCALFOLD_CCD_DIR: cache } }).toString());
+    native = JSON.parse(execFileSync(probe, args, { maxBuffer: 1 << 30 }).toString());
   } catch (error) {
     console.log(`  ${c.name}: the native featuriser failed: ${error.stderr ?? error.message}`);
     failures += 1;

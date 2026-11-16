@@ -25,6 +25,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUDA = os.path.join(REPO, "cuda")
 FIX = os.path.join(REPO, "tools", "fixtures")
 JOBS = os.path.join(FIX, "af3-jobs")
+# colabfold-cuda's process flags (--ccd-dir, --msa-server, --accept-model-terms) replaced its environment variables in
+# b351032; the pinned submodule's own front end says which kind it is
+CCD_DIR_FLAG = "ccd-dir" in open(os.path.join(CUDA, "cpp", "featurise", "standalone.h")).read()
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 
 
@@ -166,8 +169,11 @@ def main():
                 handle.write(open(os.path.join(FIX, "ccd", f"{code}.cif")).read())
         empty = os.path.join(work, "empty-cache")
         os.makedirs(empty)
-        env = dict(os.environ, LOCALFOLD_CCD_DIR=empty)
-        standalone("af3", [f"--job={JOBS}/calmodulin_4calcium.json", f"--ccd={tiny}", "--steps=20"], f"{work}/ccd.pdb", env)
+        cache = [f"--ccd-dir={empty}"]        # (the fetched-component cache: a flag since colabfold-cuda's b351032)
+        env = None
+        if not CCD_DIR_FLAG:                  # (a cuda/ submodule from before then reads the environment instead)
+            cache, env = [], dict(os.environ, LOCALFOLD_CCD_DIR=empty)
+        standalone("af3", [f"--job={JOBS}/calmodulin_4calcium.json", f"--ccd={tiny}", "--steps=20", *cache], f"{work}/ccd.pdb", env)
         bare = os.path.join(work, "weights-without-ccd")    # (the RCSB arm: a weights dir with no ccd/ beside it)
         os.makedirs(bare)
         os.symlink(os.path.join(REPO, "af3am-af3"), os.path.join(bare, "af3am-af3"))
@@ -177,17 +183,15 @@ def main():
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --ccd: calmodulin's calcium from a local dictionary, "
               + ("byte-identical to the RCSB's, nothing cached" if ok else f"identical {same}, cached {os.listdir(empty)}"))
-        r = run([binary("af3"), f"--sequence={S6}", "--ligands=GOL", f"--ccd={tiny}", f"--out={work}/gol.pdb"], env)
+        r = run([binary("af3"), f"--sequence={S6}", "--ligands=GOL", f"--ccd={tiny}", *cache, f"--out={work}/gol.pdb"], env)
         ok = r.returncode != 0 and "GOL is not in the CCD" in r.stdout + r.stderr and not os.listdir(empty)
         failed += not ok
         print(f"{'ok  ' if ok else 'FAIL'} --ccd: a code the dictionary lacks is refused, not fetched")
 
-        # 🔴 A SLOW UPLOAD MUST FOLD WHAT A FAST ONE DOES. cuda/ef2 warms up while its weights are still arriving and
-        # then forgets whatever it derived from them; a derived cache that was not told to (Wbf, every bf16-pair block's
-        # transition) kept a copy of a half-uploaded block for good, so a cold page cache folded 1BRS at pLDDT 28 and
-        # 5CAJ through the 600M model at 64. LOCALFOLD_SLOW_UPLOAD_MS makes the slow disk on demand; every gate here
-        # otherwise runs warm and could not see it. And LOCALFOLD_BIG=1 beside it: the warm-up used to park the tower
-        # under its own upload and kill the process
+        # (the slow-upload arms - ef2 with LOCALFOLD_SLOW_UPLOAD_MS, beside LOCALFOLD_BIG=1 - and the big-input path's
+        # bf16-pair arms - LOCALFOLD_BIG=1 against LOCALFOLD_WIDEN_PAIR=1 for af3, boltz2 and rosettafold3 - are gone:
+        # colabfold-cuda reads no environment variable since b351032, and 6809482 removed --slow-upload-ms, --big and
+        # --widen-pair with the code only they reached, so each arm would have folded the default path against itself)
         def seq_of(pdb, chain):
             three = dict(ALA="A", ARG="R", ASN="N", ASP="D", CYS="C", GLN="Q", GLU="E", GLY="G", HIS="H", ILE="I", LEU="L",
                          LYS="K", MET="M", PHE="F", PRO="P", SER="S", THR="T", TRP="W", TYR="Y", VAL="V", MSE="M")
@@ -196,51 +200,6 @@ def main():
                 if l.startswith(("ATOM", "HETATM")) and l[12:16] == " CA " and l[21] == chain and l[22:27] not in seen:
                     seen.add(l[22:27]); out += three.get(l[17:20], "X")
             return out
-        S5 = seq_of("5caj-crystal.pdb", "A")
-        # 🔴 THROUGH THE TWO-STEP PATH WITH --warm, because the standalone binary now skips its warm-up when the input is
-        # already written (a sequence is) - which would leave these arms folding with no warm-up at all, passing for
-        # want of the thing they test. The worker's resident server always warms, so this is the path that ships it
-        dirs = {}
-        for line in run([os.path.join(CUDA, "cpp", "featurise", "fetch-weights"), "ef2-fast-600m", "ef2"]).stdout.splitlines():
-            name, _, d = line.partition(": ")
-            if d: dirs.setdefault(name, []).append(d)
-        for model, extra_env in (("ef2-fast-600m", {}), ("ef2", {}), ("ef2", {"LOCALFOLD_BIG": "1"})):
-            arms = []
-            trunk, tower = dirs[model]
-            inputs = os.path.join(work, f"slow-in-{model}")
-            shutil.rmtree(inputs, ignore_errors=True)
-            run([os.path.join(CUDA, "cpp", "featurise", "ef2-featurise"), inputs, f"--sequence={S5}", f"--fold-bundle={trunk}"])
-            for slow in ("0", "400"):
-                out = os.path.join(work, f"slow-{model}-{slow}-{len(extra_env)}.pdb")
-                r = run([binary("ef2"), inputs, f"--fold-bundle={trunk}", f"--esmc-bundle={tower}", "--fast", "--warm=96,800",
-                         "--seed=1", f"--out={out}"], dict(os.environ, LOCALFOLD_SLOW_UPLOAD_MS=slow, **extra_env))
-                arms.append(open(out, "rb").read() if r.returncode == 0 and os.path.exists(out) else b"failed: " + (r.stdout + r.stderr)[-200:].encode())
-            ok = arms[0] == arms[1] and not arms[0].startswith(b"failed: ")
-            # (two arms failing alike are equal too: a fold must have happened for equality to mean anything)
-            failed += not ok
-            label = model + (" (LOCALFOLD_BIG=1)" if extra_env else "")
-            print(f"{'ok  ' if ok else 'FAIL'} slow upload, {label} 5CAJ: "
-                  + ("byte-identical to a fast one" if ok else "differs from a fast one: " + arms[1][-120:].decode(errors="replace")))
-
-        # 🔴 THE BIG-INPUT PATH KEEPS THE PAIR bf16 PAST THE TRUNK (cuda/dev/af3.md, "7,900 tokens on a 40 GB A100"):
-        # the distogram, the streamed diffusion preparation and the confidence head read bf16 rows there, and nothing
-        # else folds that path below thousands of tokens. LOCALFOLD_BIG=1 runs it at any size, and its structure is the
-        # same path's with the pair widened (LOCALFOLD_WIDEN_PAIR=1) to the byte - the diffusion reads exactly the values
-        # the widening made - so a defect in any of those readers shows as a coordinate, and the confidence head must
-        # still produce one. The three heads it took: AF3's, boltz2's re-embedding and rf3's global norm
-        for model in ("af3", "boltz2", "rosettafold3"):
-            coords = []
-            for widen in (True, False):
-                out = os.path.join(work, f"big-{model}-{int(widen)}.pdb")
-                env = dict(os.environ, LOCALFOLD_BIG="1", **({"LOCALFOLD_WIDEN_PAIR": "1"} if widen else {}))
-                r = run([binary("af3"), f"--model={model}", f"--sequence={S6}", "--seed=1", f"--out={out}"], env)
-                coords.append([l[30:54] for l in open(out) if l.startswith(("ATOM", "HETATM"))]
-                              if r.returncode == 0 and os.path.exists(out) else None)
-            ok = coords[0] is not None and coords[0] == coords[1]
-            failed += not ok
-            print(f"{'ok  ' if ok else 'FAIL'} {model} on the big-input path, the pair bf16 past the trunk: "
-                  + ("the widened pair's coordinates" if ok else "differs from the widened pair's, or did not fold"))
-
         # 🔴 CHAI-1 PAST ~500 TOKENS DIED IN THE TRUNK'S GRAPH CAPTURE: its first pass takes a branch of its own, which
         # sized a scratch buffer for 128 MB chunks, and the recycle passes - the first of them captured as a graph - want
         # the whole pair where the card has the room, so the buffer grew inside the capture ("operation not permitted
