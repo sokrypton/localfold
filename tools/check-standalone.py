@@ -27,7 +27,6 @@ FIX = os.path.join(REPO, "tools", "fixtures")
 JOBS = os.path.join(FIX, "af3-jobs")
 # colabfold-cuda's process flags (--ccd-dir, --msa-server, --accept-model-terms) replaced its environment variables in
 # b351032; the pinned submodule's own front end says which kind it is
-CCD_DIR_FLAG = "ccd-dir" in open(os.path.join(CUDA, "cpp", "featurise", "standalone.h")).read()
 S6 = "GWSTELEKHREELKEFLKKEGITNVEIRIDNGRLEVRVEGGTERLKRFLEELRQKLEKKGYTVDIKIE"
 
 
@@ -169,10 +168,8 @@ def main():
                 handle.write(open(os.path.join(FIX, "ccd", f"{code}.cif")).read())
         empty = os.path.join(work, "empty-cache")
         os.makedirs(empty)
-        cache = [f"--ccd-dir={empty}"]        # (the fetched-component cache: a flag since colabfold-cuda's b351032)
+        cache = [f"--ccd-dir={empty}"]        # (the fetched-component cache)
         env = None
-        if not CCD_DIR_FLAG:                  # (a cuda/ submodule from before then reads the environment instead)
-            cache, env = [], dict(os.environ, LOCALFOLD_CCD_DIR=empty)
         standalone("af3", [f"--job={JOBS}/calmodulin_4calcium.json", f"--ccd={tiny}", "--steps=20", *cache], f"{work}/ccd.pdb", env)
         bare = os.path.join(work, "weights-without-ccd")    # (the RCSB arm: a weights dir with no ccd/ beside it)
         os.makedirs(bare)

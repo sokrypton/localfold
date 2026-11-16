@@ -63,18 +63,15 @@ class Peak:
     def __exit__(self, *a): self.stop = True; self.t.join()
 
 
-# colabfold-cuda reads no environment variable since b351032: AlphaFold 3's terms are --accept-model-terms=alphafold3. A
-# cuda/ submodule from before then refuses the flag and reads LOCALFOLD_ACCEPT_MODEL_TERMS; its front end says which
-TERMS_FLAG = "accept-model-terms" in (ROOT / "cuda/cpp/featurise/standalone.h").read_text()
+# (colabfold-cuda reads no environment variable: AlphaFold 3's terms are a flag)
 
 
 def fold(args, gpus, flags, out):
-    env = dict(os.environ) if TERMS_FLAG else dict(os.environ, LOCALFOLD_ACCEPT_MODEL_TERMS="alphafold3")
     cmd = [str(BIN)] + flags + [f"--out={out}"] + ([f"--gpus={gpus}"] if gpus > 1 else []) + \
-          ([f"--model={args.model}"] if args.model else []) + (["--accept-model-terms=alphafold3"] if TERMS_FLAG else [])
+          ([f"--model={args.model}"] if args.model else []) + ["--accept-model-terms=alphafold3"]
     t0 = time.time()
     with Peak() as pk:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, cwd=ROOT)
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=ROOT)
     wall = time.time() - t0
     log = r.stdout + r.stderr
     m = re.search(r"fold 1: trunk ([\d.]+) ms.*?diffusion ([\d.]+) ms.*?confidence ([\d.]+) ms, total ([\d.]+) ms", log)
