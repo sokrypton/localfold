@@ -72,8 +72,6 @@ import { superposePdbOnto } from "./pdb-superpose.js";
 import { CHAIN_IDS, confidenceJson, contactMapFor, matrixForViewer, modifiedPositions,
   paeMatrix, predictionToPdb, safeJobName, viewerTokens } from "./prediction-results.js";
 import { complexSequenceProblem } from "./sequence.js";
-// 🔴 SHARED WITH proteinhunter.html, which shows the same card against its
-// own play bar. See web/scores-card.js.
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
@@ -241,8 +239,8 @@ const maxMsaConfig = () => {
 async function agreeModelTerms(family) {
   if (family !== "af3" || termsAccepted()) return family;
   const dialog = document.getElementById("model-terms");
-  // 🔴 NO DIALOG MEANS NO FOLD IS BLOCKED. single.html and the bundled offline
-  // build do not carry this markup, and a missing element must not make the
+  // 🔴 NO DIALOG MEANS NO FOLD IS BLOCKED. The bundled offline build does not
+  // carry this markup, and a missing element must not make the
   // page unfoldable - the deploy-side gate still stands either way.
   if (dialog === null || typeof dialog.showModal !== "function") return family;
 

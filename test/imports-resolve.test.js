@@ -195,9 +195,8 @@ test("every source path named in python, yaml, html or markdown exists", () => {
   // 🔴 AND `src/parts/` IS py2Dmol's SEVENTH, ARRIVING THE SAME WAY cartoon's
   // DID - which is the paragraph above happening a second time. It is now the
   // LARGEST of them (embed.js, multi.js, plugins.js, selectpanel.js,
-  // sidechains.js), and docs/DESIGN-PY2DMOL.md cites those files because an
-  // audit of someone else's API is worth nothing without the line it was read
-  // from. Nothing of ours has ever lived at src/parts/.
+  // sidechains.js), and a document that audits someone else's API cites those
+  // files by the line it was read from. Nothing of ours has ever lived at src/parts/.
   const FOREIGN = ["src/align/", "src/app/", "src/cartoon/", "src/core/", "src/io/",
                    "src/panels/", "src/parts/", "src/alphafold3/", "src/dawn/",
                    "src/mpnn/", "src/py2Dmol/"];

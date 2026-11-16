@@ -2,7 +2,7 @@
  * Steering AF3's sampler toward an epitope: a restraint applied to each denoised prediction.
  *
  * 🔴 WHY: A HOTSPOT IS A FILTER FOR EVERY MODEL BUT boltz2 (2026-10-28). boltz2 was trained with a
- * pocket input (the design page's hotspot pocket); the rest can only fold and then reject a binder
+ * pocket input (a hotspot pocket); the rest can only fold and then reject a binder
  * that missed - and on PD-L1 with AF3 7 runs of 12 ended with no cycle that hit. This asks the walk
  * itself, with geometry rather than weights, so it works for any model the sampler drives. The step
  * moves toward `denoised`, so displacing that prediction steers the trajectory without touching the

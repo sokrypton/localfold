@@ -7,10 +7,9 @@ upstream and re-run `python3 tools/sync-py2dmol.py`;
 - upstream: `/Users/mini/Documents/GitHub/py2Dmol`
 - commit: `183c1ad2bb8751f4693eb8f8e836f6011cc50f9b`
 
-Two of these are built by upstream's `tools/bundle.py build` and two
+One of these is built by upstream's `tools/bundle.py build` and two
 are source files that ship as they are. `full` is the website plus the
-embed API and `embed` is the embed API alone - both are needed,
-because index.html loads one and the other two pages load the other.
+embed API, the bundle index.html loads.
 
 - `py2Dmol.app.css` — `f7fda445ca6a5629` — index.html
 - `py2Dmol.align.js` — `24cc39809ebe3ba4` — index.html (TM-align; upstream cannot bundle it)

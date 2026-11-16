@@ -1,17 +1,12 @@
 /**
  * The confidence card: pLDDT, pTM, ipTM and the ranking score, by element id.
  *
- * 🔴 ONE IMPLEMENTATION, TWO PAGES. This was inside web/app.js, which is
- * index.html's driver, and proteinhunter.html wanted the same card following
- * its own play bar. The choice was to copy forty lines of `document
- * .getElementById` into a second driver or to move them somewhere both can
- * reach; a copy would have been two places to remember when a metric is added,
- * and the metric that is easy to forget is the one that hides itself.
+ * Moved out of web/app.js, index.html's driver, when a second page shared it;
+ * that page is gone and app.js is its one caller.
  *
  * 🔴 A MISSING ELEMENT IS NOT AN ERROR. The card is optional furniture - a
  * page that has no #metricIptm simply does not show ipTM - so every lookup is
- * guarded rather than asserted. That is what lets the same function serve a
- * page with four cells and a page with two.
+ * guarded rather than asserted.
  *
  * @param {{meanPlddt?: number, ptm?: number, iptm?: number,
  *          multimerScore?: number}} [confidence] absent hides the card

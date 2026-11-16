@@ -468,7 +468,7 @@ async function main() {
     : spawn(CHROME, [
     // LOCALFOLD_HEADED=1 opens a visible window instead (macOS): a visitor's page competes with the compositor at
     // their device pixel ratio, which headless does not, and a change can measure 1.06x visible where it measured
-    // 1.02x headless (docs/RFD4P-FROM-LOCALDESIGN.md section 5).
+    // 1.02x headless (measured in rfd4-proteina-webgpu).
     ...((process.platform === "linux" && !LINUX_HEADLESS) || process.env.LOCALFOLD_HEADED === "1" ? [] : ["--headless=new"]),
     ...(STOCK_FLAGS ? [] : ["--enable-unsafe-webgpu"]), "--disable-gpu-sandbox",
     ...PLATFORM_FLAGS,

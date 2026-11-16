@@ -76,8 +76,7 @@ async function deflate(bytes) {
  * always done and the reader did not. A browser without `DecompressionStream`
  * also writes stored archives, so its OWN archives read back - what it could
  * not read was an archive written anywhere else, which is the whole point of
- * the upload box. shared/input/inflate.js is this repository's DEFLATE, the
- * same decoder the design page's structure path reads with.
+ * the upload box. shared/input/inflate.js is this repository's DEFLATE.
  */
 async function inflate(bytes) {
   if (typeof DecompressionStream === "undefined") return inflateRaw(bytes);

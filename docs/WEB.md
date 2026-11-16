@@ -1,6 +1,6 @@
 # The page: layout, templates, the archive, and the progress bar
 
-`index.html`, `single.html`, `web/`, and the tools that drive them -
+`index.html`, `web/`, and the tools that drive them -
 `tools/fold-in-page.py`, `tools/mobile-layout.py`, `tools/model-terms.py`.
 
 ## Templates, from the page
@@ -92,7 +92,8 @@ gives `Emulation.setDeviceMetricsOverride`, which is a true viewport at any
 width, plus `Page.captureScreenshot`, which `--screenshot` cannot do on a page
 with a running rAF loop. `tools/mobile-layout.py` runs 320, 360 and 390 with
 1200 as the control, loading a structure and an alignment first - half the rows
-it measures are `display: none` on a bare page. It checks `single.html` too.
+it measures are `display: none` on a bare page. (It checked `single.html` and
+`proteinhunter.html` too until those pages were retired on 2026-11-16.)
 
 🔴 **AND "NO HORIZONTAL OVERFLOW" IS NOT THE TEST.** Under mobile emulation a
 page that cannot fit does not overflow: the LAYOUT VIEWPORT GROWS, so
@@ -402,7 +403,8 @@ mirror has drifted. Never edit the mirror.
 plus the embed API and `embed` is the embed API alone, so `full` looks like a
 superset and is nearly one - but `index.html` loads `full` while `single.html`
 and `proteinhunter.html` load `embed`. Syncing only the larger leaves two of
-the three pages on a stale viewer.
+the three pages on a stale viewer. (Since retired with those two pages: only
+`full` is vendored now.)
 
 
 ## A token is not a position, and a modified residue is where they part
@@ -1731,10 +1733,8 @@ still there.
 derivation below still stands and still guards anything else that falls out of
 use; what follows is why it was written.
 
-`py2Dmol.embed.min.js` is loaded by `single.html` and `proteinhunter.html`, both
-**held back at `b0dc258`** - out of the repository and gitignored until the model
-row they were built against stops moving, with every tool that touches them
-skipping a page it cannot find. `web/` is copied wholesale, so their bundle
+`py2Dmol.embed.min.js` was loaded by `single.html` and `proteinhunter.html`, both
+**held back at `b0dc258`** and retired for good on 2026-11-16. `web/` is copied wholesale, so their bundle
 shipped on every deploy to be fetched by nobody: the second-largest file on a
 site Pages caps at a gigabyte.
 
@@ -1753,13 +1753,13 @@ from **`dist/`**, and the build says so.
 dist/  240 files, 23.0 MiB
 ```
 
-Derived for the reason the model registry is - the day `single.html` returns its
-bundle returns with it, with no edit here and nothing to forget. Verified both
+Derived for the reason the model registry is - a bundle that falls out of use
+leaves the site with no edit here and nothing to forget. Verified both
 ways: a stub `single.html` loading that bundle gives **242 files, 23.6 MiB** with
 the bundle present, and removing it again gives 240 and 23.0. `.md` is excluded
 from the search because `SOURCE.md` names every bundle by definition, and only
-top-level files are considered because `mpnn/kernels.wasm` is loaded from
-JavaScript rather than from a page.
+top-level files are considered because an asset loaded from JavaScript would
+live in a subdirectory.
 
 ## Do AlphaFold 3's own examples work? Nine of fourteen, and now that is measured
 

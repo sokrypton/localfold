@@ -41,16 +41,6 @@ DOMAIN = "localfold.org"
 # WHAT A PUBLIC SITE CONTAINS. Files are copied as-is; directories are copied
 # whole, minus the ignore patterns below.
 FILES = [".nojekyll", "index.html", "dev.html"]
-# 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, NOT DELETED. `single.html` and
-# `proteinhunter.html` are out of the repository and out of the site while the
-# model row they were built against moves under them; the files stay on disk and
-# gitignored, and every tool that touches them SKIPS a page it cannot find
-# rather than dropping its probe - so putting them back is one line here and the
-# gates come back with them.
-# ...and `design.html`, which IS in the repository and is copied when present:
-# nothing links to it and index.html does not mention it, but it is on the site
-# once `main` deploys. Unlinked is not hidden; see docs/DESIGN.md.
-OPTIONAL = ["single.html", "proteinhunter.html", "design.html"]
 # 🔴 AND `webgl` IS ON THIS LIST BECAUSE web/af3-model.js IMPORTS IT STATICALLY. Without it this
 # script assembles a dist/ whose web/af3-model.js resolves to nothing - the module never loads and
 # the AF3 fold path is dead for every visitor, WebGPU or not - and the only gate that can see it is
@@ -449,26 +439,22 @@ def unresolved_imports(root: Path) -> list[str]:
 def drop_unreferenced_vendor() -> None:
     """Leave a vendored bundle out of the site when no shipped page loads it.
 
-    🔴 620 KB WAS PUBLISHED FOR PAGES THAT ARE NOT IN THE SITE.
-    `py2Dmol.embed.min.js` is loaded by single.html and proteinhunter.html, and
-    both are held back - OPTIONAL above, out of the repository and gitignored
-    until the model row they were built against stops moving. `web/` is copied
-    wholesale, so the bundle they need shipped on every deploy regardless, to be
-    fetched by nobody. Pages is capped at a gigabyte (docs/HOSTING.md) and this
-    is the second-largest file on the site.
+    🔴 620 KB WAS ONCE PUBLISHED FOR PAGES THAT WERE NOT IN THE SITE.
+    `py2Dmol.embed.min.js` served two pages that had been taken out, and `web/`
+    is copied wholesale, so it shipped on every deploy to be fetched by nobody.
+    Pages is capped at a gigabyte (docs/HOSTING.md).
 
-    🔴 DERIVED, NOT A NAME IN A LIST, for the reason the model registry is: the
-    day single.html comes back its bundle comes back with it, with no edit here
-    and nothing to forget. That is also why this DELETES FROM `dist/` rather
-    than skipping the copy - the rule is about what the site serves, and the
-    checkout keeps its mirror intact so `sync-py2dmol.py --check` still has
-    something to compare and the commit that held those pages out keeps its
-    promise that putting them back is one line.
+    🔴 DERIVED, NOT A NAME IN A LIST, for the reason the model registry is: a
+    bundle that falls out of use leaves the site with no edit here and nothing
+    to forget. That is also why this DELETES FROM `dist/` rather than skipping
+    the copy - the rule is about what the site serves, and the checkout keeps
+    its mirror intact so `sync-py2dmol.py --check` still has something to
+    compare.
 
     Only top-level files are considered, and only against what the site
-    actually serves as CODE: an asset loaded from JavaScript (mpnn/kernels.wasm)
-    lives in a subdirectory, and SOURCE.md names every bundle by definition, so
-    reading the .md would make every file look referenced.
+    actually serves as CODE: an asset loaded from JavaScript would live in a
+    subdirectory, and SOURCE.md names every bundle by definition, so reading the
+    .md would make every file look referenced.
     """
     vendor = OUT / "web" / "vendor"
     if not vendor.is_dir():
@@ -501,10 +487,6 @@ def build(include_model: bool, local_bundles: bool = True) -> int:
             print(f"missing {name}", file=sys.stderr)
             return 1
         shutil.copy2(source, OUT / name)
-    for name in OPTIONAL:
-        source = ROOT / name
-        if source.exists():
-            shutil.copy2(source, OUT / name)
 
     for name in DIRECTORIES:
         source = ROOT / name

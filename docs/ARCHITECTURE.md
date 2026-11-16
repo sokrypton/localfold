@@ -1107,6 +1107,12 @@ explanation in its own header. A dead-code sweep would delete all four, because
 the evidence that nothing imports a file is not evidence that nothing needs it -
 the same trap as the WebGL2 kernels above, one directory over.
 
+**Settled 2026-11-16: the two pages are not coming back.** `main.js`,
+`viewer.js`, `mutate.js`, `hydrophobicity.js` and `plddt.js` were deleted with
+`test/mutate.test.js`, `test/hydrophobicity.test.js` and the mutation-panel
+case in `test/browser/webgpu.spec.js` (`hunter.js` had gone earlier) - a
+deliberate decision, not the sweep this paragraph warns against.
+
 🔴 **AND "NOTHING IMPORTS IT" AND "NO PAGE REACHES IT" ARE DIFFERENT QUESTIONS,
 which is worth stating because the first answer here was the wrong one of the
 two.** A census keyed on importers reports **three** (`main.js`, `hunter.js`,

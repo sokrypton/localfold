@@ -10,8 +10,7 @@ browser loads by relative path. There is nothing in the serving path that could
 fetch it.
 
 🔴 THE FOUR FILES WERE COPIED BY HAND AND NOTHING RECORDED FROM WHERE. That is
-the failure this exists to end, and it is the same one `tools/sync-mpnn.py`
-already ends for the MPNN port: a copy without a record is a fork, and a fork
+the failure this exists to end: a copy without a record is a fork, and a fork
 nobody declared gets edited in place and silently diverges. Before this tool the
 vendored bundles named no upstream commit, so "is this current?" could only be
 answered by diffing 800 KB of minified JavaScript against a build.
@@ -23,18 +22,12 @@ are. So this runs the upstream build first rather than trusting whatever
 happens to be sitting in that directory, which may be from any commit or from
 none.
 
-🔴 AND `embed` IS NOT VENDORED, BECAUSE NOTHING LOADS IT. It is for
-`single.html` and `proteinhunter.html`, both held back at `b0dc258` and absent
-from this tree - so syncing it wrote 655 KB into git on every update for a file
-`build_site.py` then deliberately dropped from `dist/`. Vendoring is a cost
-paid in history, which is permanent, and the deploy already proved nobody
-fetches it.
-
-**Putting it back is one line**: an entry here and one in LOADED_BY, which is a
-better place for that promise to live than a stale mirror - a page restored
-tomorrow gets a bundle built from upstream today rather than whatever this
-directory last happened to hold. `build_site.py`'s "no page loads it" rule
-stays where it is and still covers anything else that falls out of use.
+🔴 AND `embed` IS NOT VENDORED, BECAUSE NOTHING LOADS IT. It served two pages
+this site no longer has, and syncing it wrote 655 KB into git on every update
+for a file `build_site.py` then dropped from `dist/`. Vendoring is a cost paid
+in history, which is permanent. A page that needs it again is an entry here and
+one in LOADED_BY; `build_site.py`'s "no page loads it" rule still covers
+anything else that falls out of use.
 """
 import argparse
 import hashlib
@@ -103,10 +96,9 @@ def source_markdown(root: Path, commit: str, hashes: dict) -> str:
         f"- upstream: `{root}`",
         f"- commit: `{commit}`",
         "",
-        "Two of these are built by upstream's `tools/bundle.py build` and two",
+        "One of these is built by upstream's `tools/bundle.py build` and two",
         "are source files that ship as they are. `full` is the website plus the",
-        "embed API and `embed` is the embed API alone - both are needed,",
-        "because index.html loads one and the other two pages load the other.",
+        "embed API, the bundle index.html loads.",
         "",
     ]
     for name in FILES:

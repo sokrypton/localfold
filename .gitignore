@@ -93,13 +93,6 @@ natives
 /model-esmfold2-trunk-f32
 /esmfold2-fold.pdb
 
-# 🔴 HELD BACK UNTIL THEY ARE FIXED AND CHECKED, not deleted. Both pages were
-# built against a model row that has moved under them; they stay on disk while
-# that is sorted out, and tools/build_site.py and tools/mobile-layout.py skip a
-# page they cannot find rather than failing on it.
-/single.html
-/proteinhunter.html
-
 # tools/gpu/bench-jaxjs-matmul.js wants @jax-js/jax's dist copied here.
 /.jaxjs-tmp
 .ipynb_checkpoints/
@@ -144,16 +137,3 @@ oracle-dumps-colab/
 /model-bioemu2-f32
 /model-bioemu2-int5
 
-# RFD4-Proteina's INT8 shards: ~420 MB, hosted rather than committed, exactly as
-# the nine fold bundles are. The config and the tensor manifest beside them ARE
-# tracked - they are what the tests read and what says where a tensor lives.
-# 🔴 RENAMED FROM `weights/` ONCE THE HOSTING DECISION WAS MADE: the shards are
-# served by sokrypton/rfd4-proteina-webgpu's Pages URL and are never kept here,
-# so a top-level directory called `weights/` named something this repository
-# does not have. It matches the nine fold bundles' `model-*` convention now, and
-# holds only the config and the tensor manifest - text the tests read offline.
-model-rfd4p-int8/*.bin
-model-rfd4p-int8/*.safetensors
-model-rfd4p-int8/shards/
-# metal/rfd4p/gate.py's reference trajectories: a CPU forward per arm, gigabytes, rebuilt on demand
-/.rfd4p-gate/
