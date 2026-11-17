@@ -63,8 +63,9 @@ export function releaseTransitionWeights(execution, weights) {
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{activations: Tensor, weights: Record<string, Tensor>, rows: number,
  *   channels: number, hiddenChannels: number, epsilon?: number,
- *   hiddenPrecision?: "f16" | "f32"}} call
- * @returns {Tensor} `rows x channels`; the caller owns it
+ *   hiddenPrecision?: "f16" | "f32", residualOf?: Tensor}} call
+ * @returns {Tensor} `rows x channels` - `residualOf + update` where that is given, added in the down projection's own
+ *   repack or epilogue; the caller owns it
  */
 export function transition(execution, call) {
   const {
@@ -91,6 +92,7 @@ export function transition(execution, call) {
     x: hidden, weight: w.secondWeight, bias: w.secondBias,
     rows, inChannels: hiddenChannels, outChannels: channels,
     weightLayout: "in-major",
+    ...(call.residualOf === undefined ? {} : { residual: call.residualOf }),
   });
   execution.release(hidden);
   output.label = "transition";

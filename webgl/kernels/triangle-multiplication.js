@@ -316,9 +316,13 @@ function blockedTriangle(execution, call, zn) {
   execution.release(zn);
   let output;
   if (residualOf !== undefined) {
+    // ...the gate read per row in the repack (`gateSlice` at the output's own stride), where a multiplier costs a
+    // draw after it; `--no-linear-gate-slice` is the arm
     output = linear(execution, {
       x: normalised, weight: w.linearZWeight, bias: w.linearZBias,
-      rows: pairs, inChannels: cHidden, outChannels: cZ, residual: residualOf, multiplier: gate,
+      rows: pairs, inChannels: cHidden, outChannels: cZ, residual: residualOf,
+      ...(execution.noLinearGateSlice ? { multiplier: gate }
+        : { gateSlice: { gates: gate, stride4: cZ / 4, at4: 0 } }),
     });
   } else {
     const projected = linear(execution, {

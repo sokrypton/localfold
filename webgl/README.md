@@ -3927,3 +3927,14 @@ A deep alignment is unchanged.
 | monomer, 200 residues | 15.60 / 15.63 s | **12.72 / 12.90 s** | **1.22x** |
 
 Monomer worst atom 0.0365 A against a floor of 0.0686 (pLDDT 57.937); multimer f32 0.0011 against 0.001, default 0.2614.
+
+**The remaining residuals into the draws beside them.** Both transitions' adds ride in the down projection
+(`transition`'s `residualOf`, the repack or the epilogue), the outer product mean's in its contraction's last line
+(two-draw form; the sequences-first form still adds), and the triangle's `pair + projected * gate` in the output
+projection's repack (`gateSlice` at the output's own stride) where it was a repack and a `residual-product` draw. 266
+fewer draws a 195-residue pass (4,356 to 4,090). Medians of four interleaved runs against the previous commit:
+multimer **12.33 -> 12.05 s (1.02x)**, monomer **12.73 -> 12.60 s (1.01x)** - inside the drift on a single pair, but
+every one of the eight multimer runs is consistent with it. Not bit-identical (an add fused into a multiply-add):
+monomer worst atom 0.0447 A against a floor of 0.0403 (bar 3x), pLDDT 57.938; multimer f32 0.0016 against 0.0009;
+`check-webgl-evoformer-block` now passes all four arms, its `extra.pair` included. AF3 66.379 unchanged (it passes no
+`residualOf` to these kernels).

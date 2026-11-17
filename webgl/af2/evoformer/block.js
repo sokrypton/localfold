@@ -207,12 +207,14 @@ export function evoformerBlock(execution, call) {
   // the block has already updated three times. The two are different models
   // sharing one kernel, and the flag is per checkpoint.
   if (call.outerProductMeanFirst === true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
       twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -270,12 +272,14 @@ export function evoformerBlock(execution, call) {
 
   // 3. MSA transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: msa,
     });
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
     ownMsa = true;
   }
 
@@ -305,12 +309,14 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
   //    is the multimer graph's order. `encodeEvoformerPairBlock` takes the same
   //    flag under the same name for the same reason.
   if (call.outerProductMeanDone !== true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
       twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -389,12 +395,14 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
 
   // 6. Pair transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: pair, weights: w.pairTransition,
       rows: pairs, channels: cZ, hiddenChannels: pairHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
   }
   return pair;
 }
@@ -429,12 +437,14 @@ export function extraMsaBlock(execution, call) {
   // 0. The outer product mean first, on the multimer graph; see the note in
   //    `evoformerBlock`. `encodeExtraMsaBlock` takes the same flag.
   if (call.outerProductMeanFirst === true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter: call.cOuter, cZ: call.cZ, layerNormEpsilon: epsilon,
       twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -469,12 +479,14 @@ export function extraMsaBlock(execution, call) {
 
   // 3. MSA transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: msa,
     });
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
   }
 
   pair = pairHalf(
@@ -675,11 +687,15 @@ export function templatePairBlock(execution, call) {
   }
 
   // The pair transition, last in both orders.
-  pair = residual(pair, transition(execution, {
-    activations: pair, weights: w.pairTransition,
-    rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
-    hiddenPrecision: call.transitionPrecision,
-  }));
+  {
+    const next = transition(execution, {
+      activations: pair, weights: w.pairTransition,
+      rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
+      hiddenPrecision: call.transitionPrecision, residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    pair = next;
+  }
   pair.label = "template.pair";
   return pair;
 }
