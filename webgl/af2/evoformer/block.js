@@ -53,6 +53,13 @@ import { globalAttention } from "../../kernels/global-attention.js";
 import { transposeLeading } from "../../runtime/transpose.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
+
+/**
+ * The alignment depth at or below which AF2's outer product mean takes the two-draw form rather than contracting the
+ * sequences first (`twoDrawDepth`, webgl/kernels/outer-product-mean.js): the two-draw form costs ~6 ms a sequence at
+ * 195 residues and the sequences-first one ~75 ms almost whatever the depth, so eight is well inside the crossover.
+ */
+const AF2_OPM_TWO_DRAW_DEPTH = 8;
 /** @typedef {Record<string, Tensor>} Group a named set of uploaded weights */
 /**
  * @typedef {{heads: number, attention: Group, pairBias?: Group}} AttentionGroup
@@ -203,6 +210,7 @@ export function evoformerBlock(execution, call) {
     const update = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
     });
     pair = residual(pair, update, ownPair);
     ownPair = true;
@@ -300,6 +308,7 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
     const update = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
     });
     pair = residual(pair, update, ownPair);
     ownPair = true;
@@ -423,6 +432,7 @@ export function extraMsaBlock(execution, call) {
     const update = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter: call.cOuter, cZ: call.cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
     });
     pair = residual(pair, update, ownPair);
     ownPair = true;

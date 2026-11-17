@@ -3913,3 +3913,17 @@ Small, and taken because every round of it is ahead and it removes four transpos
 fused projection blocks where the four did not): monomer worst atom 0.0347 -> **0.042 A** against a floor of 0.0578,
 pLDDT 57.937; multimer f32 0.001 -> **0.0015 A** against 0.0007 (bar 3x), default 0.2619. `check-webgl-evoformer-block`
 reads its pre-existing red `extra.pair` 4.451e-5 on both sides of this and at the commit this work started from.
+
+**The outer product mean's two-draw form back at a shallow alignment.** The sequences-first form (`outerProductFirst`,
+written for AF3's 1024-row alignments) costs ~75 ms a call at 195 residues almost whatever the depth - an `L^2 x
+cOuter^2` permute and a K = 1024 projection - where the two-draw form it replaced costs ~6 ms a SEQUENCE. At depth 1,
+which is a single-sequence fold and the page's "none", that profiled 4.6 s of OPM against 0.5. AF2's block now passes
+`twoDrawDepth: 8` (`AF2_OPM_TWO_DRAW_DEPTH`); AF3 passes none and is untouched. `--no-opm-shallow` is the control arm.
+A deep alignment is unchanged.
+
+| | sequences first | two draws at depth <= 8 | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 14.72 / 14.77 s | **12.03 / 12.25 s** | **1.21x** |
+| monomer, 200 residues | 15.60 / 15.63 s | **12.72 / 12.90 s** | **1.22x** |
+
+Monomer worst atom 0.0365 A against a floor of 0.0686 (pLDDT 57.937); multimer f32 0.0011 against 0.001, default 0.2614.

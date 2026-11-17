@@ -289,7 +289,7 @@ export function releaseOuterProductMeanWeights(execution, weights) {
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   sequences: number, length: number, cM: number, cOuter: number, cZ: number,
  *   layerNormEpsilon?: number, normalizationEpsilon?: number,
- *   variance?: "two-pass" | "fast", biasAfterNorm?: boolean}} call
+ *   variance?: "two-pass" | "fast", biasAfterNorm?: boolean, twoDrawDepth?: number}} call
  * @returns {Tensor} `length^2 x cZ`; the caller owns it
  */
 export function outerProductMean(execution, call) {
@@ -338,7 +338,13 @@ export function outerProductMean(execution, call) {
   const left = side(w.leftWeight, w.leftBias, "left");
   const right = side(w.rightWeight, w.rightBias, "right");
   execution.release(normalised);
-  if (!execution.noOpmOuterFirst) {
+  // 🔴 AND NOT AT A SHALLOW ALIGNMENT, WHERE THE TWO-DRAW FORM IS AN ORDER OF MAGNITUDE CHEAPER: its cost is linear in
+  // the depth and the sequences-first form's is mostly fixed (an `L^2 x cOuter^2` permute and a K = 1024 projection
+  // whatever the depth). A 195-residue AF2 pass at depth 1 profiled 0.5 s of OPM two-draw against 4.6 s outer-first.
+  // `twoDrawDepth` is the caller's (AF2's block passes `AF2_OPM_TWO_DRAW_DEPTH`; AF3 passes none and is unchanged);
+  // `--no-opm-shallow` is the control arm.
+  const shallow = sequences <= (call.twoDrawDepth ?? 0) && !execution.noOpmShallow;
+  if (!execution.noOpmOuterFirst && !shallow) {
     const output = outerProductFirst(execution, { left, right, mask, w, sequences, length, cOuter, cZ,
       normalizationEpsilon, biasAfterNorm });
     execution.release(left);

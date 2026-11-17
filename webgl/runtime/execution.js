@@ -366,6 +366,8 @@ export class Execution {
      * kernels/outer-product-mean.js): the two-draw form through `intermediate[s][i][cr][z]`, as before.
      */
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
+    /** The control arm for the two-draw outer product mean at a shallow alignment (`twoDrawDepth`). */
+    this.noOpmShallow = options.noOpmShallow ?? false;
     this.noGridFusedProjection = options.noGridFusedProjection ?? false;
     this.noKeepPlanes = options.noKeepPlanes ?? false;
     this.noHeadMajorAttention = options.noHeadMajorAttention ?? false;
