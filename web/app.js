@@ -23,6 +23,7 @@
  */
 import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../webgpu/af2/multimer/model.js";
+import { AlphaFoldWebGl2 } from "./af2-webgl2.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../shared/input/a3m.js";
 import { mergeJobAlignments } from "../shared/input/chains.js";
@@ -5011,9 +5012,9 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
-    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2, AND ONLY THE AF3 LINEAGE CAN. `webgl/` holds
-    // af2, bioemu2, esmc and esmfold2 as well, but web/af3-model.js is the only page path with a
-    // `backend` to pass, so every other family is refused BY NAME - which is this page's rule at
+    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2: THE AF3 LINEAGE (web/af3-model.js) AND ALPHAFOLD 2,
+    // BOTH GRAPHS AND EVERY MODEL (web/af2-webgl2.js). `webgl/` holds bioemu2, esmc and esmfold2 as
+    // well, but no page path takes a backend for them, so every other family is refused BY NAME - which is this page's rule at
     // every other such seam (a template on a template-free model, a bond on a model that reads
     // none): a family that cannot run must say so, never fold something else and never hang.
     // The sentence names what does work, because "not supported" leaves the visitor nowhere.
@@ -5021,9 +5022,10 @@ async function fold(event) {
     // 🔴 AND THE LIST IS NARROWER THAN THE LINEAGE - see WEBGL2_FAMILIES: OpenDDE re-tokenises
     // after the trunk, which webgl/ has not ported; refusing it HERE is what keeps a visitor from
     // downloading half a gigabyte of parameters before finding out.
-    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family)) {
+    const af2Graph = graphOf(family) === "monomer" || graphOf(family) === "multimer";
+    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family) && !af2Graph) {
       throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
-        + ` have. ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`
+        + ` have. AlphaFold 2 and ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`
         + " fold here in WebGL2 instead - slower, same structure.");
     }
     // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
@@ -5319,8 +5321,10 @@ async function fold(event) {
       return;
     }
 
-    status("Starting WebGPU");
-    const device = await getDevice();
+    // ...and without WebGPU the WebGL2 driver (web/af2-webgl2.js), which takes no device.
+    const af2WebGl2 = backend === "webgl2";
+    status(af2WebGl2 ? "Starting WebGL2" : "Starting WebGPU");
+    const device = af2WebGl2 ? null : await getDevice();
     throwIfAborted(signal);
     // 🔴 MULTIMER ALWAYS TAKES THE A3M DRIVER, even with no alignment. The
     // query-only path is a separate graph that knows nothing about the multimer
@@ -5697,7 +5701,8 @@ async function fold(event) {
       // fold does. `prediction` stays undefined, so everything below reads
       // `allRecycles` and `final` instead - which is what it read anyway.
       const prediction = replay ? undefined
-        : await new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device)
+        : await (af2WebGl2 ? new AlphaFoldWebGl2({ graph: multimer ? "multimer" : "monomer" })
+          : new (unified ? AlphaFoldUnifiedGpu : AlphaFoldMonomerGpu)(device))
         .predictA3m(
           alignmentForDriver, weights, model.featureTables,
           // 🔴 `resumable: true` IS WHAT ASKS FOR THE CONTINUATION STATE, and this
@@ -5969,7 +5974,7 @@ async function fold(event) {
     status(`${foldWasReplayed ? "Already folded · shown from memory"
       : `Done in ${took} s`} · pLDDT ${best.confidence.meanPlddt.toFixed(1)}`
       + ` · pTM ${best.confidence.ptm.toFixed(3)}${bestIptmText}${ranked}${converged}`
-      + templateText + broken);
+      + templateText + (af2WebGl2 ? " · WebGL2" : "") + broken);
   } catch (error) {
     progress(null);
     if (signal.aborted || isAbortError(error)) status("Prediction stopped");

@@ -10,8 +10,12 @@ operating systems that the WebGPU path refuses outright.
 in web/model.js, `WEBGL2_FAMILIES` in shared/bundles/manifests/index.js, measured through
 `tools/fold-in-page.py --no-webgpu` (AlphaFold 3 pLDDT 68.0 in 11 s against WebGPU's 68.2 in 1 s).
 The four fused-template bundles and opendde are refused by name before the download; see
-webgl/index.js. **AlphaFold 2 folds here - both graphs - and the PAGE still does not select it**,
-because web/ has no AF2 entry point that takes a backend.
+webgl/index.js. **AlphaFold 2 folds here - both graphs - and the PAGE selects it too** (2026-11-17,
+web/af2-webgl2.js: the WebGL2 fold behind the WebGPU drivers' `predictA3m`, its pTM, ipTM and chain scores reduced by
+the same `tmScoresFromTerm`). Through `tools/fold-in-page.py --no-webgpu --remote-weights` on an M2, one recycle,
+single sequence: the monomer pLDDT 64.2 / pTM 0.338 in 4.3 s against WebGPU's 64.2 / 0.337 in 0.9 s; the multimer
+(two chains of 6MRR) 65.5 / 0.514 / ipTM 0.462 in 5.8 s against 65.5 / 0.514 / 0.461 in 1.9 s; "All 5" in 20.4 s. It
+cannot continue a fold's recycles (no `resumable`), so a raised recycle count refolds from pass zero.
 
 🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS.** 59 residues from
 `model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight

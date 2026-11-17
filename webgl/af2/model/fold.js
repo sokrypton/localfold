@@ -240,7 +240,7 @@ export function releaseAf2Weights(execution, weights) {
  *   paeBreaks: ArrayLike<number>,
  *   template?: Parameters<typeof templateFeatures>[0]["template"],
  *   useTemplateUnitVector?: boolean, templates?: number,
- *   tolerance?: number, pairHost?: boolean, contactMap?: boolean,
+ *   tolerance?: number, pairHost?: boolean, contactMap?: boolean, keepPaeLogits?: boolean,
  *   shape?: Partial<typeof AF2_SHAPE>,
  *   onRecycle?: (result: object, recycle: number) => void,
  *   onBlock?: (stack: "extra" | "main", block: number, blocks: number) => void,
@@ -492,6 +492,7 @@ export async function foldAf2(execution, call) {
       hiddenChannels: w.confidence.lddt.act0Bias.elements,
       lddtBins: w.confidence.lddt.logitsBias.elements,
       breaks: paeBreaks,
+      keepPaeLogits: call.keepPaeLogits === true,
     });
 
     let contactProbs;
