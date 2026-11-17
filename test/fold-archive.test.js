@@ -119,6 +119,29 @@ describe("the fold archive", () => {
     expect(files.has("fold_test_model_0.pdb")).toBe(true);
   });
 
+  it("writes an ensemble's every sample, one MODEL each, beside the first", () => {
+    const sample = (x) => `ATOM      1  CA  GLY A   1    ${x}   0.000   0.000  1.00  0.00           C\nCONECT    1    1\nEND\n`;
+    const ensemble = [{ name: "sample_1", pdb: sample("   1.000") }, { name: "sample_2", pdb: sample("   2.000") }];
+    const files = buildFoldArchive({
+      stem: "fold_test", model: "BioEmu2", settings: {}, entities: [{ type: "protein", value: "G" }],
+      ensemble, prediction: { pdb: ensemble[0].pdb, chainLengths: [1], confidence: {} },
+    });
+    const text = files.get("fold_test_ensemble.pdb");
+    expect(text.match(/^MODEL /gm).length).toBe(2);
+    expect(text.match(/^ENDMDL/gm).length).toBe(2);
+    expect(text.match(/^CONECT/gm).length).toBe(1);
+    expect(text.trimEnd().endsWith("END")).toBe(true);
+    expect(text).toContain("REMARK 250 MODEL 2 IS sample_2");
+    expect(files.get("fold_test_model_0.pdb")).toBe(ensemble[0].pdb);
+    expect(files.get("README.md")).toContain("fold_test_ensemble.pdb");
+    // ...and one structure is no ensemble: the archive is what it always was
+    const single = buildFoldArchive({
+      stem: "fold_test", model: "BioEmu2", settings: {}, entities: [{ type: "protein", value: "G" }],
+      ensemble: ensemble.slice(0, 1), prediction: { pdb: ensemble[0].pdb, chainLengths: [1], confidence: {} },
+    });
+    expect(single.has("fold_test_ensemble.pdb")).toBe(false);
+  });
+
   // ...and a single-model fold is byte for byte the archive it always was.
   it("writes no per-model files when one model folded", () => {
     const files = buildFoldArchive({
