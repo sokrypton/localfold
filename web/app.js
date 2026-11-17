@@ -5025,7 +5025,7 @@ async function fold(event) {
     const af2Graph = graphOf(family) === "monomer" || graphOf(family) === "multimer";
     if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family) && !af2Graph) {
       throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
-        + ` have. AlphaFold 2 and ${WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one).join(", ")}`
+        + ` have. ${["AlphaFold 2", ...WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one)].join(", ")}`
         + " fold here in WebGL2 instead - slower, same structure.");
     }
     // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
