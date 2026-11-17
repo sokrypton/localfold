@@ -46,6 +46,51 @@ export function extraMsaStack(execution, call) {
   return runStack(execution, call, extraMsaBlock, "extra-stack");
 }
 
+/**
+ * ...and the same two stacks with a pause after every block, for a PAGE: `pause` is awaited before `onBlock`, so a
+ * caller handing it `laggedPause` (webgl/runtime/steps.js - one block behind the GPU, never draining it) gets a
+ * repaint and a Stop check every block, and a progress count that follows what the GPU has DONE rather than what was
+ * issued. Without it the 48 blocks of the main stack were issued in one synchronous run: the bar stood still, then
+ * jumped. The synchronous forms above are unchanged, so the stage gates call what they always called.
+ *
+ * @param {import("../../runtime/execution.js").Execution} execution
+ * @param {Parameters<typeof evoformerStack>[1] & {pause?: () => Promise<void>}} call
+ * @returns {Promise<{msa: Tensor, pair: Tensor, blocks: number}>}
+ */
+export function evoformerStackAsync(execution, call) {
+  return runStackAsync(execution, call, evoformerBlock, "stack");
+}
+
+/** `extraMsaStack` with a pause after every block; see `evoformerStackAsync`. */
+export function extraMsaStackAsync(execution, call) {
+  return runStackAsync(execution, call, extraMsaBlock, "extra-stack");
+}
+
+async function runStackAsync(execution, call, block, label) {
+  const { blockWeights } = call;
+  if (!Array.isArray(blockWeights) || blockWeights.length === 0) {
+    throw new RangeError(`${label}: needs at least one block's weights`);
+  }
+  let msa = call.msa;
+  let pair = call.pair;
+  let own = false;
+  for (const [index, weights] of blockWeights.entries()) {
+    const next = block(execution, { ...call, msa, pair, weights });
+    if (own) {
+      execution.release(msa);
+      execution.release(pair);
+    }
+    msa = next.msa;
+    pair = next.pair;
+    own = true;
+    await call.pause?.();
+    call.onBlock?.(index, blockWeights.length);
+  }
+  msa.label = `${label}.msa`;
+  pair.label = `${label}.pair`;
+  return { msa, pair, blocks: blockWeights.length };
+}
+
 function runStack(execution, call, block, label) {
   const { blockWeights } = call;
   if (!Array.isArray(blockWeights) || blockWeights.length === 0) {
