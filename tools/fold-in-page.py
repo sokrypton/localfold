@@ -241,6 +241,8 @@ def main():
                              " or --model multimer; \"all\" runs every one of them in"
                              " a single set of frames and ranks across them")
     parser.add_argument("--recycles", default="1")
+    parser.add_argument("--bioemu2-samples", default=None,
+                        help="BioEmu2's sample count (the page's default is 1) - an ensemble, for the saved-ensemble check")
     parser.add_argument("--steps", default="4", help="AF3 sampler steps")
     parser.add_argument("--url", default=None,
                         help="drive a DEPLOYED page instead of this checkout,"
@@ -989,6 +991,7 @@ def main():
           // same certainty, same time, which is what an arm that did not run
           // looks like.
           set('af3-count', %s);
+          if (%s !== null) set('bioemu2-samples', %s);
           // 🔴 THE TERMS DIALOG WOULD OTHERWISE EAT THE CLICK. AlphaFold 3's
           // parameters are gated behind an acknowledgement, and it opens in
           // front of `predict` - so without this the Fold press opens a modal,
@@ -1004,7 +1007,8 @@ def main():
         })()""" % (json.dumps(args.model), json.dumps(args.af2_model),
                    json.dumps(args.recycles),
                    json.dumps(msa_mode), json.dumps(msa_mode), json.dumps(args.plm),
-                   json.dumps(args.steps)))
+                   json.dumps(args.steps),
+                   json.dumps(args.bioemu2_samples), json.dumps(args.bioemu2_samples)))
         time.sleep(0.5)
         print("controls:", cdp.evaluate(ws, """(() => {
           const v = (id) => (document.getElementById(id) || {}).value;
