@@ -22,6 +22,9 @@ p.add_argument("--steps", default="4")
 p.add_argument("--timeout", type=float, default=600)
 p.add_argument("--url", default=None)
 p.add_argument("--repeat", type=int, default=1)
+p.add_argument("--recycles", default="1", help="the recycle row (the page's own default is 3)")
+p.add_argument("--remote-weights", action="store_true",
+               help="the registry's published bundles rather than this checkout's exports (as fold-in-page.py's)")
 p.add_argument("--delay", type=float, default=0, help="seconds to wait after the page is ready, as a reader typing would")
 p.add_argument("--sequence", default="GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK")
 a = p.parse_args()
@@ -31,7 +34,7 @@ spec = importlib.util.spec_from_file_location("fip", os.path.join(a.repo, "tools
 fip = importlib.util.module_from_spec(spec)
 sys.path.insert(0, os.path.join(a.repo, "tools"))
 spec.loader.exec_module(fip)
-httpd = fip.serve(local_weights=True)
+httpd = fip.serve(local_weights=not a.remote_weights)
 URL = a.url or f"http://127.0.0.1:{fip.PORT}/index.html"
 
 DPORT = 4447
@@ -76,10 +79,10 @@ try:
       field.dispatchEvent(new Event('input', { bubbles: true }));
       const set = (id, v) => { const el = document.getElementById(id); if (!el) return;
         el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
-      set('model-family', arguments[1]); set('recycles', '1'); set('msa-mode', arguments[2]);
+      set('model-family', arguments[1]); set('recycles', arguments[4]); set('msa-mode', arguments[2]);
       set('af3-count', arguments[3]);
       try { localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted'); } catch (e) {}
-    """, a.sequence, a.model, a.msa, a.steps)
+    """, a.sequence, a.model, a.msa, a.steps, a.recycles)
     time.sleep(0.5)
     print("controls:", json.dumps(js("""const v = id => (document.getElementById(id)||{}).value;
         return {model: v('model-family'), msa: v('msa-mode'), steps: v('af3-count')};""")))
@@ -108,6 +111,10 @@ try:
             seen.setdefault(key, at)
         for key, at in seen.items():
             print(f"   {at:7d} ms  {key}")
+        # ...and every progress reading the reader saw, in order: how smoothly the bar moved
+        steps = [(at, m.group(1)) for at, text in log for m in [re.search(r"Folding[^0-9]*([0-9]+)%", text)] if m]
+        if steps:
+            print("   progress:", " ".join(f"{p}%@{at}" for at, p in steps))
 finally:
     if sid:
         try: call("DELETE", f"/session/{sid}")
