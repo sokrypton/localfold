@@ -3938,3 +3938,13 @@ every one of the eight multimer runs is consistent with it. Not bit-identical (a
 monomer worst atom 0.0447 A against a floor of 0.0403 (bar 3x), pLDDT 57.938; multimer f32 0.0016 against 0.0009;
 `check-webgl-evoformer-block` now passes all four arms, its `extra.pair` included. AF3 66.379 unchanged (it passes no
 `residualOf` to these kernels).
+
+**End to end**, the commit this started from against this one, interleaved, two rounds: the 195-residue multimer
+**25.36 / 25.65 s -> 12.08 / 11.88 s (2.13x)** and the 200-residue monomer **27.17 / 27.11 s -> 12.71 / 13.56 s
+(2.07x)**. Through the page (`fold-in-page.py --no-webgpu --remote-weights --msa-mode none --recycles 1`): 1BRS
+**52.5 s -> 24.2 s** at the same pLDDT 38.4 / pTM 0.220 / ipTM 0.080, and 5CAJ chain A (261 residues) **111.3 s -> 49.2
+s** at the same pLDDT 31.5 / pTM 0.206. What is left, profiled at 195 residues: the dense projections 35% (the fused
+attention 128 -> 516 and triangle 128 -> 512 the largest, x-bound as "The dense projection is bound by x's fetch
+locality" says), the flash attention 12%, LayerNorm at 128 channels 11% (the statistics split is a measured loss at
+this width), the q/k/v/g split 6% and the triangle operands 6% - its incoming direction a third slower than its
+outgoing one, from the transposed read.
