@@ -3892,3 +3892,24 @@ unchanged). Profiled, `triangle.operands` 4950 -> 1513 ms. Bit-identical; `--no-
 
 Every gate reads exactly its previous figure (monomer 0.0347 A, multimer 0.001 / 0.0015 at f32 and 0.2611 at default,
 AF3 66.379); `check-webgl-triangle.js` gains a 99-residue shape whose planes are past one texture row (36 arms).
+
+**The attentions' four projections as one, and the ending node's transposes gone.** AF3's grid attention runs q, k,
+v and the gate as one projection (`fuseGridProjections`); AF2's attention block now does too (`uploadAttentionGroup`
+in `webgl/kernels/attention-block.js`): one in-major `[C][4C]` weight - AF2's four are in-major already, so it is a
+concatenation - with a triangle attention's `[C][heads]` bias projection appended, one blocked projection with kept
+planes, a four-target split that applies the gate's logistic and the block's float16 rounding, and the bias read out
+of the same planes head-major. The column attentions (MSA column, triangle ending node) no longer transpose their input
+and their update: the split gathers rows in transposed order and the residual reads the update back transposed
+(`transposedResidualSource`), and every attention's residual rides in its output projection: 5,315 draws to 4,481 on the
+59-residue gate. The fused weight is float32 unless its parts
+were float16, since `halfWeights` decides by size. `--no-af2-attention-fused` is the control arm.
+
+| | aligned planes | and fused attention | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 14.89 / 14.91 s | **14.69 / 14.77 s** | **1.01x** |
+| monomer, 200 residues | 16.43 / 15.84 s | **15.82 / 15.60 s** | **1.03x** |
+
+Small, and taken because every round of it is ahead and it removes four transposes a block. Not bit-identical (the
+fused projection blocks where the four did not): monomer worst atom 0.0347 -> **0.042 A** against a floor of 0.0578,
+pLDDT 57.937; multimer f32 0.001 -> **0.0015 A** against 0.0007 (bar 3x), default 0.2619. `check-webgl-evoformer-block`
+reads its pre-existing red `extra.pair` 4.451e-5 on both sides of this and at the commit this work started from.

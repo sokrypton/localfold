@@ -397,6 +397,8 @@ export class Execution {
     this.noAf2TriangleBlock = options.noAf2TriangleBlock ?? false;
     /** The control arm for AF2's operand planes laid a whole number of texture rows apart (`alignedPlaneStride`). */
     this.noAlignedPlanes = options.noAlignedPlanes ?? false;
+    /** The control arm for AF2's attention projections fused into one (`uploadAttentionGroup`). Read at UPLOAD. */
+    this.noAf2AttentionFused = options.noAf2AttentionFused ?? false;
     /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this
