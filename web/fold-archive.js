@@ -396,7 +396,7 @@ export function summaryConfidencesJson({ confidence, chainLengths, tokenChainIds
  */
 function readme({ stem, model, settings, msaOrigin, templateCount, scored = true,
                   alignedError, alignmentOmitted = false,
-                  carriesAlignment = false }) {
+                  carriesAlignment = false, ensemble }) {
   const lines = [
     `# ${stem}`,
     "",
@@ -420,6 +420,10 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
   }
   if (templateCount !== undefined) {
     lines.push(`- templates: ${templateCount === 0 ? "none" : `${templateCount} used`}`);
+  }
+  if (ensemble !== undefined) {
+    lines.push("", `The ensemble's ${ensemble.samples} samples are \`${ensemble.file}\`, one MODEL each; \`_model_0.pdb\``
+      + " is the first of them.");
   }
   if (!scored) {
     // ...said once, plainly, because the B-factor column and a missing summary
@@ -522,9 +526,37 @@ function readme({ stem, model, settings, msaOrigin, templateCount, scored = true
  *
  * @returns {Map<string, string>}
  */
+/**
+ * An ensemble as ONE multi-model PDB: each sample a `MODEL n ... ENDMDL` block, named in a REMARK, which PyMOL and
+ * ChimeraX open as the states of one object. A sample's own END is dropped and its CONECT records (a declared bond's)
+ * kept once, after the last model, because every model numbers its atoms the same way.
+ *
+ * 🔴 IT EXISTS BECAUSE AN ENSEMBLE WAS SAVED AS ITS FIRST SAMPLE. BioEmu2's point is the ensemble - the play bar shows
+ * every sample - and the .pdb button and the archive both wrote `pdb`, sample one alone (reported by a user).
+ *
+ * @param {{name: string, pdb: string}[]} samples
+ */
+export function ensemblePdb(samples) {
+  const lines = samples.map((sample, at) => `REMARK 250 MODEL ${at + 1} IS ${sample.name}`);
+  let conect = [];
+  samples.forEach((sample, at) => {
+    lines.push(`MODEL     ${String(at + 1).padStart(4)}`);
+    const own = [];
+    for (const line of sample.pdb.split(/\r?\n/)) {
+      if (line === "" || line.startsWith("END") || line.startsWith("MODEL")) continue;
+      if (line.startsWith("CONECT")) { own.push(line); continue; }
+      lines.push(line);
+    }
+    if (at === 0) conect = own;
+    lines.push("ENDMDL");
+  });
+  lines.push(...conect, "END");
+  return `${lines.join("\n")}\n`;
+}
+
 export function buildFoldArchive({
   stem, model, settings, entities, prediction, msas = {}, templates,
-  msaOrigin, alignmentOmitted = false, perModel,
+  msaOrigin, alignmentOmitted = false, perModel, ensemble,
 }) {
   const name = safeJobName(stem);
   const { confidence, alignedError, pdb, chainLengths } = prediction;
@@ -559,6 +591,10 @@ export function buildFoldArchive({
     name: stem, seed: settings?.seed, entities,
   }));
   files.set(`${name}_model_0.pdb`, pdb);
+  // ...and an ENSEMBLE's every sample, in one multi-model file beside the first (`_model_0.pdb` is sample one, which
+  // the viewer opens on). Absent for a single structure, so an ordinary archive is byte for byte what it was.
+  const ensembleFile = Array.isArray(ensemble) && ensemble.length > 1 ? `${name}_ensemble.pdb` : undefined;
+  if (ensembleFile !== undefined) files.set(ensembleFile, ensemblePdb(ensemble));
   // 🔴 AND ONE FILE PER MODEL WHERE FIVE OF THEM FOLDED. "All 5" runs
   // AlphaFold 2's five models as one prediction and ranks their passes
   // together, and an archive carrying only the winner throws four structures
@@ -648,6 +684,7 @@ export function buildFoldArchive({
     // loop above is the only thing that knows whether an a3m survived.
     carriesAlignment: [...files.keys()].some((path) => path.startsWith("msas/")),
     templateCount: templates === undefined ? undefined : templates.length,
+    ensemble: ensembleFile === undefined ? undefined : { file: ensembleFile, samples: ensemble.length },
   }));
   return files;
 }

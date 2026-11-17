@@ -77,7 +77,7 @@ import { complexSequenceProblem } from "./sequence.js";
 import { updateScoresCard } from "./scores-card.js";
 import { entitiesFromText, entitiesProblem, expandEntities, POLYMER_TYPES,
          templateKind } from "./entities.js";
-import { buildFoldArchive, tokenLayoutFrom, msasFromArchive, templatesFromArchive,
+import { buildFoldArchive, ensemblePdb, tokenLayoutFrom, msasFromArchive, templatesFromArchive,
          SINGLE_SEQUENCE_ORIGIN } from "./fold-archive.js";
 import { jobFromJson, jobInputJson } from "./job-json.js";
 import {
@@ -4334,6 +4334,8 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   updateScoresCard(undefined);
   recordPrediction({
     stem, pdb: pdbs[0], chains, confidence: undefined, scores: JSON.stringify(scores, null, 2),
+    // ...and every sample, in the play bar's order and names, which the .pdb button and the archive save (ensemblePdb)
+    ensemble: pdbs.map((pdb, at) => ({ name: label(at), pdb })),
     chainLengths: chains.map((chain) => chain.length),
     contactSource: { contactProbs: result.contact },
     model: modelName,
@@ -4718,6 +4720,8 @@ async function nativeBioemu2Samples(result, prediction) {
   const perTrajectory = Math.max(1, Number(controls["bioemu2-propagation-steps"]) || 1);
   const label = (at) => (propagating
     ? `trajectory_${Math.floor(at / perTrajectory) + 1}_step_${(at % perTrajectory) + 1}` : `sample_${at + 1}`);
+  // every sample, as the browser path records them, for the .pdb button and the archive (ensemblePdb)
+  prediction.ensemble = result.samples.map((pdb, at) => ({ name: label(at), pdb }));
   const api = window.py2Dmol;
   if (api?.frameFromText !== undefined && viewer !== undefined) {
     const object = viewer.objectsData?.[viewerObject];
@@ -6554,7 +6558,13 @@ const activePrediction = () => {
 
 element("download-pdb").addEventListener("click", () => {
   const pred = activePrediction();
-  if (pred) download(`${pred.stem}.pdb`, pred.pdb, "chemical/x-pdb");
+  // several structures as one multi-model PDB, a MODEL each: an ensemble's samples (BioEmu2), or "All 5"'s models in
+  // the archive's rank order (rank_001 first, the structure the page chose); anything else its one structure
+  const several = pred?.ensemble?.length > 1 ? pred.ensemble
+    : pred?.perModel?.length > 1 ? pred.perModel.map((entry) => ({
+      name: `rank_${String(entry.rank).padStart(3, "0")}_model_${entry.number}`, pdb: entry.pdb }))
+    : undefined;
+  if (pred) download(`${pred.stem}.pdb`, several === undefined ? pred.pdb : ensemblePdb(several), "chemical/x-pdb");
 });
 // 🔴 EVERYTHING THE FOLD USED AND PRODUCED, NOT JUST THE SCORES. What this
 // replaces wrote pLDDT, PAE and pTM into one JSON and dropped the rest on the
@@ -6612,6 +6622,7 @@ function archiveFor(pred, { includeAlignment = true } = {}) {
       // ...and every model's own best where a sweep produced them. See the
       // note in buildFoldArchive: one file per model, ranked.
       perModel: pred.perModel,
+      ensemble: pred.ensemble,
       prediction: {
         pdb: pred.pdb,
         chainLengths: pred.chainLengths,
