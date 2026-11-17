@@ -65,7 +65,11 @@ export async function main(device, args) {
   const defaultBundle = family === "multimer" ? "/model-multimer" : "/model-af2-monomer-int5";
   const bundle = option(args, "bundle", defaultBundle).replace(/\/$/, "");
   const length = Number(option(args, "length", "0"));
-  const sequence = length > 0 ? DEFAULT_SEQUENCE.slice(0, length) : DEFAULT_SEQUENCE;
+  // `--sequence=` folds any protein (chains concatenated; `--chains=` splits them), so a profile can be taken at a
+  // length a visitor folds rather than only at the 59-residue default.
+  const given = option(args, "sequence", "");
+  const base = given !== "" ? given : DEFAULT_SEQUENCE;
+  const sequence = length > 0 ? base.slice(0, length) : base;
   // `--chains=30,29` splits the one residue axis a multimer folds over. One
   // chain is a legal multimer and is the arm that should reproduce a monomer.
   const chains = option(args, "chains", null) === null
