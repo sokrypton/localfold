@@ -69,6 +69,8 @@ export async function main(device, args) {
     { length: 24, cZ: 32, cHidden: 64 },
     // an odd length, which the blocked form pads to eight and must strip again
     { length: 13, cZ: 64, cHidden: 32 },
+    // a plane past one texture row (104 x 104 padded), which the blocked form lays a whole number of rows apart
+    { length: 99, cZ: 32, cHidden: 16 },
   ];
 
   for (const shape of shapes) {

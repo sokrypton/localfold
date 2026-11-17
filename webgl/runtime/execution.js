@@ -395,6 +395,8 @@ export class Execution {
      * (`webgl/kernels/triangle-multiplication.js`) - against the nine-draw form. Read at weight UPLOAD.
      */
     this.noAf2TriangleBlock = options.noAf2TriangleBlock ?? false;
+    /** The control arm for AF2's operand planes laid a whole number of texture rows apart (`alignedPlaneStride`). */
+    this.noAlignedPlanes = options.noAlignedPlanes ?? false;
     /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this

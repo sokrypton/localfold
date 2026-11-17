@@ -192,7 +192,7 @@ export function triangleContract(execution, call, into) {
  * then threw away sixty-three sixty-fourths of.
  */
 const splitContractSourceUncached = (length, channels, direction, divideByLength,
-  coalesce = true, paddedLength = length) => {
+  coalesce = true, paddedLength = length, planeStride = paddedLength * paddedLength) => {
   // 🔴 THE OUTGOING DIRECTION WALKS k ALONG THE CONTIGUOUS AXIS, SO IT CAN READ
   // WHOLE TEXELS - AND `fetch1` WAS ASKING FOR THE SAME TEXEL FOUR TIMES. Four
   // consecutive k of `a[c][i][k]` are four consecutive floats, which is one
@@ -219,7 +219,7 @@ const splitContractSourceUncached = (length, channels, direction, divideByLength
     ? "total += fetch1(aTex, plane + i * LP + k) * fetch1(bTex, plane + j * LP + k);"
     : "total += fetch1(aTex, plane + k * LP + j) * fetch1(bTex, plane + k * LP + i);"}
   }`;
-  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
+  return sized({ L: length, LP: paddedLength, PLANE: planeStride, ELEMENTS: length * length * channels }, `${PRELUDE}${ONE_TARGET}
 // The operands' pair axes, padded to a multiple of four so the coalesced loop
 // is legal; equal to L whenever nothing needed padding.
 const int C4 = ${channels / 4};
@@ -285,7 +285,7 @@ void main() {
  */
 const blockedContractSourceUncached = (length, channels, direction, divideByLength,
   channelSlowest = true, paddedLength = length, tileMapped = false,
-  residentOperands = false) => {
+  residentOperands = false, planeStride = paddedLength * paddedLength) => {
   const planes = 8;
   const component = ["x", "y", "z", "w"];
   // For the outgoing direction a row is `a[i][k]`, contiguous in k; for the
@@ -310,7 +310,7 @@ ${[0, 1].map((di) => [0, 1, 2, 3].map((dj) =>
   `    result${di * 4 + dj}.${component[c4]} = s${di}${dj}${divideByLength ? " / float(L)" : ""};`)
   .join("\n")).join("\n")}
   }`;
-  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, JBLOCKS: paddedLength / 4, BLOCKS: (paddedLength / 2) * (paddedLength / 4), TILEW: Math.max(1, Math.floor(2048 / (channels / 4))) }, `${PRELUDE}${targetDeclarations(planes)}
+  return sized({ L: length, LP: paddedLength, PLANE: planeStride, JBLOCKS: paddedLength / 4, BLOCKS: (paddedLength / 2) * (paddedLength / 4), TILEW: Math.max(1, Math.floor(2048 / (channels / 4))) }, `${PRELUDE}${targetDeclarations(planes)}
 // The padded pair axes: the block sweeps the PADDED grid, whose tail rows and
 // columns are zeros, and the repack reads only the true L of them.
 const int C4 = ${channels / 4};
@@ -392,7 +392,7 @@ ${[0, 1, 2, 3].map(channelBlock).join("\n")}
  * arithmetic and is already inside the figures above.
  */
 const widePairBlockSourceUncached = (length, channels, divideByLength,
-  paddedLength = length, tileWidth = 8) => {
+  paddedLength = length, tileWidth = 8, planeStride = paddedLength * paddedLength) => {
   const I = 4;
   const J = 8;
   const slots = [];
@@ -400,7 +400,7 @@ const widePairBlockSourceUncached = (length, channels, divideByLength,
     for (let j = 0; j < J; j += 1) slots.push(`s${i}_${j}`);
   }
   const value = (name) => (divideByLength ? `${name} / float(L)` : name);
-  return sized({ L: length, LP: paddedLength, PLANE: paddedLength * paddedLength, JBLOCKS: paddedLength / J, BLOCKS: (paddedLength / I) * (paddedLength / J), TILEW: tileWidth }, `${PRELUDE}${targetDeclarations(8)}
+  return sized({ L: length, LP: paddedLength, PLANE: planeStride, JBLOCKS: paddedLength / J, BLOCKS: (paddedLength / I) * (paddedLength / J), TILEW: tileWidth }, `${PRELUDE}${targetDeclarations(8)}
 const int C = ${channels};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -561,7 +561,9 @@ ${Array.from({ length: 7 }, (_, p) =>
  * @param {import("../runtime/execution.js").Execution} execution
  */
 export function contractInto(execution, output, a, b, length, channels, divideByLength,
-  direction, padded = length, prefix = "af3.triangle") {
+  direction, padded = length, prefix = "af3.triangle", planeStride = padded * padded) {
+  // `planeStride`: floats between two channels' planes in a and b, `padded * padded` unless the producer laid them
+  // further apart (`alignedPlaneStride`)
   // The pair block needs the PADDED length divisible by four - two i and four j
   // a fragment - and eight render targets; `MAX_DRAW_BUFFERS` is at least four
   // everywhere, so the one-pair kernel stays for a context that has only four.
@@ -580,7 +582,7 @@ export function contractInto(execution, output, a, b, length, channels, divideBy
   if (!blocked) {
     execution.dispatch({
       source: splitContractSource(length, channels, direction === "incoming" ? "incoming" : "outgoing",
-        divideByLength, !execution.noTriangleCoalesce, padded),
+        divideByLength, !execution.noTriangleCoalesce, padded, planeStride),
       output,
       inputs: { aTex: a, bTex: b },
       label: `${prefix}.contract-only:${direction}:${length}x${channels}${tag}`
@@ -602,7 +604,7 @@ export function contractInto(execution, output, a, b, length, channels, divideBy
     const widePlanes = Array.from({ length: 8 },
       (_, p) => execution.allocate(wideTexels * 4, `af3.triangle.wide-plane${p}`));
     execution.dispatch({
-      source: widePairBlockSource(length, channels, divideByLength, padded, wideTile),
+      source: widePairBlockSource(length, channels, divideByLength, padded, wideTile, planeStride),
       outputs: widePlanes,
       inputs: { aTex: a, bTex: b },
       label: `${prefix}.contract-wide:${direction}:${length}x${channels}${tag}`
@@ -635,7 +637,7 @@ export function contractInto(execution, output, a, b, length, channels, divideBy
     (_, p) => execution.allocate(planeTexels * 4, `af3.triangle.pair-plane${p}`));
   execution.dispatch({
     source: blockedContractSource(length, channels, direction, divideByLength,
-      !execution.noContractChannelSlowest, padded, tileMapped),
+      !execution.noContractChannelSlowest, padded, tileMapped, false, planeStride),
     outputs: planes,
     inputs: { aTex: a, bTex: b },
     label: `${prefix}.contract-block:${direction}:${length}x${channels}${tag}`
@@ -662,6 +664,18 @@ export function contractInto(execution, output, a, b, length, channels, divideBy
  * can actually run, so a context without eight draw buffers or with
  * `--no-contract-wide` keeps the four-padding and the smaller tensors.
  */
+/**
+ * A channel plane's stride for a producer that lays the contraction's operands out itself: `padded * padded` floats
+ * rounded up to whole texture rows, so channel c + 1's (i, j) sits directly BELOW channel c's and a rasterisation tile
+ * of the producer covers the same pairs in several neighbouring channels - which is what lets one pair-major source
+ * texel serve the four channels it holds. Unchanged below one texture row.
+ */
+export const alignedPlaneStride = (padded) => {
+  const row = TEXTURE_WIDTH * CHANNELS_PER_TEXEL;
+  const plane = padded * padded;
+  return plane <= row ? plane : Math.ceil(plane / row) * row;
+};
+
 export const paddedPairLength = (execution, length, channels = 0) => {
   if (execution.noContractPad) return length;
   const wideWanted = !execution.noContractWide && channels > 0

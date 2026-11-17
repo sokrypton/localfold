@@ -286,6 +286,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noRepackResidual: flag(args, "no-repack-residual"),
     noTriangleFusedLayout: flag(args, "no-triangle-fused-layout"),
     noAf2TriangleBlock: flag(args, "no-af2-triangle-block"),
+    noAlignedPlanes: flag(args, "no-aligned-planes"),
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
     noTriangleSplit: flag(args, "no-triangle-split"),

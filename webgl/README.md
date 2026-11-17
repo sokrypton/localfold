@@ -3874,3 +3874,21 @@ Gates: the monomer's worst atom against WGSL **0.0347 A** (was 0.0679) at pLDDT 
 a floor of 0.0015** at `--no-half-weights --no-half-x` (was 0.0004 / 0.0006) and 0.2611 at the default (was 0.2627);
 `check-webgl-triangle.js` holds both forms, at five shapes including an odd length, to the CPU reference and the WGSL
 kernels at ~4e-7 (30 arms, all red under `--falsify`); AF3's `fold-af3-webgl.js` pLDDT 66.379 either side.
+
+🔴 **AND THE OPERAND DRAW IT INTRODUCED WAS THEN THE LARGEST TRIANGLE KERNEL, BY LOCALITY.** Profiled after that
+commit, `triangle.operands` was 4950 ms of the profile against the contraction's 1072 - 27 ms a call outgoing and 51
+incoming, for what is a relayout. An output texel is four consecutive j of ONE channel, read from pair-major texels
+that each hold four channels, and with planes `L_P * L_P` floats apart a rasterisation tile spans ~6 channels at
+UNRELATED pairs - so each source texel served one of its four channels per tile. Laying the planes a whole number of
+texture rows apart (`alignedPlaneStride`: 40,000 floats to 40,960 at 195 residues, +2.4%) puts channel c + 1's (i, j)
+directly below channel c's, so one tile covers the same pairs in neighbouring channels and a source texel serves all
+four. The contraction takes the stride as a constant (`planeStride`, defaulting to `L_P * L_P`, so AF3's source text is
+unchanged). Profiled, `triangle.operands` 4950 -> 1513 ms. Bit-identical; `--no-aligned-planes` is the control arm.
+
+| | shared contraction | aligned planes | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 17.75 / 17.71 s | **14.89 / 14.91 s** | **1.19x** |
+| monomer, 200 residues | 19.18 / 18.77 s | **16.43 / 15.84 s** | **1.17x** |
+
+Every gate reads exactly its previous figure (monomer 0.0347 A, multimer 0.001 / 0.0015 at f32 and 0.2611 at default,
+AF3 66.379); `check-webgl-triangle.js` gains a 99-residue shape whose planes are past one texture row (36 arms).

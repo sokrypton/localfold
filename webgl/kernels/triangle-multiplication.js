@@ -36,7 +36,7 @@
  */
 import { layerNorm } from "./layer-norm.js";
 import { linear, planeFetchGlsl, planeInputs } from "./linear.js";
-import { contractInto, paddedPairLength, triangleContract } from "./triangle-contract.js";
+import { alignedPlaneStride, contractInto, paddedPairLength, triangleContract } from "./triangle-contract.js";
 import { add, maskRows, multiply } from "../runtime/elementwise.js";
 import { PRELUDE, sized, memoSource } from "../runtime/execution.js";
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
@@ -133,9 +133,9 @@ export function uploadTriangleGroup(execution, source, label) {
  * in the order the nine-draw form computes it - the product, then the mask - so the operands agree with it to the
  * rounding of `exp`.
  */
-const operandsSourceUncached = (length, channels, paddedLength, transposed, blockRows) => sized(
-  { L: length, LP: paddedLength, PLANE: paddedLength * paddedLength,
-    ELEMENTS: channels * paddedLength * paddedLength }, `${PRELUDE}
+const operandsSourceUncached = (length, channels, paddedLength, transposed, blockRows,
+  planeStride = paddedLength * paddedLength) => sized(
+  { L: length, LP: paddedLength, PLANE: planeStride, ELEMENTS: channels * planeStride }, `${PRELUDE}
 layout(location = 0) out vec4 aOut;
 layout(location = 1) out vec4 bOut;
 const int H = ${channels};
@@ -157,6 +157,7 @@ void main() {
   int j0 = within - i * LP;
   vec4 a = vec4(0.0);
   vec4 b = vec4(0.0);
+  // ...and past LP rows a plane's tail, when its stride is wider than LP * LP, which nothing reads
   if (i < L) {
     for (int lane = 0; lane < 4; ++lane) {
       int j = j0 + lane;
@@ -286,10 +287,11 @@ function blockedTriangle(execution, call, zn) {
   const kept = /** @type {any} */ (projection).planes !== undefined ? /** @type {any} */ (projection) : null;
   const padded = paddedPairLength(execution, length, cHidden);
   const transposed = direction === "incoming";
-  const a = execution.allocate(cHidden * padded * padded, "triangle.a");
-  const b = execution.allocate(cHidden * padded * padded, "triangle.b");
+  const stride = execution.noAlignedPlanes ? padded * padded : alignedPlaneStride(padded);
+  const a = execution.allocate(cHidden * stride, "triangle.a");
+  const b = execution.allocate(cHidden * stride, "triangle.b");
   execution.dispatch({
-    source: operandsSource(length, cHidden, padded, transposed, kept?.blockRows ?? 0),
+    source: operandsSource(length, cHidden, padded, transposed, kept?.blockRows ?? 0, stride),
     outputs: [a, b],
     inputs: kept === null ? { projectionTex: projection, maskTex: mask } : { ...planeInputs(kept), maskTex: mask },
     label: `triangle.operands${transposed ? ":transposed" : ""}:${length}x${cHidden}`,
@@ -299,7 +301,7 @@ function blockedTriangle(execution, call, zn) {
   const contracted = execution.allocate(pairs * cHidden, "triangle.contract");
   // Incoming is outgoing over the transposed planes, handed bT and aT: `sum_k b[k][i] a[k][j]`.
   contractInto(execution, contracted, transposed ? b : a, transposed ? a : b, length, cHidden, false,
-    transposed ? "incoming-transposed" : "outgoing", padded, "triangle");
+    transposed ? "incoming-transposed" : "outgoing", padded, "triangle", stride);
   execution.release(a);
   execution.release(b);
   const normalised = layerNorm(execution, {
