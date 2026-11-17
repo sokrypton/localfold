@@ -43,16 +43,23 @@
  * back before it is added - three extra draws each, and the reason
  * `webgl/runtime/transpose.js` exists.
  */
-import { attentionBlock } from "../../kernels/attention-block.js";
+import { attentionBlock, uploadAttentionGroup } from "../../kernels/attention-block.js";
 import { outerProductMean } from "../../kernels/outer-product-mean.js";
 import { pairBias as projectPairBias } from "../../kernels/pair-bias.js";
 import { transition } from "../../kernels/transition.js";
-import { triangleMultiplication } from "../../kernels/triangle-multiplication.js";
+import { triangleMultiplication, uploadTriangleGroup } from "../../kernels/triangle-multiplication.js";
 import { add } from "../../runtime/elementwise.js";
 import { globalAttention } from "../../kernels/global-attention.js";
 import { transposeLeading } from "../../runtime/transpose.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
+
+/**
+ * The alignment depth at or below which AF2's outer product mean takes the two-draw form rather than contracting the
+ * sequences first (`twoDrawDepth`, webgl/kernels/outer-product-mean.js): the two-draw form costs ~6 ms a sequence at
+ * 195 residues and the sequences-first one ~75 ms almost whatever the depth, so eight is well inside the crossover.
+ */
+const AF2_OPM_TWO_DRAW_DEPTH = 8;
 /** @typedef {Record<string, Tensor>} Group a named set of uploaded weights */
 /**
  * @typedef {{heads: number, attention: Group, pairBias?: Group}} AttentionGroup
@@ -76,14 +83,6 @@ const OPM_NAMES = [
   "layerNormScale", "layerNormOffset", "leftWeight", "leftBias",
   "rightWeight", "rightBias", "outputWeight", "outputBias",
 ];
-const TRIANGLE_NAMES = [
-  "layerNormInWeight", "layerNormInBias",
-  "linearAPWeight", "linearAPBias", "linearAGWeight", "linearAGBias",
-  "linearBPWeight", "linearBPBias", "linearBGWeight", "linearBGBias",
-  "layerNormOutWeight", "layerNormOutBias",
-  "linearZWeight", "linearZBias", "linearGWeight", "linearGBias",
-];
-
 /**
  * Upload a block's weights once, in the structure `webgpu/af2/evoformer` uses:
  * `{heads, attention: {...}, pairBias: {...}}` for an attention, a flat group
@@ -103,11 +102,17 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     }
     return out;
   };
-  const attention = (source, label, biasNames) => ({
-    heads: source.heads,
-    attention: group(ATTENTION_NAMES, source.attention, `${label}.attention`),
-    pairBias: group(biasNames, source.pairBias, `${label}.pairBias`),
-  });
+  // ...the four projections fused, and a triangle attention's bias projection with them (`uploadAttentionGroup`)
+  const attention = (source, label, biasNames) => {
+    const triangle = biasNames.length === 1 && biasNames[0] === "projectionWeight";
+    const { attention: uploaded, pairBiasFused } = uploadAttentionGroup(execution, source.attention,
+      `${label}.attention`, source.heads, triangle ? source.pairBias.projectionWeight : undefined);
+    return {
+      heads: source.heads,
+      attention: uploaded,
+      pairBias: pairBiasFused ? {} : group(biasNames, source.pairBias, `${label}.pairBias`),
+    };
+  };
   // The extra stack's column attention is GLOBAL and its weights are a flat
   // group rather than `{heads, attention}`, because that kernel has no separate
   // pair-bias or per-head key and value; see encodeExtraMsaBlock.
@@ -120,7 +125,8 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     : {
       msaColumnAttention: {
         heads: weights.msaColumnAttention.heads,
-        attention: group(ATTENTION_NAMES, weights.msaColumnAttention.attention, "msa-column"),
+        attention: uploadAttentionGroup(execution, weights.msaColumnAttention.attention, "msa-column",
+          weights.msaColumnAttention.heads, undefined).attention,
       },
     };
   return {
@@ -129,10 +135,10 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     ...column,
     msaTransition: group(TRANSITION_NAMES, weights.msaTransition, "msa-transition"),
     outerProductMean: group(OPM_NAMES, weights.outerProductMean, "opm"),
-    triangleMultiplicationOutgoing: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationOutgoing, "tri-out"),
-    triangleMultiplicationIncoming: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationIncoming, "tri-in"),
+    triangleMultiplicationOutgoing: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationOutgoing, "tri-out"),
+    triangleMultiplicationIncoming: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationIncoming, "tri-in"),
     triangleAttentionStarting: attention(
       weights.triangleAttentionStarting, "tri-att-start", ["projectionWeight"]),
     triangleAttentionEnding: attention(
@@ -201,11 +207,14 @@ export function evoformerBlock(execution, call) {
   // the block has already updated three times. The two are different models
   // sharing one kernel, and the flag is per checkpoint.
   if (call.outerProductMeanFirst === true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -215,13 +224,15 @@ export function evoformerBlock(execution, call) {
     const bias = projectPairBias(execution, {
       pair, weights: row.pairBias, length, pairChannels: cZ, heads: row.heads, epsilon,
     });
-    const update = attentionBlock(execution, {
+    const next = attentionBlock(execution, {
       activations: msa, mask: msaMask, weights: row.attention,
       batch: sequences, queryLength: length, channels: cM, heads: row.heads,
       pairBias: bias, epsilon, storagePrecision: call.msaAttentionPrecision ?? "f16",
+      residualOf: msa,
     });
     execution.release(bias);
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
     ownMsa = true;
   }
 
@@ -229,6 +240,18 @@ export function evoformerBlock(execution, call) {
   //    and the update transposed back.
   {
     const column = w.msaColumnAttention;
+    if (column.attention.qkvg !== undefined) {
+      // ...over the transposed MSA without transposing it: the split gathers its rows, the residual puts them back
+      const next = attentionBlock(execution, {
+        activations: msa, mask: msaMask, weights: column.attention,
+        batch: length, queryLength: sequences, channels: cM, heads: column.heads,
+        transpose: true, transposeRows: true, epsilon,
+        storagePrecision: call.msaAttentionPrecision ?? "f16", residualOf: msa,
+      });
+      if (ownMsa) execution.release(msa);
+      msa = next;
+      ownMsa = true;
+    } else {
     const transposed = transposeLeading(execution, {
       x: msa, outer: sequences, inner: length, channels: cM,
     });
@@ -244,16 +267,19 @@ export function evoformerBlock(execution, call) {
     execution.release(updateT);
     msa = residual(msa, update, ownMsa);
     ownMsa = true;
+    }
   }
 
   // 3. MSA transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: msa,
     });
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
     ownMsa = true;
   }
 
@@ -283,11 +309,14 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
   //    is the multimer graph's order. `encodeEvoformerPairBlock` takes the same
   //    flag under the same name for the same reason.
   if (call.outerProductMeanDone !== true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter, cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -299,13 +328,16 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
     ["incoming", w.triangleMultiplicationIncoming],
   ];
   for (const [direction, group] of multiplications) {
-    const update = triangleMultiplication(execution, {
+    // ...the residual in the output projection's own epilogue (`residualOf`), where it was a multiply and an add
+    const next = triangleMultiplication(execution, {
       z: pair, mask: pairMask, weights: group,
       shape: { length, cZ, cHidden: triangleHidden },
       direction, epsilon,
       projectionPrecision: call.trianglePrecision ?? "f32",
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -313,20 +345,34 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
   //    normalised pair.
   {
     const starting = w.triangleAttentionStarting;
-    const update = attentionBlock(execution, {
+    const next = attentionBlock(execution, {
       activations: pair, mask: pairMask, weights: starting.attention,
       batch: length, queryLength: length, channels: cZ, heads: starting.heads,
       pairBiasProjection: starting.pairBias.projectionWeight, epsilon,
       storagePrecision: call.triangleAttentionPrecision ?? "f16",
       ...(call.triangleAttentionParts ?? {}),
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
   // 5. Triangle attention, ending node: the other pair axis.
   {
     const ending = w.triangleAttentionEnding;
+    if (ending.attention.qkvg !== undefined) {
+      const next = attentionBlock(execution, {
+        activations: pair, mask: pairMask, weights: ending.attention,
+        batch: length, queryLength: length, channels: cZ, heads: ending.heads,
+        transpose: true, transposeRows: true, epsilon,
+        storagePrecision: call.triangleAttentionPrecision ?? "f16",
+        ...(call.triangleAttentionParts ?? {}),
+        residualOf: pair,
+      });
+      if (ownPair) execution.release(pair);
+      pair = next;
+    } else {
     const transposed = transposeLeading(execution, {
       x: pair, outer: length, inner: length, channels: cZ,
     });
@@ -343,17 +389,20 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
     });
     execution.release(updateT);
     pair = residual(pair, update, ownPair);
+    }
     ownPair = true;
   }
 
   // 6. Pair transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: pair, weights: w.pairTransition,
       rows: pairs, channels: cZ, hiddenChannels: pairHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
   }
   return pair;
 }
@@ -388,11 +437,14 @@ export function extraMsaBlock(execution, call) {
   // 0. The outer product mean first, on the multimer graph; see the note in
   //    `evoformerBlock`. `encodeExtraMsaBlock` takes the same flag.
   if (call.outerProductMeanFirst === true) {
-    const update = outerProductMean(execution, {
+    const next = outerProductMean(execution, {
       activations: msa, mask: msaMask, weights: w.outerProductMean,
       sequences, length, cM, cOuter: call.cOuter, cZ: call.cZ, layerNormEpsilon: epsilon,
+      twoDrawDepth: AF2_OPM_TWO_DRAW_DEPTH,
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -402,13 +454,15 @@ export function extraMsaBlock(execution, call) {
     const bias = projectPairBias(execution, {
       pair, weights: row.pairBias, length, pairChannels: call.cZ, heads: row.heads, epsilon,
     });
-    const update = attentionBlock(execution, {
+    const next = attentionBlock(execution, {
       activations: msa, mask: msaMask, weights: row.attention,
       batch: sequences, queryLength: length, channels: cM, heads: row.heads,
       pairBias: bias, epsilon, storagePrecision: call.msaAttentionPrecision ?? "f16",
+      residualOf: msa,
     });
     execution.release(bias);
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
     ownMsa = true;
   }
 
@@ -425,12 +479,14 @@ export function extraMsaBlock(execution, call) {
 
   // 3. MSA transition.
   {
-    const update = transition(execution, {
+    const next = transition(execution, {
       activations: msa, weights: w.msaTransition,
       rows: sequences * length, channels: cM, hiddenChannels: msaHidden, epsilon,
       hiddenPrecision: call.transitionPrecision,
+      residualOf: msa,
     });
-    msa = residual(msa, update, ownMsa);
+    if (ownMsa) execution.release(msa);
+    msa = next;
   }
 
   pair = pairHalf(
@@ -466,11 +522,15 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
     }
     return out;
   };
-  const attention = (source, label) => ({
-    heads: source.heads,
-    attention: group(ATTENTION_NAMES, source.attention, `${label}.attention`),
-    pairBias: group(["projectionWeight"], source.pairBias, `${label}.pairBias`),
-  });
+  const attention = (source, label) => {
+    const { attention: uploaded, pairBiasFused } = uploadAttentionGroup(execution, source.attention,
+      `${label}.attention`, source.heads, source.pairBias.projectionWeight);
+    return {
+      heads: source.heads,
+      attention: uploaded,
+      pairBias: pairBiasFused ? {} : group(["projectionWeight"], source.pairBias, `${label}.pairBias`),
+    };
+  };
   for (const name of TEMPLATE_BLOCK_GROUPS) {
     if (weights[name] === undefined) throw new Error(`template block weights: ${name} is missing`);
   }
@@ -479,10 +539,10 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
       weights.triangleAttentionStarting, "template.tri-att-start"),
     triangleAttentionEnding: attention(
       weights.triangleAttentionEnding, "template.tri-att-end"),
-    triangleMultiplicationOutgoing: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationOutgoing, "template.tri-out"),
-    triangleMultiplicationIncoming: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationIncoming, "template.tri-in"),
+    triangleMultiplicationOutgoing: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationOutgoing, "template.tri-out"),
+    triangleMultiplicationIncoming: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationIncoming, "template.tri-in"),
     pairTransition: group(TRANSITION_NAMES, weights.pairTransition, "template.pair-transition"),
   };
 }
@@ -541,19 +601,36 @@ export function templatePairBlock(execution, call) {
   //    normalised pair, exactly as in the main stack.
   {
     const starting = w.triangleAttentionStarting;
-    pair = residual(pair, attentionBlock(execution, {
+    const next = attentionBlock(execution, {
       activations: pair, mask: pairMask, weights: starting.attention,
       batch: length, queryLength: length, channels: cZ, heads: starting.heads,
       pairBiasProjection: starting.pairBias.projectionWeight, epsilon,
       storagePrecision: call.triangleAttentionPrecision ?? "f16",
       ...(call.triangleAttentionParts ?? {}),
-    }));
+      residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    own = true;
+    pair = next;
   }
 
   // 2. Triangle attention, ending node: the other pair axis, so transpose in
   //    and transpose the update back.
   {
     const ending = w.triangleAttentionEnding;
+    if (ending.attention.qkvg !== undefined) {
+      const next = attentionBlock(execution, {
+        activations: pair, mask: pairMask, weights: ending.attention,
+        batch: length, queryLength: length, channels: cZ, heads: ending.heads,
+        transpose: true, transposeRows: true, epsilon,
+        storagePrecision: call.triangleAttentionPrecision ?? "f16",
+        ...(call.triangleAttentionParts ?? {}),
+        residualOf: pair,
+      });
+      if (own) execution.release(pair);
+      own = true;
+      pair = next;
+    } else {
     const transposed = transposeLeading(execution, {
       x: pair, outer: length, inner: length, channels: cZ,
     });
@@ -570,6 +647,7 @@ export function templatePairBlock(execution, call) {
     });
     execution.release(updateT);
     pair = residual(pair, update);
+    }
   }
   };
 
@@ -580,12 +658,16 @@ export function templatePairBlock(execution, call) {
     ["incoming", w.triangleMultiplicationIncoming],
   ];
   for (const [direction, group] of directions) {
-    pair = residual(pair, triangleMultiplication(execution, {
+    const next = triangleMultiplication(execution, {
       z: pair, mask: pairMask, weights: group,
       shape: { length, cZ, cHidden: triangleHidden },
       direction, epsilon,
       projectionPrecision: call.trianglePrecision ?? "f32",
-    }));
+      residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    own = true;
+    pair = next;
   }
   };
 
@@ -605,11 +687,15 @@ export function templatePairBlock(execution, call) {
   }
 
   // The pair transition, last in both orders.
-  pair = residual(pair, transition(execution, {
-    activations: pair, weights: w.pairTransition,
-    rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
-    hiddenPrecision: call.transitionPrecision,
-  }));
+  {
+    const next = transition(execution, {
+      activations: pair, weights: w.pairTransition,
+      rows: length * length, channels: cZ, hiddenChannels: pairHidden, epsilon,
+      hiddenPrecision: call.transitionPrecision, residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    pair = next;
+  }
   pair.label = "template.pair";
   return pair;
 }

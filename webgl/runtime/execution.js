@@ -366,6 +366,8 @@ export class Execution {
      * kernels/outer-product-mean.js): the two-draw form through `intermediate[s][i][cr][z]`, as before.
      */
     this.noOpmOuterFirst = options.noOpmOuterFirst ?? false;
+    /** The control arm for the two-draw outer product mean at a shallow alignment (`twoDrawDepth`). */
+    this.noOpmShallow = options.noOpmShallow ?? false;
     this.noGridFusedProjection = options.noGridFusedProjection ?? false;
     this.noKeepPlanes = options.noKeepPlanes ?? false;
     this.noHeadMajorAttention = options.noHeadMajorAttention ?? false;
@@ -389,6 +391,16 @@ export class Execution {
     this.noLaggedPause = options.noLaggedPause ?? false;
     /** The control arm for the triangle's operands written straight into the contraction's layout (`operandsLaidOutSource`). */
     this.noTriangleFusedLayout = options.noTriangleFusedLayout ?? false;
+    /**
+     * The control arm for AF2's triangle multiplication on AF3's pair-blocked contraction - one fused input
+     * projection, the operands written into its planes, the residual in the output projection's epilogue
+     * (`webgl/kernels/triangle-multiplication.js`) - against the nine-draw form. Read at weight UPLOAD.
+     */
+    this.noAf2TriangleBlock = options.noAf2TriangleBlock ?? false;
+    /** The control arm for AF2's operand planes laid a whole number of texture rows apart (`alignedPlaneStride`). */
+    this.noAlignedPlanes = options.noAlignedPlanes ?? false;
+    /** The control arm for AF2's attention projections fused into one (`uploadAttentionGroup`). Read at UPLOAD. */
+    this.noAf2AttentionFused = options.noAf2AttentionFused ?? false;
     /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this

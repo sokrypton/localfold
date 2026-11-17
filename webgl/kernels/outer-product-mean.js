@@ -50,7 +50,7 @@
 import { PRELUDE, ONE_TARGET, sized, memoSource } from "../runtime/execution.js";
 import { layerNorm } from "./layer-norm.js";
 import { linear } from "./linear.js";
-import { maskRows } from "../runtime/elementwise.js";
+import { add, maskRows } from "../runtime/elementwise.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -94,8 +94,9 @@ void main() {
  *                  + outputBias[z]) / (epsilon + sum_s mask[s][i] * mask[s][j])`
  */
 const opmContractSourceUncached = (
-  sequences, length, cOuter, cZ, biasAfterNorm = false,
+  sequences, length, cOuter, cZ, biasAfterNorm = false, withResidual = false,
 ) => sized({ L: length }, `${PRELUDE}${ONE_TARGET}
+${withResidual ? "uniform sampler2D residualTex;" : ""}
 const int SEQUENCES = ${sequences};
 const int C_OUTER = ${cOuter};
 const int CZ4 = ${cZ / 4};
@@ -130,6 +131,7 @@ void main() {
 ${biasAfterNorm
     ? "  result = sum / max(count, 1.0) + fetch4(biasTex, z4);"
     : "  result = (sum + fetch4(biasTex, z4)) / (normalizationEpsilon + count);"}
+${withResidual ? "  result += fetch4(residualTex, texel);" : ""}
 }`);
 
 /**
@@ -289,8 +291,9 @@ export function releaseOuterProductMeanWeights(execution, weights) {
  * @param {{activations: Tensor, mask: Tensor, weights: Record<string, Tensor>,
  *   sequences: number, length: number, cM: number, cOuter: number, cZ: number,
  *   layerNormEpsilon?: number, normalizationEpsilon?: number,
- *   variance?: "two-pass" | "fast", biasAfterNorm?: boolean}} call
- * @returns {Tensor} `length^2 x cZ`; the caller owns it
+ *   variance?: "two-pass" | "fast", biasAfterNorm?: boolean, twoDrawDepth?: number,
+ *   residualOf?: Tensor}} call
+ * @returns {Tensor} `length^2 x cZ` - `residualOf + update` where that is given; the caller owns it
  */
 export function outerProductMean(execution, call) {
   const {
@@ -338,11 +341,22 @@ export function outerProductMean(execution, call) {
   const left = side(w.leftWeight, w.leftBias, "left");
   const right = side(w.rightWeight, w.rightBias, "right");
   execution.release(normalised);
-  if (!execution.noOpmOuterFirst) {
+  // 🔴 AND NOT AT A SHALLOW ALIGNMENT, WHERE THE TWO-DRAW FORM IS AN ORDER OF MAGNITUDE CHEAPER: its cost is linear in
+  // the depth and the sequences-first form's is mostly fixed (an `L^2 x cOuter^2` permute and a K = 1024 projection
+  // whatever the depth). A 195-residue AF2 pass at depth 1 profiled 0.5 s of OPM two-draw against 4.6 s outer-first.
+  // `twoDrawDepth` is the caller's (AF2's block passes `AF2_OPM_TWO_DRAW_DEPTH`; AF3 passes none and is unchanged);
+  // `--no-opm-shallow` is the control arm.
+  const shallow = sequences <= (call.twoDrawDepth ?? 0) && !execution.noOpmShallow;
+  if (!execution.noOpmOuterFirst && !shallow) {
     const output = outerProductFirst(execution, { left, right, mask, w, sequences, length, cOuter, cZ,
       normalizationEpsilon, biasAfterNorm });
     execution.release(left);
     execution.release(right);
+    if (call.residualOf !== undefined) {
+      const summed = add(execution, call.residualOf, output);
+      execution.release(output);
+      return summed;
+    }
     return output;
   }
 
@@ -357,10 +371,12 @@ export function outerProductMean(execution, call) {
 
   const output = execution.allocate(length * length * cZ, "opm.output");
   execution.dispatch({
-    source: opmContractSource(sequences, length, cOuter, cZ, biasAfterNorm),
+    // ...and the caller's residual added in the same draw (`residualOf`)
+    source: opmContractSource(sequences, length, cOuter, cZ, biasAfterNorm, call.residualOf !== undefined),
     output,
     inputs: {
       intermediateTex: intermediate, rightTex: right, maskTex: mask, biasTex: w.outputBias,
+      ...(call.residualOf === undefined ? {} : { residualTex: call.residualOf }),
     },
     // 🔴 NOT PASSED IN boltz2's FORM, BECAUSE THE SHADER NO LONGER READS IT.
     // That variant clamps the count rather than nudging it, so the compiler

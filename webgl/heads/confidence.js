@@ -124,15 +124,18 @@ export function releaseConfidenceWeights(execution, weights) {
  * @param {{structure: Tensor, pair: Tensor, length: number, structureChannels: number,
  *   pairChannels: number, weights: {lddt: Record<string, Tensor>, pae: Record<string, Tensor>},
  *   hiddenChannels: number, lddtBins: number, breaks: ArrayLike<number>,
- *   epsilon?: number}} call
+ *   epsilon?: number, keepPaeLogits?: boolean}} call
+ *   `keepPaeLogits` reads the PAE logits back as well (`paeLogits`): a COMPLEX's chain-level scores take AlphaFold 3's
+ *   interface term, whose d0 comes from each pair's own chains, so the one global `tmTerm` cannot give them
+ *   (webgpu/heads/confidence.js `tmScoresFromTerm`). Off by default - it is length^2 x 64 floats read back.
  * @returns {{plddt: Float32Array, meanPlddt: number,
  *   predictedAlignedError: Float32Array, tmTerm: Float32Array,
- *   maxPredictedAlignedError: number}}
+ *   maxPredictedAlignedError: number, paeLogits?: Float32Array}}
  */
 export function confidenceHeads(execution, call) {
   const {
     structure, pair, length, structureChannels, pairChannels, weights: w,
-    hiddenChannels, lddtBins, breaks, epsilon = 1e-5,
+    hiddenChannels, lddtBins, breaks, epsilon = 1e-5, keepPaeLogits = false,
   } = call;
   const pairs = length * length;
   const paeBins = breaks.length + 1;
@@ -197,6 +200,7 @@ export function confidenceHeads(execution, call) {
   const predictedAlignedError = expectation(paeLogits, pairs, paeBins, centres, "pae");
   const tmTerm = expectation(
     paeLogits, pairs, paeBins, tmPerBinFor(centres, tmScoreD0(length)), "tm-term");
+  const paeLogitValues = keepPaeLogits ? Float32Array.from(execution.read(paeLogits)) : undefined;
   execution.release(paeLogits);
 
   let total = 0;
@@ -207,6 +211,7 @@ export function confidenceHeads(execution, call) {
     predictedAlignedError,
     tmTerm,
     maxPredictedAlignedError: centres[paeBins - 1],
+    ...(paeLogitValues === undefined ? {} : { paeLogits: paeLogitValues }),
   };
 }
 

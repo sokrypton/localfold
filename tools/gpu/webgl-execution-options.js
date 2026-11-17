@@ -264,6 +264,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     // `--skip=<regex>`: no draws for those labels - the family's draw time, where `--double` reads free (Execution.skipLabels)
     skipLabels: pattern("skip"),
     noOpmOuterFirst: flag(args, "no-opm-outer-first"),
+    noOpmShallow: flag(args, "no-opm-shallow"),
     noGridFusedProjection: flag(args, "no-grid-fused-projection"),
     noKeepPlanes: flag(args, "no-keep-planes"),
     noHeadMajorAttention: flag(args, "no-head-major-attention"),
@@ -285,6 +286,9 @@ export function webglExecutionOptions(args, defaults = {}) {
     noTriangleFusedProjection: flag(args, "no-triangle-fused-projection"),
     noRepackResidual: flag(args, "no-repack-residual"),
     noTriangleFusedLayout: flag(args, "no-triangle-fused-layout"),
+    noAf2TriangleBlock: flag(args, "no-af2-triangle-block"),
+    noAlignedPlanes: flag(args, "no-aligned-planes"),
+    noAf2AttentionFused: flag(args, "no-af2-attention-fused"),
     skipDraws: flag(args, "skip-draws"),
     noTriangleTranspose: flag(args, "no-triangle-transpose"),
     noTriangleSplit: flag(args, "no-triangle-split"),

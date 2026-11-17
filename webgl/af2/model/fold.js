@@ -240,7 +240,7 @@ export function releaseAf2Weights(execution, weights) {
  *   paeBreaks: ArrayLike<number>,
  *   template?: Parameters<typeof templateFeatures>[0]["template"],
  *   useTemplateUnitVector?: boolean, templates?: number,
- *   tolerance?: number, pairHost?: boolean, contactMap?: boolean,
+ *   tolerance?: number, pairHost?: boolean, contactMap?: boolean, keepPaeLogits?: boolean,
  *   shape?: Partial<typeof AF2_SHAPE>,
  *   onRecycle?: (result: object, recycle: number) => void,
  *   onBlock?: (stack: "extra" | "main", block: number, blocks: number) => void,
@@ -440,7 +440,7 @@ export async function foldAf2(execution, call) {
       sequences: features.extraSequences, length,
       cM: extraMsaChannels, cZ: pairChannels,
       cOuter: w.extraStack[0].outerProductMean.leftBias.elements,
-      triangleHidden: w.extraStack[0].triangleMultiplicationOutgoing.linearAPBias.elements,
+      triangleHidden: w.extraStack[0].triangleMultiplicationOutgoing.layerNormOutWeight.elements,
       msaHidden: w.extraStack[0].msaTransition.firstBias.elements,
       pairHidden: w.extraStack[0].pairTransition.firstBias.elements,
       blockWeights: w.extraStack,
@@ -457,7 +457,7 @@ export async function foldAf2(execution, call) {
       sequences: features.msaSequences, length,
       cM: msaChannels, cZ: pairChannels,
       cOuter: w.mainStack[0].outerProductMean.leftBias.elements,
-      triangleHidden: w.mainStack[0].triangleMultiplicationOutgoing.linearAPBias.elements,
+      triangleHidden: w.mainStack[0].triangleMultiplicationOutgoing.layerNormOutWeight.elements,
       msaHidden: w.mainStack[0].msaTransition.firstBias.elements,
       pairHidden: w.mainStack[0].pairTransition.firstBias.elements,
       blockWeights: w.mainStack,
@@ -492,6 +492,7 @@ export async function foldAf2(execution, call) {
       hiddenChannels: w.confidence.lddt.act0Bias.elements,
       lddtBins: w.confidence.lddt.logitsBias.elements,
       breaks: paeBreaks,
+      keepPaeLogits: call.keepPaeLogits === true,
     });
 
     let contactProbs;

@@ -37,7 +37,7 @@ import { createDeterministicTriangleInput } from "../../webgpu/testing/determini
 import { Execution } from "../../webgl/runtime/execution.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import {
-  releaseTriangleWeights, triangleMultiplication, uploadTriangleWeights,
+  releaseTriangleWeights, triangleMultiplication, uploadTriangleGroup, uploadTriangleWeights,
 } from "../../webgl/kernels/triangle-multiplication.js";
 import { relativeRms } from "./relative-rms.js";
 
@@ -67,6 +67,10 @@ export async function main(device, args) {
     { length: 12, cZ: 64, cHidden: 32 },
     { length: 16, cZ: 128, cHidden: 128 },
     { length: 24, cZ: 32, cHidden: 64 },
+    // an odd length, which the blocked form pads to eight and must strip again
+    { length: 13, cZ: 64, cHidden: 32 },
+    // a plane past one texture row (104 x 104 padded), which the blocked form lays a whole number of rows apart
+    { length: 99, cZ: 32, cHidden: 16 },
   ];
 
   for (const shape of shapes) {
@@ -80,31 +84,39 @@ export async function main(device, args) {
       ? Float32Array.from(input.z, (v, i) => (i === (input.z.length >> 1) ? v * 1.01 + 0.01 : v))
       : input.z;
 
-    const weights = uploadTriangleWeights(execution, input.weights);
     const zTensor = execution.upload(z, "z");
     const maskTensor = execution.upload(input.mask, "mask");
+    // 🔴 BOTH FORMS: the nine draws (`uploadTriangleWeights`) and the one the Evoformer runs - the four input
+    // projections fused, the operands laid into AF3's pair-blocked contraction, and the residual in the output
+    // projection's epilogue (`uploadTriangleGroup`, `residualOf`). The residual arm subtracts z back out on the host.
+    for (const form of ["nine-draw", "blocked"]) {
+      const weights = form === "blocked"
+        ? uploadTriangleGroup(execution, input.weights, "check")
+        : uploadTriangleWeights(execution, input.weights);
+      if (form === "blocked" && weights.projectionGate === undefined) throw new Error("the blocked form was not taken");
+      const ours = {};
+      for (const direction of ["outgoing", "incoming"]) {
+        const output = triangleMultiplication(execution, {
+          z: zTensor, mask: maskTensor, weights, shape, direction, epsilon: input.epsilon ?? 1e-5,
+          ...(form === "blocked" ? { residualOf: zTensor } : {}),
+        });
+        const values = execution.read(output).slice();
+        ours[direction] = form === "blocked" ? values.map((v, i) => v - z[i]) : values;
+        execution.release(output);
+      }
 
-    const ours = {};
-    for (const direction of ["outgoing", "incoming"]) {
-      const output = triangleMultiplication(execution, {
-        z: zTensor, mask: maskTensor, weights, shape, direction, epsilon: input.epsilon ?? 1e-5,
-      });
-      ours[direction] = execution.read(output).slice();
-      execution.release(output);
+      arm(`${form} outgoing vs CPU reference ${label}`,
+        ours.outgoing, triangleMultiplicationOutgoingReference(input));
+
+      for (const [direction, Kernel] of [
+        ["outgoing", TriangleMultiplicationOutgoingGpu],
+        ["incoming", TriangleMultiplicationIncomingGpu],
+      ]) {
+        const wgsl = await new Kernel(device).run(input);
+        arm(`${form} ${direction} vs WGSL ${label}`, ours[direction], wgsl);
+      }
+      releaseTriangleWeights(execution, weights);
     }
-
-    arm(`outgoing vs CPU reference ${label}`,
-      ours.outgoing, triangleMultiplicationOutgoingReference(input));
-
-    for (const [direction, Kernel] of [
-      ["outgoing", TriangleMultiplicationOutgoingGpu],
-      ["incoming", TriangleMultiplicationIncomingGpu],
-    ]) {
-      const wgsl = await new Kernel(device).run(input);
-      arm(`${direction} vs WGSL ${label}`, ours[direction], wgsl);
-    }
-
-    releaseTriangleWeights(execution, weights);
     execution.release(zTensor);
     execution.release(maskTensor);
   }

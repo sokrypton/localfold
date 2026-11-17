@@ -10,8 +10,12 @@ operating systems that the WebGPU path refuses outright.
 in web/model.js, `WEBGL2_FAMILIES` in shared/bundles/manifests/index.js, measured through
 `tools/fold-in-page.py --no-webgpu` (AlphaFold 3 pLDDT 68.0 in 11 s against WebGPU's 68.2 in 1 s).
 The four fused-template bundles and opendde are refused by name before the download; see
-webgl/index.js. **AlphaFold 2 folds here - both graphs - and the PAGE still does not select it**,
-because web/ has no AF2 entry point that takes a backend.
+webgl/index.js. **AlphaFold 2 folds here - both graphs - and the PAGE selects it too** (2026-11-17,
+web/af2-webgl2.js: the WebGL2 fold behind the WebGPU drivers' `predictA3m`, its pTM, ipTM and chain scores reduced by
+the same `tmScoresFromTerm`). Through `tools/fold-in-page.py --no-webgpu --remote-weights` on an M2, one recycle,
+single sequence: the monomer pLDDT 64.2 / pTM 0.338 in 4.3 s against WebGPU's 64.2 / 0.337 in 0.9 s; the multimer
+(two chains of 6MRR) 65.5 / 0.514 / ipTM 0.462 in 5.8 s against 65.5 / 0.514 / 0.461 in 1.9 s; "All 5" in 20.4 s. It
+cannot continue a fold's recycles (no `resumable`), so a raised recycle count refolds from pass zero.
 
 🔴 **ALPHAFOLD 2 FOLDS HERE NOW - BOTH GRAPHS.** 59 residues from
 `model-af2-monomer-int5`, 4 extra-MSA blocks and 48 Evoformer blocks, the template stack, eight
@@ -3836,3 +3840,111 @@ and 42 agree to 0.008-0.14 A, so it is one seed at a bifurcation, WebGL2 at 76.5
 in a 66.7 basin. Not run: a 255- or 400-token fold through BOTH backends in one page - two models' weights and two
 folds in one browser took this 16 GB M2 down twice (IntelliFold-2 + RNA at 109 tokens already reaches 30% free). The
 pair transition past 362 tokens is back on the path measured whole above.
+
+## 🔴 2026-11-17: AF2's Evoformer on AF3's kernels
+
+The page folds AlphaFold 2 in WebGL2 now, and it was ~7x off WebGPU on the multimer and ~4.5x on the monomer because
+AF2's Evoformer still ran this tree's FIRST kernels while AF3's trunk had been taken through every section above.
+Measured on an M2 at 195 residues (1BRS A+D, 108+87) and 200 (the first 200 of 5CAJ chain A), one pass, single
+sequence, `tools/gpu/fold-af2-webgl.js --no-reference`, arms interleaved, two rounds each.
+
+🔴 **THE DEFAULT-CONFIGURATION MULTIMER GATE IS RED BEFORE ANY OF THIS, AND THAT IS NOT THIS WORK.** `fold-af2-webgl.js
+--family=multimer --chains=30,29` reads worst atom **0.2627 A** against a measured floor of 0.0132 at the commit this
+started from, reproducibly: `model-multimer` is int5 now, and float16 weights and x (`halfWeights`, `halfActivations`)
+against a WGSL fold run in f32 are a real 0.26 A on that graph. With `--no-half-weights --no-half-x` it is **0.0004 A
+against 0.0006**, the figure the top of this file quotes. Every multimer row below is given in both configurations.
+
+**The triangle multiplication on the shared pair-blocked contraction.** `triangle.contract` was 25% of the profile -
+the one-pair-a-fragment kernel this file's AF2 section began with, ~90 ms a call at 195 residues. AF3's `contractInto`
+(the wide 4 i x 8 j x 1 channel block, tile-mapped) moved to `webgl/kernels/triangle-contract.js` - AF3, ESMFold2 and
+bioemu2 import it from there through `webgl/af3/trunk/triangle.js`'s re-export, bit-identical - and AF2 runs it from
+five draws where it ran nine: the four input projections FUSED at upload into one `[4H][cZ]` out-major weight with its
+bias (`uploadTriangleGroup`; float32 whatever `halfWeights` says, since the four parts sit under the float16 floor and
+their concatenation sits on it), its row planes read by one operand draw (`linear`'s `keepPlanes`) that applies AF2's
+BLOCKED split `[aP | aG | bP | bG]`, the gates and the mask and writes both operands channel-major into the padded
+(incoming: transposed) planes the contraction reads, AF2's own LayerNorm on the result, and the output projection with
+its gate and the caller's residual in `linear`'s epilogue. `--no-af2-triangle-block` is the control arm.
+
+| | nine draws | shared contraction | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 26.23 / 25.91 s | **18.34 / 18.94 s** | **1.40x** |
+| monomer, 200 residues | 28.20 / 30.03 s | **20.07 / 20.26 s** | **1.44x** |
+
+Gates: the monomer's worst atom against WGSL **0.0347 A** (was 0.0679) at pLDDT 57.938; the multimer **0.001 A against
+a floor of 0.0015** at `--no-half-weights --no-half-x` (was 0.0004 / 0.0006) and 0.2611 at the default (was 0.2627);
+`check-webgl-triangle.js` holds both forms, at five shapes including an odd length, to the CPU reference and the WGSL
+kernels at ~4e-7 (30 arms, all red under `--falsify`); AF3's `fold-af3-webgl.js` pLDDT 66.379 either side.
+
+🔴 **AND THE OPERAND DRAW IT INTRODUCED WAS THEN THE LARGEST TRIANGLE KERNEL, BY LOCALITY.** Profiled after that
+commit, `triangle.operands` was 4950 ms of the profile against the contraction's 1072 - 27 ms a call outgoing and 51
+incoming, for what is a relayout. An output texel is four consecutive j of ONE channel, read from pair-major texels
+that each hold four channels, and with planes `L_P * L_P` floats apart a rasterisation tile spans ~6 channels at
+UNRELATED pairs - so each source texel served one of its four channels per tile. Laying the planes a whole number of
+texture rows apart (`alignedPlaneStride`: 40,000 floats to 40,960 at 195 residues, +2.4%) puts channel c + 1's (i, j)
+directly below channel c's, so one tile covers the same pairs in neighbouring channels and a source texel serves all
+four. The contraction takes the stride as a constant (`planeStride`, defaulting to `L_P * L_P`, so AF3's source text is
+unchanged). Profiled, `triangle.operands` 4950 -> 1513 ms. Bit-identical; `--no-aligned-planes` is the control arm.
+
+| | shared contraction | aligned planes | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 17.75 / 17.71 s | **14.89 / 14.91 s** | **1.19x** |
+| monomer, 200 residues | 19.18 / 18.77 s | **16.43 / 15.84 s** | **1.17x** |
+
+Every gate reads exactly its previous figure (monomer 0.0347 A, multimer 0.001 / 0.0015 at f32 and 0.2611 at default,
+AF3 66.379); `check-webgl-triangle.js` gains a 99-residue shape whose planes are past one texture row (36 arms).
+
+**The attentions' four projections as one, and the ending node's transposes gone.** AF3's grid attention runs q, k,
+v and the gate as one projection (`fuseGridProjections`); AF2's attention block now does too (`uploadAttentionGroup`
+in `webgl/kernels/attention-block.js`): one in-major `[C][4C]` weight - AF2's four are in-major already, so it is a
+concatenation - with a triangle attention's `[C][heads]` bias projection appended, one blocked projection with kept
+planes, a four-target split that applies the gate's logistic and the block's float16 rounding, and the bias read out
+of the same planes head-major. The column attentions (MSA column, triangle ending node) no longer transpose their input
+and their update: the split gathers rows in transposed order and the residual reads the update back transposed
+(`transposedResidualSource`), and every attention's residual rides in its output projection: 5,315 draws to 4,481 on the
+59-residue gate. The fused weight is float32 unless its parts
+were float16, since `halfWeights` decides by size. `--no-af2-attention-fused` is the control arm.
+
+| | aligned planes | and fused attention | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 14.89 / 14.91 s | **14.69 / 14.77 s** | **1.01x** |
+| monomer, 200 residues | 16.43 / 15.84 s | **15.82 / 15.60 s** | **1.03x** |
+
+Small, and taken because every round of it is ahead and it removes four transposes a block. Not bit-identical (the
+fused projection blocks where the four did not): monomer worst atom 0.0347 -> **0.042 A** against a floor of 0.0578,
+pLDDT 57.937; multimer f32 0.001 -> **0.0015 A** against 0.0007 (bar 3x), default 0.2619. `check-webgl-evoformer-block`
+reads its pre-existing red `extra.pair` 4.451e-5 on both sides of this and at the commit this work started from.
+
+**The outer product mean's two-draw form back at a shallow alignment.** The sequences-first form (`outerProductFirst`,
+written for AF3's 1024-row alignments) costs ~75 ms a call at 195 residues almost whatever the depth - an `L^2 x
+cOuter^2` permute and a K = 1024 projection - where the two-draw form it replaced costs ~6 ms a SEQUENCE. At depth 1,
+which is a single-sequence fold and the page's "none", that profiled 4.6 s of OPM against 0.5. AF2's block now passes
+`twoDrawDepth: 8` (`AF2_OPM_TWO_DRAW_DEPTH`); AF3 passes none and is untouched. `--no-opm-shallow` is the control arm.
+A deep alignment is unchanged.
+
+| | sequences first | two draws at depth <= 8 | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 14.72 / 14.77 s | **12.03 / 12.25 s** | **1.21x** |
+| monomer, 200 residues | 15.60 / 15.63 s | **12.72 / 12.90 s** | **1.22x** |
+
+Monomer worst atom 0.0365 A against a floor of 0.0686 (pLDDT 57.937); multimer f32 0.0011 against 0.001, default 0.2614.
+
+**The remaining residuals into the draws beside them.** Both transitions' adds ride in the down projection
+(`transition`'s `residualOf`, the repack or the epilogue), the outer product mean's in its contraction's last line
+(two-draw form; the sequences-first form still adds), and the triangle's `pair + projected * gate` in the output
+projection's repack (`gateSlice` at the output's own stride) where it was a repack and a `residual-product` draw. 266
+fewer draws a 195-residue pass (4,356 to 4,090). Medians of four interleaved runs against the previous commit:
+multimer **12.33 -> 12.05 s (1.02x)**, monomer **12.73 -> 12.60 s (1.01x)** - inside the drift on a single pair, but
+every one of the eight multimer runs is consistent with it. Not bit-identical (an add fused into a multiply-add):
+monomer worst atom 0.0447 A against a floor of 0.0403 (bar 3x), pLDDT 57.938; multimer f32 0.0016 against 0.0009;
+`check-webgl-evoformer-block` now passes all four arms, its `extra.pair` included. AF3 66.379 unchanged (it passes no
+`residualOf` to these kernels).
+
+**End to end**, the commit this started from against this one, interleaved, two rounds: the 195-residue multimer
+**25.36 / 25.65 s -> 12.08 / 11.88 s (2.13x)** and the 200-residue monomer **27.17 / 27.11 s -> 12.71 / 13.56 s
+(2.07x)**. Through the page (`fold-in-page.py --no-webgpu --remote-weights --msa-mode none --recycles 1`): 1BRS
+**52.5 s -> 24.2 s** at the same pLDDT 38.4 / pTM 0.220 / ipTM 0.080, and 5CAJ chain A (261 residues) **111.3 s -> 49.2
+s** at the same pLDDT 31.5 / pTM 0.206. What is left, profiled at 195 residues: the dense projections 35% (the fused
+attention 128 -> 516 and triangle 128 -> 512 the largest, x-bound as "The dense projection is bound by x's fetch
+locality" says), the flash attention 12%, LayerNorm at 128 channels 11% (the statistics split is a measured loss at
+this width), the q/k/v/g split 6% and the triangle operands 6% - its incoming direction a third slower than its
+outgoing one, from the transposed read.

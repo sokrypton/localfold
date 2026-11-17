@@ -215,8 +215,9 @@ let backendPromise;
  * WebGPU...") rather than inventing a second message about a backend the visitor also does not have.
  *
  * 🔴 AND IT IS NOT A FALLBACK FOR EVERY MODEL. `webgl/` holds af2, af3, bioemu2, esmc and esmfold2,
- * but the only one wired into the PAGE is the AlphaFold 3 lineage (web/af3-model.js's
- * `backend: "webgl2"` -> foldBatchWebGl2); the others have no page entry point, so `fold` refuses
+ * but the ones wired into the PAGE are the AlphaFold 3 lineage (web/af3-model.js's
+ * `backend: "webgl2"` -> foldBatchWebGl2) and AlphaFold 2 (web/af2-webgl2.js, both graphs); the
+ * others have no page entry point, so `fold` refuses
  * them by name here rather than folding something else or hanging. Wiring one is a change in
  * web/app.js and a measurement against WebGPU, not a flag.
  *
