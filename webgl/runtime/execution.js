@@ -390,6 +390,12 @@ export class Execution {
     /** The control arm for the triangle's operands written straight into the contraction's layout (`operandsLaidOutSource`). */
     this.noTriangleFusedLayout = options.noTriangleFusedLayout ?? false;
     /**
+     * The control arm for AF2's triangle multiplication on AF3's pair-blocked contraction - one fused input
+     * projection, the operands written into its planes, the residual in the output projection's epilogue
+     * (`webgl/kernels/triangle-multiplication.js`) - against the nine-draw form. Read at weight UPLOAD.
+     */
+    this.noAf2TriangleBlock = options.noAf2TriangleBlock ?? false;
+    /**
      * The control arm for the transposed incoming contraction
      * (`webgl/kernels/triangle-contract.js`): read the column directly, as this
      * backend did before. Bit-identical, so this prices a LAYOUT and nothing

@@ -47,7 +47,7 @@ import { attentionBlock } from "../../kernels/attention-block.js";
 import { outerProductMean } from "../../kernels/outer-product-mean.js";
 import { pairBias as projectPairBias } from "../../kernels/pair-bias.js";
 import { transition } from "../../kernels/transition.js";
-import { triangleMultiplication } from "../../kernels/triangle-multiplication.js";
+import { triangleMultiplication, uploadTriangleGroup } from "../../kernels/triangle-multiplication.js";
 import { add } from "../../runtime/elementwise.js";
 import { globalAttention } from "../../kernels/global-attention.js";
 import { transposeLeading } from "../../runtime/transpose.js";
@@ -76,14 +76,6 @@ const OPM_NAMES = [
   "layerNormScale", "layerNormOffset", "leftWeight", "leftBias",
   "rightWeight", "rightBias", "outputWeight", "outputBias",
 ];
-const TRIANGLE_NAMES = [
-  "layerNormInWeight", "layerNormInBias",
-  "linearAPWeight", "linearAPBias", "linearAGWeight", "linearAGBias",
-  "linearBPWeight", "linearBPBias", "linearBGWeight", "linearBGBias",
-  "layerNormOutWeight", "layerNormOutBias",
-  "linearZWeight", "linearZBias", "linearGWeight", "linearGBias",
-];
-
 /**
  * Upload a block's weights once, in the structure `webgpu/af2/evoformer` uses:
  * `{heads, attention: {...}, pairBias: {...}}` for an attention, a flat group
@@ -129,10 +121,10 @@ export function uploadEvoformerBlockWeights(execution, weights) {
     ...column,
     msaTransition: group(TRANSITION_NAMES, weights.msaTransition, "msa-transition"),
     outerProductMean: group(OPM_NAMES, weights.outerProductMean, "opm"),
-    triangleMultiplicationOutgoing: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationOutgoing, "tri-out"),
-    triangleMultiplicationIncoming: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationIncoming, "tri-in"),
+    triangleMultiplicationOutgoing: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationOutgoing, "tri-out"),
+    triangleMultiplicationIncoming: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationIncoming, "tri-in"),
     triangleAttentionStarting: attention(
       weights.triangleAttentionStarting, "tri-att-start", ["projectionWeight"]),
     triangleAttentionEnding: attention(
@@ -299,13 +291,16 @@ function pairHalf(execution, call, msa, pairIn, ownPairIn, residual) {
     ["incoming", w.triangleMultiplicationIncoming],
   ];
   for (const [direction, group] of multiplications) {
-    const update = triangleMultiplication(execution, {
+    // ...the residual in the output projection's own epilogue (`residualOf`), where it was a multiply and an add
+    const next = triangleMultiplication(execution, {
       z: pair, mask: pairMask, weights: group,
       shape: { length, cZ, cHidden: triangleHidden },
       direction, epsilon,
       projectionPrecision: call.trianglePrecision ?? "f32",
+      residualOf: pair,
     });
-    pair = residual(pair, update, ownPair);
+    if (ownPair) execution.release(pair);
+    pair = next;
     ownPair = true;
   }
 
@@ -479,10 +474,10 @@ export function uploadTemplatePairBlockWeights(execution, weights) {
       weights.triangleAttentionStarting, "template.tri-att-start"),
     triangleAttentionEnding: attention(
       weights.triangleAttentionEnding, "template.tri-att-end"),
-    triangleMultiplicationOutgoing: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationOutgoing, "template.tri-out"),
-    triangleMultiplicationIncoming: group(
-      TRIANGLE_NAMES, weights.triangleMultiplicationIncoming, "template.tri-in"),
+    triangleMultiplicationOutgoing: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationOutgoing, "template.tri-out"),
+    triangleMultiplicationIncoming: uploadTriangleGroup(
+      execution, weights.triangleMultiplicationIncoming, "template.tri-in"),
     pairTransition: group(TRANSITION_NAMES, weights.pairTransition, "template.pair-transition"),
   };
 }
@@ -580,12 +575,16 @@ export function templatePairBlock(execution, call) {
     ["incoming", w.triangleMultiplicationIncoming],
   ];
   for (const [direction, group] of directions) {
-    pair = residual(pair, triangleMultiplication(execution, {
+    const next = triangleMultiplication(execution, {
       z: pair, mask: pairMask, weights: group,
       shape: { length, cZ, cHidden: triangleHidden },
       direction, epsilon,
       projectionPrecision: call.trianglePrecision ?? "f32",
-    }));
+      residualOf: pair,
+    });
+    if (own) execution.release(pair);
+    own = true;
+    pair = next;
   }
   };
 

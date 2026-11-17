@@ -3840,3 +3840,37 @@ and 42 agree to 0.008-0.14 A, so it is one seed at a bifurcation, WebGL2 at 76.5
 in a 66.7 basin. Not run: a 255- or 400-token fold through BOTH backends in one page - two models' weights and two
 folds in one browser took this 16 GB M2 down twice (IntelliFold-2 + RNA at 109 tokens already reaches 30% free). The
 pair transition past 362 tokens is back on the path measured whole above.
+
+## 🔴 2026-11-17: AF2's Evoformer on AF3's kernels
+
+The page folds AlphaFold 2 in WebGL2 now, and it was ~7x off WebGPU on the multimer and ~4.5x on the monomer because
+AF2's Evoformer still ran this tree's FIRST kernels while AF3's trunk had been taken through every section above.
+Measured on an M2 at 195 residues (1BRS A+D, 108+87) and 200 (the first 200 of 5CAJ chain A), one pass, single
+sequence, `tools/gpu/fold-af2-webgl.js --no-reference`, arms interleaved, two rounds each.
+
+🔴 **THE DEFAULT-CONFIGURATION MULTIMER GATE IS RED BEFORE ANY OF THIS, AND THAT IS NOT THIS WORK.** `fold-af2-webgl.js
+--family=multimer --chains=30,29` reads worst atom **0.2627 A** against a measured floor of 0.0132 at the commit this
+started from, reproducibly: `model-multimer` is int5 now, and float16 weights and x (`halfWeights`, `halfActivations`)
+against a WGSL fold run in f32 are a real 0.26 A on that graph. With `--no-half-weights --no-half-x` it is **0.0004 A
+against 0.0006**, the figure the top of this file quotes. Every multimer row below is given in both configurations.
+
+**The triangle multiplication on the shared pair-blocked contraction.** `triangle.contract` was 25% of the profile -
+the one-pair-a-fragment kernel this file's AF2 section began with, ~90 ms a call at 195 residues. AF3's `contractInto`
+(the wide 4 i x 8 j x 1 channel block, tile-mapped) moved to `webgl/kernels/triangle-contract.js` - AF3, ESMFold2 and
+bioemu2 import it from there through `webgl/af3/trunk/triangle.js`'s re-export, bit-identical - and AF2 runs it from
+five draws where it ran nine: the four input projections FUSED at upload into one `[4H][cZ]` out-major weight with its
+bias (`uploadTriangleGroup`; float32 whatever `halfWeights` says, since the four parts sit under the float16 floor and
+their concatenation sits on it), its row planes read by one operand draw (`linear`'s `keepPlanes`) that applies AF2's
+BLOCKED split `[aP | aG | bP | bG]`, the gates and the mask and writes both operands channel-major into the padded
+(incoming: transposed) planes the contraction reads, AF2's own LayerNorm on the result, and the output projection with
+its gate and the caller's residual in `linear`'s epilogue. `--no-af2-triangle-block` is the control arm.
+
+| | nine draws | shared contraction | |
+|---|---:|---:|---:|
+| multimer, 195 residues | 26.23 / 25.91 s | **18.34 / 18.94 s** | **1.40x** |
+| monomer, 200 residues | 28.20 / 30.03 s | **20.07 / 20.26 s** | **1.44x** |
+
+Gates: the monomer's worst atom against WGSL **0.0347 A** (was 0.0679) at pLDDT 57.938; the multimer **0.001 A against
+a floor of 0.0015** at `--no-half-weights --no-half-x` (was 0.0004 / 0.0006) and 0.2611 at the default (was 0.2627);
+`check-webgl-triangle.js` holds both forms, at five shapes including an odd length, to the CPU reference and the WGSL
+kernels at ~4e-7 (30 arms, all red under `--falsify`); AF3's `fold-af3-webgl.js` pLDDT 66.379 either side.
