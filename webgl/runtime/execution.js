@@ -520,6 +520,17 @@ export class Execution {
      * which is four times the texelFetch for the same numbers.
      */
     this.noAttendDot4 = options.noAttendDot4 ?? false;
+    /** bioemu2's denoiser conditioning its atom stream at every atom row - see `bioemu2DenoiseSteps`. */
+    this.noTokenRowCond = options.noTokenRowCond ?? false;
+    /** bioemu2's adaLN and gated residuals taking slices drawn first - see `conditionedLayer`. */
+    this.noCondFuse = options.noCondFuse ?? false;
+    /** bioemu2's attentions reading sliced q, k, v and a gate tensor - see `fusedAttention`. */
+    this.noAttendFuse = options.noAttendFuse ?? false;
+    /** bioemu2's fold uploading a SwiGLU's fc1 and fc2 apart - see `transitionNoNorm`. */
+    this.noWeightStack = options.noWeightStack ?? false;
+    this.noSwigluStack = options.noSwigluStack ?? false;
+    this.qkvgStack = options.qkvgStack ?? false;
+
     /**
      * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every
      * kernel its own program, as this backend did before it had any. A link costs ~40 ms on this
@@ -698,6 +709,7 @@ export class Execution {
   uploadWeight(values, label) { return this.storage.uploadWeight(values, label); }
   /** An int5 weight left as codes, or null if this one cannot be. */
   uploadInt5Weight(source, label) { return this.storage.uploadInt5Weight(source, label); }
+  uploadInt5Weights(sources, label) { return this.storage.uploadInt5Weights(sources, label); }
   allocateHalf(elements, label) { return this.storage.allocateHalf(elements, label); }
 
   upload(values, label) { return this.storage.upload(values, label); }

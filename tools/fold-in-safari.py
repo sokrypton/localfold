@@ -25,6 +25,9 @@ p.add_argument("--repeat", type=int, default=1)
 p.add_argument("--recycles", default="1", help="the recycle row (the page's own default is 3)")
 p.add_argument("--remote-weights", action="store_true",
                help="the registry's published bundles rather than this checkout's exports (as fold-in-page.py's)")
+p.add_argument("--bioemu2-samples", default=None, help="BioEmu2's sample count (the page's default is 1)")
+p.add_argument("--stop-after", type=float, default=0,
+               help="press Stop (the Fold button again) this many seconds into each fold, to check what a stop keeps")
 p.add_argument("--delay", type=float, default=0, help="seconds to wait after the page is ready, as a reader typing would")
 p.add_argument("--sequence", default="GWSTELEKHREELKEFLKKEGITLGFTNAEKQEQAQKLGLGKKVSPELLIKAFAILKK")
 a = p.parse_args()
@@ -80,26 +83,33 @@ try:
       const set = (id, v) => { const el = document.getElementById(id); if (!el) return;
         el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); };
       set('model-family', arguments[1]); set('recycles', arguments[4]); set('msa-mode', arguments[2]);
+      if (arguments[5] !== null) set('bioemu2-samples', arguments[5]);
       set('af3-count', arguments[3]);
       try { localStorage.setItem('localfold.modelTerms.alphafold3', 'accepted'); } catch (e) {}
-    """, a.sequence, a.model, a.msa, a.steps, a.recycles)
+    """, a.sequence, a.model, a.msa, a.steps, a.recycles, a.bioemu2_samples)
     time.sleep(0.5)
     print("controls:", json.dumps(js("""const v = id => (document.getElementById(id)||{}).value;
-        return {model: v('model-family'), msa: v('msa-mode'), steps: v('af3-count')};""")))
+        return {model: v('model-family'), msa: v('msa-mode'), steps: v('af3-count'),
+                recycles: v('recycles'), samples: v('bioemu2-samples')};""")))
     js("window.__statusLog = []; const el = document.getElementById('status-message');"
        "new MutationObserver(() => { const t = el.textContent; const l = window.__statusLog;"
        " if (!l.length || l[l.length-1][1] !== t) l.push([Math.round(performance.now() - (window.__t0 ?? 0)), t]); })"
        ".observe(el, {childList: true, subtree: true, characterData: true});")
     for fold in range(a.repeat):
         js("window.__statusLog.length = 0; window.__t0 = performance.now(); document.getElementById('predict').click();")
-        t0, last = time.time(), ""
+        t0, last, pressed = time.time(), "", False
         while time.time() - t0 < a.timeout:
+            if a.stop_after > 0 and not pressed and time.time() - t0 > a.stop_after:
+                js("document.getElementById('predict').click();")
+                pressed = True
+                print(f"   stop pressed at {round((time.time() - t0) * 1000)} ms")
             st = js("""const s = document.getElementById('status-message');
                 return {text: s ? s.textContent : '', error: !!(s && s.classList.contains('error')),
                         downloads: (document.getElementById('downloads')||{style:{}}).style.display};""")
             last = st["text"]
-            if st["error"] or (st["downloads"] != "none" and any(w in last for w in ("pLDDT", "Done"))
-                               and time.time() - t0 > 2):
+            # (a BioEmu2 fold has no pLDDT: its finished line ends "... · <n> steps · ... · <seconds>s")
+            finished = any(w in last for w in ("pLDDT", "Done")) or re.search(r" steps · .*[0-9]s\b", last)
+            if st["error"] or (st["downloads"] != "none" and finished and time.time() - t0 > 2):
                 break
             time.sleep(0.5)
         log = js("return window.__statusLog.slice();")
@@ -115,6 +125,10 @@ try:
         steps = [(at, m.group(1)) for at, text in log for m in [re.search(r"Folding[^0-9]*([0-9]+)%", text)] if m]
         if steps:
             print("   progress:", " ".join(f"{p}%@{at}" for at, p in steps))
+        # ...and a BioEmu2 fold's, which says its trunk and its sampler step rather than a percentage
+        steps = [(at, m.group(1)) for at, text in log for m in [re.search(r"sampling(?: batch [^·]*·[^·]*·)? (?:step )?([0-9]+/[0-9]+)", text)] if m]
+        if steps:
+            print("   sampler:", " ".join(f"{p}@{at}" for at, p in steps))
 finally:
     if sid:
         try: call("DELETE", f"/session/{sid}")

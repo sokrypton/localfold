@@ -690,9 +690,15 @@ function decodedInt5(execution, weight, shape) {
  * producer can write x laid out that way itself (float16 where `execution.halfActivations` is set) and hand it over
  * as `xStride4`, saving the pad pass.
  */
-export function linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout = "out-major" }) {
+export function linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout = "out-major", weight }) {
+  // `weight`, where the caller has it: an int5 weight takes the blocked path below 64 rows too (see `linear`), so
+  // without it this answers 0 for a shape `linear` will pad all the same
+  const int5 = /** @type {any} */ (weight)?.int5 === true;
   if (execution.noLinearBlock || inChannels % 4 !== 0
-    || !blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)) return 0;
+    || !(blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
+      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)))) {
+    return 0;
+  }
   const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
   const narrowX = execution.halfActivations && execution.narrowAlignedX && !padX;
   return padX || narrowX ? strideFor(inChannels / 4) : 0;
@@ -708,7 +714,7 @@ export function linear(execution, call, into) {
   // batched tensor at `row * stride4 + at4 + group` - AdaLN-zero's gate, in the projection's own last draw
   // `xStride4`: x arrives ALREADY laid at that row stride (`linearPaddedStride4`), so the pad pass is skipped
   if (givenStride4 > 0) {
-    if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout })) {
+    if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout, weight })) {
       throw new RangeError(`linear: x laid at stride ${givenStride4 * 4}, which this projection would not pad to`);
     }
     if (call.x.elements !== rows * givenStride4 * 4) {
@@ -762,13 +768,20 @@ export function linear(execution, call, into) {
   /** @type {any} */
   let weightTensor = weight;
   const codeWeight = /** @type {Int5Weight} */ (weight);
-  if (int5 && (weightLayout !== "out-major" || inChannels % INT5_GROUP !== 0)) {
+  const blocked = !execution.noLinearBlock
+    && (blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
+      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)));
+  // 🔴 AN int5 WEIGHT BLOCKS BELOW 64 ROWS TOO, AND IS DECODED ONLY WHERE EVEN THAT DECLINES - because the codes have
+  // no other kernel. This threw ("an int5 weight only has the blocked path"), which no fold here reached until BioEmu2
+  // folded a chain under 64 residues on the page: its token stream projects 58 rows, and `blockedApplies` sends an
+  // [out][in] shape below 64 rows to the one-texel kernel. 58 residues, 20 steps, Chrome on an M2: decoded to f16 and
+  // one-texel, 27.9 s at a 1332 MiB peak; blocked from the codes, **15.6 s at 680 MiB**, the contacts and CA-CA the
+  // same (138, 3.86). Every shape that folded before takes the path it took: only a shape that threw is moved.
+  if (int5 && (weightLayout !== "out-major" || inChannels % INT5_GROUP !== 0 || !blocked)) {
     weightTensor = decodedInt5(execution, codeWeight, `${rows}x${inChannels}x${outChannels}`);
     int5 = false;
   }
-  if (!execution.noLinearBlock
-    && blockedApplies(rows, inChannels, outChannels, weightLayout,
-      !execution.noLinearAspect)) {
+  if (blocked) {
     const blockRows = blockRowsFor(execution, rows);
     const rowQuads = Math.ceil(rows / blockRows);
     // Row block fastest only where it is measured: the int5 path, whose codes

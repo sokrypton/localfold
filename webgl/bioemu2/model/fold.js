@@ -33,7 +33,9 @@
 import { BIOEMU2, BIOEMU2_SAMPLER } from "../../../shared/bioemu2/weights.js";
 import { trunkBlockWeights } from "../../../shared/esmfold2/weights.js";
 import { normalFrom } from "../../../shared/af3/random.js";
-import { bioemu2Schedule, sampleMany, centre } from "../../../cpu/bioemu2/sampler.js";
+import { bioemu2Schedule, bioemu2Batches, BIOEMU2_MAX_BATCH, sampleMany, centre }
+  from "../../../cpu/bioemu2/sampler.js";
+import { drain, drainAsync } from "../../runtime/steps.js";
 import { uploadTriangleWeights, releaseTriangleWeights }
   from "../../af3/trunk/triangle.js";
 import { uploadTransitionWeights, releaseTransitionWeights }
@@ -41,9 +43,9 @@ import { uploadTransitionWeights, releaseTransitionWeights }
 import { distogramLogits } from "../../esmfold2/distogram.js";
 import { inputEmbedder } from "../embedder.js";
 import { sequenceEmbedder } from "../sequence.js";
-import { trunkPass } from "../trunk.js";
+import { trunkPassSteps } from "../trunk.js";
 import { staticContext } from "../context.js";
-import { bioemu2Denoise } from "../denoiser.js";
+import { bioemu2DenoiseSteps, bioemu2DenoiserPrepare } from "../denoiser.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -104,6 +106,27 @@ function group(execution, read) {
       held.push(tensor);
       return tensor;
     },
+    /**
+     * Out-major weights of one input width as ONE weight, their outputs side by side (`Storage.uploadInt5Weights`;
+     * the float forms concatenated on the host where the codes are not int5).
+     */
+    stack: async (names, label) => {
+      const codes = execution.uploadInt5Weights(await Promise.all(names.map((name) => read.source(name))), label);
+      if (codes !== null) {
+        held.push(codes);
+        return codes;
+      }
+      const parts = await Promise.all(names.map((name) => read(name)));
+      const all = new Float32Array(parts.reduce((total, part) => total + part.length, 0));
+      let at = 0;
+      for (const part of parts) {
+        all.set(part, at);
+        at += part.length;
+      }
+      const tensor = execution.uploadWeight(all, label);
+      held.push(tensor);
+      return tensor;
+    },
     /** A map of {key: name} uploaded under its keys. */
     tree: async function tree(names, label) {
       const out = {};
@@ -125,19 +148,52 @@ function group(execution, read) {
 }
 
 /**
+ * 🔴 ON THE PAGE IT LETS GO OF THE THREAD, AND A STOP KEEPS WHAT FINISHED. With `pause` the trunk yields after
+ * every pair block and the denoiser after every layer (`trunkPassSteps`, `bioemu2DenoiseSteps`), each yield awaiting
+ * `pause` - the page's `laggedPause`, one slice behind the GPU - and `signal` is checked at every one. Without it the
+ * same generators are drained straight through, which is what every tool and gate does. The samples are grouped into
+ * the WGSL fold's batches (`bioemu2Batches`) and `onSamples(frames, first)` hands each over as it lands; a stop (an
+ * AbortError from the signal or from a callback) once a batch has landed returns those with `stopped: true`, as
+ * webgpu/bioemu2/fold.js does. Whatever the fold had allocated when it threw is released before the error goes on,
+ * so a stopped fold leaves the context as it found it.
+ *
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {any} read a bundle reader, with its `.source(name)` for the codes a bundle reader
  * @param {any} features `shared/bioemu2/featurise.js`'s
  * @param {{steps?: number, samples?: number, seed?: number, passes?: number,
  *   mode?: "structure" | "equilibrium", stepScale?: number, epsilon?: number,
- *   mixerBlocks?: number, onStage?: (name: string, detail?: any) => void,
- *   onStep?: (step: number, steps: number) => void}} [options]
+ *   mixerBlocks?: number, batch?: number, onStage?: (name: string, detail?: any) => void,
+ *   onTrunk?: (done: number, total: number) => void,
+ *   onContacts?: (contact: Float32Array) => void,
+ *   onSamples?: (frames: Float32Array[], first: number) => void | Promise<void>,
+ *   pause?: (yielded: any) => Promise<void>, signal?: AbortSignal,
+ *   onStep?: (done: number, total: number, denoised: Float32Array) => void | Promise<void>}} [options]
+ *   `onStep` counts sampler steps over every batch (`total` is steps x batches) and hands the step's denoised
+ *   estimate of the whole batch, `size x atoms x 3`, sample-major - as webgpu/bioemu2/fold.js's progress does.
  * @returns {Promise<{samples: Float32Array[], contact: Float32Array,
  *   distogram: Float32Array, tokens: number, atoms: number, calls: number,
  *   stages: [string, number][], mode: string, stepScale: number,
- *   peakMiB: number}>}
+ *   peakMiB: number, stopped: boolean, batches: number, batchSize: number}>}
  */
 export async function foldBioemu2OnWebGl2(execution, read, features, options = {}) {
+  // every tensor this fold leaves behind if it throws is one not live now (the uploader groups release theirs on the
+  // way through, but a throw mid-stage would strand a stage's weights and activations in a context the page keeps)...
+  const before = new Set(execution.storage.live);
+  // ...and so does a stop part-way through a walk, which returns the batches before it: the walk's own denoiser call
+  // was abandoned inside its generator with its temporaries live. A fold that ran to the end has released everything
+  // already, so this finds nothing.
+  try {
+    return await foldSteps(execution, read, features, options);
+  } finally {
+    for (const tensor of [...execution.storage.live]) {
+      if (!before.has(tensor)) execution.release(tensor);
+    }
+  }
+}
+
+async function foldSteps(execution, read, features, options) {
+  const run = (steps) => (options.pause === undefined ? drain(steps)
+    : drainAsync(steps, options.pause, options.signal));
   const f = features;
   const tokens = f.res_type.length;
   const atoms = f.atom_pad_mask.length;
@@ -307,12 +363,14 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
       single: execution.zeros(tokens * BIOEMU2.single, "bioemu2.s-prev"),
     };
     const passes = options.passes ?? BIOEMU2.trunkPasses;
+    const perPass = msaBlocks.length + mixerBlocks.length;
     for (let pass = 0; pass < passes; pass += 1) {
-      const out = trunkPass(execution, {
+      const out = await run(trunkPassSteps(execution, {
         zInit, sInit, m0: embedded.m0, zPrev: previous.pair, sPrev: previous.single,
         pairMask, tokens, sequences, valid: embedded.valid, weights,
         msaBlocks, mixerBlocks, epsilon,
-      });
+        onBlock: (index) => options.onTrunk?.(pass * perPass + index + 1, passes * perPass),
+      }));
       execution.release(previous.pair);
       execution.release(previous.single);
       previous = out;
@@ -370,6 +428,7 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
     }
     return { logits: values, contact: near };
   });
+  options.onContacts?.(contact);
 
   // --- the denoiser's static context --------------------------------------
   const contextWeights = group(execution, read);
@@ -425,17 +484,34 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   const weights = await clock("denoiser-weights", async () => {
     const P = "structure_module";
     const sc = `${P}/single_conditioner`;
+    // a SwiGLU's fc1 and fc2 as ONE projection (`fc12`; transitionNoNorm), or apart under `--no-weight-stack`
+    const swiglu = async (prefix, label) => (execution.noWeightStack || execution.noSwigluStack
+      ? denoiser.tree({ fc1: `${prefix}/fc1/weight`, fc2: `${prefix}/fc2/weight`, fc3: `${prefix}/fc3/weight` }, label)
+      : {
+        fc12: await denoiser.stack([`${prefix}/fc1/weight`, `${prefix}/fc2/weight`], `${label}.fc12`),
+        fc3: await denoiser.up(`${prefix}/fc3/weight`, `${label}.fc3`),
+      });
+    // an attention's [proj_qkv; proj_g] as ONE projection (`projQkvg`; the denoiser's fused attention) - OFF unless
+    // asked (`--qkvg-stack`), which is a measurement: ten sampler steps at 68 tokens on an M2, Chrome 4.64/4.58 s
+    // stacked against 4.64/4.61 apart, and Safari 16.3 6.47/6.34 stacked against 6.07/6.02 apart (the SwiGLU stack
+    // beside it is Chrome's 1.10x and within a percent in Safari, so it stays on)
+    const stackAttention = execution.qkvgStack && !execution.noWeightStack && !execution.noAttendFuse && !execution.noAttendDot4;
+    const attentionTree = async (attn, label) => {
+      const names = attentionNames(attn);
+      if (!stackAttention) return denoiser.tree(names, label);
+      const { projQkv, projG, ...rest } = names;
+      return {
+        ...(await denoiser.tree(rest, label)),
+        projQkvg: await denoiser.stack([projQkv, projG], `${label}.projQkvg`),
+      };
+    };
     const streamTree = async (base, attn, layer) => ({
       cond0Scale: await denoiser.up(`${base}/cond_0/weight`, `dn.${layer}.cond0`),
       cond0Offset: await denoiser.up(`${base}/cond_0/bias`, `dn.${layer}.cond0b`),
       cond2Weight: await denoiser.up(`${base}/cond_2/weight`, `dn.${layer}.cond2`),
       cond2Bias: await denoiser.up(`${base}/cond_2/bias`, `dn.${layer}.cond2b`),
-      attention: await denoiser.tree(attentionNames(attn), `dn.${layer}.attn`),
-      transition: await denoiser.tree({
-        fc1: `${base}/transition/fc1/weight`,
-        fc2: `${base}/transition/fc2/weight`,
-        fc3: `${base}/transition/fc3/weight`,
-      }, `dn.${layer}.transition`),
+      attention: await attentionTree(attn, `dn.${layer}.attn`),
+      transition: await swiglu(`${base}/transition`, `dn.${layer}.transition`),
     });
     const singleConditioner = {
       ...(await denoiser.tree({
@@ -450,13 +526,13 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
       transitions: [],
     };
     for (let index = 0; index < 2; index += 1) {
-      singleConditioner.transitions.push(await denoiser.tree({
-        normScale: `${sc}/transitions_${index}/norm/weight`,
-        normOffset: `${sc}/transitions_${index}/norm/bias`,
-        fc1: `${sc}/transitions_${index}/fc1/weight`,
-        fc2: `${sc}/transitions_${index}/fc2/weight`,
-        fc3: `${sc}/transitions_${index}/fc3/weight`,
-      }, `dn.single.transition${index}`));
+      singleConditioner.transitions.push({
+        ...(await denoiser.tree({
+          normScale: `${sc}/transitions_${index}/norm/weight`,
+          normOffset: `${sc}/transitions_${index}/norm/bias`,
+        }, `dn.single.transition${index}`)),
+        ...(await swiglu(`${sc}/transitions_${index}`, `dn.single.transition${index}`)),
+      });
     }
     const atomBlocks = [];
     const tokenBlocks = [];
@@ -481,16 +557,8 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
           cond2Weight: `${L}/coupling/s_coupling_cond_2/weight`,
           cond2Bias: `${L}/coupling/s_coupling_cond_2/bias`,
         }, `dn.${layer}.scond`),
-        sToQ: await denoiser.tree({
-          fc1: `${L}/coupling/s_to_q_mixer/fc1/weight`,
-          fc2: `${L}/coupling/s_to_q_mixer/fc2/weight`,
-          fc3: `${L}/coupling/s_to_q_mixer/fc3/weight`,
-        }, `dn.${layer}.stoq`),
-        qToS: await denoiser.tree({
-          fc1: `${L}/coupling/q_to_s_mixer/fc1/weight`,
-          fc2: `${L}/coupling/q_to_s_mixer/fc2/weight`,
-          fc3: `${L}/coupling/q_to_s_mixer/fc3/weight`,
-        }, `dn.${layer}.qtos`),
+        sToQ: await swiglu(`${L}/coupling/s_to_q_mixer`, `dn.${layer}.stoq`),
+        qToS: await swiglu(`${L}/coupling/q_to_s_mixer`, `dn.${layer}.qtos`),
       });
     }
     return {
@@ -546,13 +614,22 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
     sigmaData: BIOEMU2.sigmaData,
   };
   let calls = 0;
+  // what every denoiser call reads and no sampler step changes, made once for the walks of one batch size
+  const preparedBy = new Map();
+  const preparedFor = (samples) => {
+    if (!preparedBy.has(samples)) {
+      preparedBy.set(samples, bioemu2DenoiserPrepare(execution, {
+        features: deviceFeatures, context, sInputs, sTrunk, weights, dims, samples, epsilon }));
+    }
+    return preparedBy.get(samples);
+  };
   const denoise = async (stacked, sigma) => {
     calls += 1;
     const x = execution.upload(Float32Array.from(stacked), "bioemu2.x");
-    const out = bioemu2Denoise(execution, {
+    const out = await run(bioemu2DenoiseSteps(execution, {
       x, sigma, features: deviceFeatures, context, sInputs, sTrunk,
-      weights, dims, hostFourier, epsilon,
-    });
+      weights, dims, hostFourier, epsilon, prepared: preparedFor(stacked.length / (atoms * 3)),
+    }));
     const values = Float32Array.from(execution.read(out));
     execution.release(out);
     execution.release(x);
@@ -565,23 +642,46 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   const normal = normalFrom(options.seed ?? 1);
   const mask = Int32Array.from(f.atom_mask);
   const samples = [];
+  const wanted = options.samples ?? 1;
+  // the WGSL fold's batches: `size` samples walk together through ONE denoiser call a step, as webgpu/bioemu2/fold.js
+  // runs them, and a page is handed each batch as it lands
+  const { batches, size } = bioemu2Batches(wanted, options.batch ?? BIOEMU2_MAX_BATCH);
+  const total = (schedule.length - 1) * batches;
+  let done = 0;
+  let stopped = false;
   await clock("sample", async () => {
-    for (let index = 0; index < (options.samples ?? 1); index += 1) {
-      // 🔴 ONE SAMPLE A CALL. The WGSL denoiser compiles for a batch of S and
-      // runs them sample-major in one call; this one takes a single frame, so an
-      // ensemble is S walks of the same compiled programs - the same arithmetic,
-      // S times the draws, in the same order, because `sampleMany` consumes the
-      // generator step by step either way.
-      const walked = await sampleMany({
-        denoise, setCompanion: () => {}, mask, N: atoms, S: 1, schedule,
-        stepScale, normal, companions: null,
-        onStep: (step, total) => options.onStep?.(step, total),
-      });
-      samples.push(centre(walked[0], mask, atoms));
-      options.onStage?.("sample", index + 1);
+    for (let batch = 0; batch < batches && !stopped; batch += 1) {
+      let landed;
+      try {
+        // 🔴 A BATCH IS ONE WALK OF `size` SAMPLES, NOT `size` WALKS IN TURN. The denoiser stacks them sample-major
+        // (`bioemu2DenoiseSteps`), so a step is one call's draws over `size` times the rows where it was `size`
+        // calls - the draws are what a WebGL2 step costs. `sampleMany` draws its noise sample by sample within a
+        // step, which is the WGSL fold's order; `batch: 1` is the control arm, the walks in turn as they were.
+        const walked = await sampleMany({
+          denoise, setCompanion: () => {}, mask, N: atoms, S: size, schedule,
+          stepScale, normal, companions: null,
+          onStep: (step, steps, denoised) => {
+            done += 1;
+            return options.onStep?.(done, total, denoised);
+          },
+        });
+        landed = walked.map((x) => centre(x, mask, atoms));
+      } catch (error) {
+        // a stop part-way through a batch keeps the batches that landed before it, and only those
+        if (error?.name !== "AbortError" || samples.length === 0) throw error;
+        stopped = true;
+        break;
+      }
+      // the last batch may carry samples nobody asked for (bioemu2Batches); they are dropped here
+      landed = landed.slice(0, wanted - samples.length);
+      const first = samples.length;
+      samples.push(...landed);
+      options.onStage?.("sample", samples.length);
+      await options.onSamples?.(landed, first);
     }
   });
 
+  for (const prepared of preparedBy.values()) prepared.release();
   denoiser.release();
   for (const tensor of Object.values(deviceFeatures)) execution.release(tensor);
   execution.release(sInputs);
@@ -592,5 +692,6 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   return {
     samples, contact, distogram: logits, tokens, atoms, calls, stages, mode,
     stepScale, peakMiB: Math.round(execution.stats().peakBytes / 1048576),
+    stopped, batches, batchSize: size,
   };
 }

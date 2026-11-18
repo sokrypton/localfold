@@ -23,7 +23,8 @@
  */
 import { AlphaFoldMonomerGpu } from "../webgpu/af2/model/monomer.js";
 import { AlphaFoldUnifiedGpu } from "../webgpu/af2/multimer/model.js";
-import { AlphaFoldWebGl2 } from "./af2-webgl2.js";
+import { AlphaFoldWebGl2, releaseAf2WebGl2 } from "./af2-webgl2.js";
+import { foldBioemu2WebGl2 } from "./bioemu2-webgl2.js";
 import { blankChainColumns, foldsAsSingleSequence, parseA3m }
   from "../shared/input/a3m.js";
 import { mergeJobAlignments } from "../shared/input/chains.js";
@@ -40,7 +41,7 @@ import { isAbortError, throwIfAborted } from "../webgpu/runtime/abort.js";
 import { GpuMemoryBudgetError, setMemoryBudget }
   from "../webgpu/runtime/device-memory.js";
 import { AF3_COUNTS, af3SequenceProblem, alphaCarbons, fittedPdb, foldAf3,
-  loadAf3Weights, preloadWebGl2Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
+  loadAf3Weights, preloadWebGl2Weights, releaseWebGl2Weights, toPoints, warmAf3Pipelines } from "./af3-model.js";
 import { actualSteps, ESMFOLD2_COUNTS, ESMFOLD2_SAMPLER_MODE, esmfold2StepsFor, languageModelRunner,
   loadEsmfold2Weights } from "./esmfold2-model.js";
 import { SAMPLER_PRESETS, foldEsmfold2 } from "../webgpu/esmfold2/fold.js";
@@ -4114,7 +4115,7 @@ function showEnsembleScatter(renderer, ask) {
 }
 
 async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications,
-                                 constraints }) {
+                                 constraints, backend }) {
   const family = "bioemu2";
   const modelName = MODEL_LABELS[family];
   const started = performance.now();
@@ -4161,9 +4162,12 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
   throwIfAborted(signal);
   const loaded = await modelLoad;
   throwIfAborted(signal);
-  const device = await getDevice();
+  // 🔴 WITHOUT WebGPU THE WebGL2 FOLD (web/bioemu2-webgl2.js), called as foldBioemu2 is and taking no device; it
+  // refuses a propagation by name, as the gate above does before the download
+  const webgl2 = backend === "webgl2";
+  const device = webgl2 ? null : await getDevice();
   throwIfAborted(signal);
-  const network = bioemu2Network(device, loaded.read);
+  const network = webgl2 ? null : bioemu2Network(device, loaded.read);
 
   predictionCount += 1;
   const stem = foldStem(`${MODEL_STEMS[family]}_${predictionCount}`);
@@ -4261,8 +4265,8 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     return pca;
   };
   const { batches } = bioemu2Batches(samples, BIOEMU2_MAX_BATCH);
-  const result = await foldBioemu2(device, loaded.read, features, {
-    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1, onSamples,
+  const foldOptions = {
+    network, samples, steps, seed: randomSeed(), mode, propagation, passes: recycleCount() + 1, onSamples, signal,
     // the distogram's contact map exists before any structure does, and is shown as the trunk's is
     onContacts: (contact) => {
       if (signal.aborted) return;
@@ -4284,7 +4288,9 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
       progress(0.15 + 0.85 * done / total);
       if (denoised !== undefined && (done % every === 0 || done === total)) drawLive(denoised);
     },
-  });
+  };
+  const result = webgl2 ? await foldBioemu2WebGl2(loaded.read, features, foldOptions)
+    : await foldBioemu2(device, loaded.read, features, foldOptions);
   // 🔴 A STOP PART-WAY THROUGH AN ENSEMBLE KEEPS THE BATCHES THAT FINISHED (foldBioemu2's `stopped`)
   if (!result.stopped) throwIfAborted(signal);
   const contactMap = contactMapFor(result.contact, keep);
@@ -4364,6 +4370,7 @@ async function foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks,
     + (result.stopped ? " (stopped)" : "") + ` · ${steps} steps`
     // the alignment's rows as the trunk read them, as the other models' lines say - a Max MSA override shows here
     + (featurised.msaRows > 1 ? ` · ${featurised.msaRows} MSA rows` : " · single sequence") + ` · ${seconds}s`
+    + (webgl2 ? " · WebGL2" : "")
     + physicalityLine
     + (verdict.ok ? "" : " · NOT A CHAIN"));
   progress(null);
@@ -5016,9 +5023,9 @@ async function fold(event) {
                             templates: request.templates ?? [], family, signal });
       return;
     }
-    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2: THE AF3 LINEAGE (web/af3-model.js) AND ALPHAFOLD 2,
-    // BOTH GRAPHS AND EVERY MODEL (web/af2-webgl2.js). `webgl/` holds bioemu2, esmc and esmfold2 as
-    // well, but no page path takes a backend for them, so every other family is refused BY NAME - which is this page's rule at
+    // 🔴 WITHOUT WebGPU THE PAGE FOLDS IN WebGL2: THE AF3 LINEAGE (web/af3-model.js), ALPHAFOLD 2,
+    // BOTH GRAPHS AND EVERY MODEL (web/af2-webgl2.js), AND BioEmu2 (web/bioemu2-webgl2.js). `webgl/` holds esmc and
+    // esmfold2 as well, but no page path takes a backend for them, so every other family is refused BY NAME - which is this page's rule at
     // every other such seam (a template on a template-free model, a bond on a model that reads
     // none): a family that cannot run must say so, never fold something else and never hang.
     // The sentence names what does work, because "not supported" leaves the visitor nowhere.
@@ -5027,10 +5034,18 @@ async function fold(event) {
     // after the trunk, which webgl/ has not ported; refusing it HERE is what keeps a visitor from
     // downloading half a gigabyte of parameters before finding out.
     const af2Graph = graphOf(family) === "monomer" || graphOf(family) === "multimer";
-    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family) && !af2Graph) {
+    // ...and BioEmu2 (web/bioemu2-webgl2.js), its Structure and Equilibrium modes - not Propagate, whose companion
+    // frame the WebGL2 sampler does not carry; refused here too, before its 450 MB download
+    const bioemu2 = BIOEMU2_FAMILIES.includes(family);
+    if (backend === "webgl2" && !WEBGL2_FAMILIES.includes(family) && !af2Graph && !bioemu2) {
       throw new Error(`${MODEL_LABELS[family] ?? family} needs WebGPU, which this browser does not`
-        + ` have. ${["AlphaFold 2", ...WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one)].join(", ")}`
+        + ` have. ${["AlphaFold 2", ...WEBGL2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one),
+          ...BIOEMU2_FAMILIES.map((one) => MODEL_LABELS[one] ?? one)].join(", ")}`
         + " fold here in WebGL2 instead - slower, same structure.");
+    }
+    if (backend === "webgl2" && bioemu2 && document.getElementById("bioemu2-mode")?.value === "propagate") {
+      throw new Error("BioEmu2 propagation needs WebGPU, which this browser does not have - the WebGL2 sampler carries"
+        + " no starting frame. Structure and Equilibrium sample here in WebGL2.");
     }
     // 🔴 A DIFFERENT MODEL LETS THE LAST ONE'S GPU WEIGHTS GO. Residency is
     // kept between folds so the same model's next fold skips its packing, and
@@ -5040,6 +5055,14 @@ async function fold(event) {
     if (lastFoldedFamily !== undefined && lastFoldedFamily !== family && backend === "webgpu") {
       releaseAllWeights(await getDevice());
       releaseBioemu2(await getDevice());
+    }
+    // ...and on the WebGL2 path the two families that keep weights resident in their own contexts let them go
+    // (the AF3 lineage's ~800 MB, AlphaFold 2's), so a BioEmu2 fold after either does not run beside them; BioEmu2's
+    // own context holds nothing between folds (web/bioemu2-webgl2.js)
+    if (lastFoldedFamily !== undefined && lastFoldedFamily !== family && backend === "webgl2") {
+      // (within a lineage each driver replaces its own weights on the next upload)
+      if (!isAf3Family(family)) await releaseWebGl2Weights();
+      if (!af2Graph) releaseAf2WebGl2();
     }
     lastFoldedFamily = family;
     // ...and started, not awaited. The templates and the alignment below are
@@ -5305,7 +5328,7 @@ async function fold(event) {
     // differs is only how the A3M is encoded, which is af3MsaFromA3m's job.
     if (BIOEMU2_FAMILIES.includes(family)) {
       await foldWithBioemu2({ chains, chainKinds, alignment, alignmentBlocks, signal, modelLoad, modifications,
-                              constraints: request.constraints });
+                              constraints: request.constraints, backend });
       return;
     }
     if (SINGLE_SEQUENCE_FAMILIES.includes(family)) {

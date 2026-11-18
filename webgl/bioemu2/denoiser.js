@@ -39,8 +39,9 @@
  * this port be handed the same ones.
  */
 import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
+import { drain } from "../runtime/steps.js";
 import { layerNorm, layerNormStatsSource } from "../kernels/layer-norm.js";
-import { linear } from "../kernels/linear.js";
+import { linear, linearPaddedStride4 } from "../kernels/linear.js";
 
 /** @typedef {import("../runtime/storage.js").Tensor} Tensor */
 
@@ -58,6 +59,21 @@ export const WINDOW_QUERIES = 32;
 export const WINDOW_KEYS = 128;
 export const WINDOW_CONTEXT = (WINDOW_KEYS - WINDOW_QUERIES) / 2;
 
+/**
+ * The first line of a kernel that may write its rows at a padded stride: `texel` the LOGICAL texel of a
+ * `[rows][c4 texels]` tensor laid at `s4` texels a row, the padding written zero (0 or `c4`: the plain layout). This is
+ * how a producer hands a projection the x `linear` would otherwise re-lay itself (`linearPaddedStride4`,
+ * `linear`'s `xStride4`): the same values, stored once - and into float16 where the pad pass would have narrowed
+ * them, which is the same conversion on the same store.
+ */
+const stridedTexel = (c4, s4) => (s4 > 0 && s4 !== c4
+  ? `int raw = linearTexel();
+  int sRow = raw / ${s4};
+  int sK = raw - sRow * ${s4};
+  if (sK >= ${c4}) { result = vec4(0.0); return; }
+  int texel = sRow * ${c4} + sK;`
+  : "int texel = linearTexel();");
+
 /** `out = x * factor`, a scalar the host computed from sigma. */
 const scaleSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
@@ -70,8 +86,11 @@ void main() {
   result = fetch4(xTex, texel) * factor;
 }`;
 
-/** `out = a + b`. */
-const sumSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
+/**
+ * `out = a + b`, or with `periodA` (elements, a multiple of four) `out[i] = a[i % periodA] + b[i]`: one sample's
+ * `a` broadcast over a batch of samples stacked sample-major in `b` - the same add, element for element.
+ */
+const sumSourceUncached = (elements, periodA = elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
@@ -79,32 +98,87 @@ uniform sampler2D bTex;
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(aTex, texel) + fetch4(bTex, texel);
+  result = fetch4(aTex, ${periodA === elements ? "texel" : `texel % ${periodA / 4}`}) + fetch4(bTex, texel);
 }`;
 
-/** `out = a * b`, elementwise over equal shapes. */
-const productSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
+/** `out = a * b`, elementwise over equal shapes (rows of `c4` texels written at `s4`: `stridedTexel`). */
+const productSourceUncached = (elements, c4 = 0, s4 = 0) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D aTex;
 uniform sampler2D bTex;
 
 void main() {
-  int texel = linearTexel();
+  ${stridedTexel(c4, s4)}
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   result = fetch4(aTex, texel) * fetch4(bTex, texel);
 }`;
 
-/** `out = silu(x)`. */
-const siluSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
+/** `out = silu(x)` (and `stridedTexel`'s layout). */
+const siluSourceUncached = (elements, c4 = 0, s4 = 0) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
 uniform sampler2D xTex;
 
 void main() {
-  int texel = linearTexel();
+  ${stridedTexel(c4, s4)}
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
   vec4 x = fetch4(xTex, texel);
   result = x / (vec4(1.0) + exp(-x));
 }`;
+
+/**
+ * `out = silu(LN(x) * scale + offset)` with the row statistics READ (`layerNormStatsSource`'s, made once a step for
+ * the conditioning every layer normalises): `layerNorm`'s split apply and the silu draw's arithmetic, in one draw, at
+ * the conditioning GEMM's x layout (`stridedTexel`).
+ */
+const statsSiluSourceUncached = (rows, channels, s4) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+uniform sampler2D statsTex;
+uniform sampler2D weightTex;
+uniform sampler2D biasTex;
+
+void main() {
+  ${stridedTexel(channels / 4, s4)}
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int row = texel / C4;
+  int group = texel - row * C4;
+  vec2 stats = fetch4(statsTex, row).xy;
+  vec4 value = fetch4(xTex, texel);
+  vec4 w = fetch4(weightTex, group);
+  vec4 b = fetch4(biasTex, group);
+  vec4 normalised = (value - stats.x) * stats.y * w + b;
+  result = normalised / (vec4(1.0) + exp(-normalised));
+}`;
+
+/**
+ * silu(LN(conditioning)) for a conditioning GEMM, at its x layout: one draw over shared `stats` where there are
+ * some (and not under `--no-cond-fuse`), otherwise `layerNorm` and a silu draw.
+ */
+function conditioningInput(execution, { conditioning, stats, rows, channels, scale, offset, consumers, epsilon }) {
+  const s4 = sharedXStride4(execution, rows, channels, consumers);
+  const activated = allocateX(execution, rows, channels, s4, "bioemu2.cond-silu");
+  if (stats !== undefined && stats !== null && channels % 4 === 0 && !execution.noCondFuse) {
+    execution.dispatch({
+      source: statsSiluSource(rows, channels, s4),
+      output: activated,
+      inputs: { xTex: conditioning, statsTex: stats, weightTex: scale, biasTex: offset },
+      label: `bioemu2.cond-ln-silu:${rows}x${channels}`,
+    });
+    return activated;
+  }
+  const normalised = layerNorm(execution, {
+    x: conditioning, weight: scale, bias: offset, rows, channels, epsilon,
+  });
+  execution.dispatch({
+    source: siluSource(rows * channels, channels / 4, s4),
+    output: activated,
+    inputs: { xTex: normalised },
+    label: `bioemu2.cond-silu:${rows * channels}`,
+  });
+  execution.release(normalised);
+  return activated;
+}
 
 /** `out = sigmoid(x)`. */
 const sigmoidSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
@@ -131,6 +205,29 @@ void main() {
   int group = texel % W4;
   int row = texel / W4;
   result = fetch4(xTex, row * C4 + FROM4 + group);
+}`;
+
+/**
+ * `out[row][c] = index[row] < 0 ? 0 : x[index[row]][from + c]` - a channel range of a GATHERED row, so one
+ * conditioning projection made at the token rows serves every atom row (and every sample's rows) through a map,
+ * in the draw the plain slice took. The copy is exact.
+ */
+const gatherSliceSourceUncached = (rows, channels, from, width) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int W4 = ${width / 4};
+const int FROM4 = ${from / 4};
+const int ELEMENTS = ${rows * width};
+uniform sampler2D xTex;
+uniform sampler2D indexTex;
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % W4;
+  int row = texel / W4;
+  int from = int(fetch1(indexTex, row));
+  if (from < 0) { result = vec4(0.0); return; }
+  result = fetch4(xTex, from * C4 + FROM4 + group);
 }`;
 
 /**
@@ -246,8 +343,11 @@ void main() {
     base + 3 < ELEMENTS ? at(base + 3) : 0.0);
 }`);
 
-/** `out[row][c] = x[row][c] * mask[row]`, with the same ragged split. */
-const maskRowsSourceUncached = (rows, channels) => (channels % 4 === 0
+/**
+ * `out[row][c] = x[row][c] * mask[row % period]`, with the same ragged split - `period` the rows of ONE sample, so a
+ * batch stacked sample-major reads one sample's mask.
+ */
+const maskRowsSourceUncached = (rows, channels, period = rows) => (channels % 4 === 0
   ? `${PRELUDE}${ONE_TARGET}
 const int C4 = ${channels / 4};
 const int ELEMENTS = ${rows * channels};
@@ -257,7 +357,7 @@ uniform sampler2D maskTex;
 void main() {
   int texel = linearTexel();
   if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
-  result = fetch4(xTex, texel) * fetch1(maskTex, texel / C4);
+  result = fetch4(xTex, texel) * fetch1(maskTex, ${period === rows ? "texel / C4" : `(texel / C4) % ${period}`});
 }`
   : `${PRELUDE}${ONE_TARGET}
 const int CHANNELS = ${channels};
@@ -266,7 +366,7 @@ uniform sampler2D xTex;
 uniform sampler2D maskTex;
 
 float at(int element) {
-  return fetch1(xTex, element) * fetch1(maskTex, element / CHANNELS);
+  return fetch1(xTex, element) * fetch1(maskTex, ${period === rows ? "element / CHANNELS" : `(element / CHANNELS) % ${period}`});
 }
 
 void main() {
@@ -526,12 +626,12 @@ const headDot = (keyTex, wide) => wide
       dot += fetch1(qTex, qBase + d) * fetch1(${keyTex}, kBase + d);
     }`;
 
-const fullAttentionSourceUncached = (rows, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
+const fullAttentionSourceUncached = (rows, channels, heads, wide = true, samples = 1) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
 const int HEAD_DIM = ${channels / heads};
-const int ELEMENTS = ${rows * channels};
+const int ELEMENTS = ${samples * rows * channels};
 const float SCALE = ${(1 / Math.sqrt(channels / heads)).toFixed(10)};
 uniform sampler2D qTex;
 uniform sampler2D kTex;
@@ -542,15 +642,19 @@ uniform sampler2D padTex;
 void main() {
   int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
-  int i = base / CHANNELS;
-  int c = base - i * CHANNELS;
+  // A row of a batch attends within its own sample: AT is the row in the stack (q, k and v are sample-major),
+  // I the token inside its sample, which is what the shared bias and pad are indexed by.
+  int at = base / CHANNELS;
+  int c = base - at * CHANNELS;
+  int smp = at / ROWS;
+  int i = at - smp * ROWS;
   int head = c / HEAD_DIM;
-  int qBase = i * CHANNELS + head * HEAD_DIM;
+  int qBase = at * CHANNELS + head * HEAD_DIM;
 
   float largest = -1e30;
   for (int j = 0; j < ROWS; ++j) {
     if (fetch1(padTex, j) == 0.0) continue;
-    int kBase = j * CHANNELS + head * HEAD_DIM;
+    int kBase = (smp * ROWS + j) * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
 ${headDot("kTex", wide)}
     largest = max(largest, dot * SCALE + fetch1(biasTex, (i * ROWS + j) * HEADS + head));
@@ -559,7 +663,7 @@ ${headDot("kTex", wide)}
   vec4 gathered = vec4(0.0);
   for (int j = 0; j < ROWS; ++j) {
     if (fetch1(padTex, j) == 0.0) continue;
-    int kBase = j * CHANNELS + head * HEAD_DIM;
+    int kBase = (smp * ROWS + j) * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
 ${headDot("kTex", wide)}
     float weight = exp(dot * SCALE
@@ -577,7 +681,7 @@ ${headDot("kTex", wide)}
  * head h is at `d + h * headDim` and its value at `2 * d + h * headDim` - see
  * the note at the top.
  */
-const windowAttentionSourceUncached = (atoms, channels, heads, wide = true) => `${PRELUDE}${ONE_TARGET}
+const windowAttentionSourceUncached = (atoms, channels, heads, wide = true, samples = 1) => `${PRELUDE}${ONE_TARGET}
 const int ATOMS = ${atoms};
 const int CHANNELS = ${channels};
 const int HEADS = ${heads};
@@ -585,7 +689,7 @@ const int HEAD_DIM = ${channels / heads};
 const int W_Q = ${WINDOW_QUERIES};
 const int W_K = ${WINDOW_KEYS};
 const int CTX = ${WINDOW_CONTEXT};
-const int ELEMENTS = ${atoms * channels};
+const int ELEMENTS = ${samples * atoms * channels};
 const float SCALE = ${(1 / Math.sqrt(channels / heads)).toFixed(10)};
 uniform sampler2D qTex;
 uniform sampler2D kvTex;
@@ -595,10 +699,13 @@ uniform sampler2D padTex;
 void main() {
   int base = linearTexel() * 4;
   if (base >= ELEMENTS) { result = vec4(0.0); return; }
-  int i = base / CHANNELS;
-  int c = base - i * CHANNELS;
+  // a row of a batch reads keys of its own sample only: AT the row in the stack, I the atom inside its sample
+  int at = base / CHANNELS;
+  int c = base - at * CHANNELS;
+  int smp = at / ATOMS;
+  int i = at - smp * ATOMS;
   int head = c / HEAD_DIM;
-  int qBase = i * CHANNELS + head * HEAD_DIM;
+  int qBase = at * CHANNELS + head * HEAD_DIM;
   int window = i / W_Q;
   int inWindow = i - window * W_Q;
 
@@ -607,7 +714,7 @@ void main() {
     int j = window * W_Q - CTX + slot;
     if (j < 0 || j >= ATOMS) continue;
     if (fetch1(padTex, j) == 0.0) continue;
-    int kBase = j * 2 * CHANNELS + head * HEAD_DIM;
+    int kBase = (smp * ATOMS + j) * 2 * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
 ${headDot("kvTex", wide)}
     float bias = fetch1(biasTex,
@@ -620,7 +727,7 @@ ${headDot("kvTex", wide)}
     int j = window * W_Q - CTX + slot;
     if (j < 0 || j >= ATOMS) continue;
     if (fetch1(padTex, j) == 0.0) continue;
-    int kBase = j * 2 * CHANNELS + head * HEAD_DIM;
+    int kBase = (smp * ATOMS + j) * 2 * CHANNELS + head * HEAD_DIM;
     float dot = 0.0;
 ${headDot("kvTex", wide)}
     float bias = fetch1(biasTex,
@@ -632,6 +739,269 @@ ${headDot("kvTex", wide)}
   }
   result = gathered / sum;
 }`;
+
+/**
+ * adaLN with its alpha and beta read straight out of the conditioning PROJECTION they are slices of - row
+ * `index[row]` (or the row itself), channels `alphaAt` and `betaAt` of `condWidth` - where two slice draws made
+ * them first. The same expression on the same values: `split` is `splitAdaLnSource`'s pass (the row statistics
+ * read from `statsTex`), otherwise `adaLnSource`'s sweep.
+ */
+const condAdaLnSourceUncached = (rows, channels, condWidth, alphaAt, betaAt, mapped, split, s4 = 0) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int CHANNELS = ${channels};
+const int CW4 = ${condWidth / 4};
+const int A4 = ${alphaAt / 4};
+const int B4 = ${betaAt / 4};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+uniform sampler2D condTex;
+${mapped ? "uniform sampler2D indexTex;" : ""}
+${split ? "uniform sampler2D statsTex;" : "uniform float epsilon;"}
+
+void main() {
+  ${stridedTexel(channels / 4, s4)}
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int row = texel / C4;
+  int from = ${mapped ? "int(fetch1(indexTex, row))" : "row"};
+  vec4 alpha = from < 0 ? vec4(0.0) : fetch4(condTex, from * CW4 + A4 + group);
+  vec4 beta = from < 0 ? vec4(0.0) : fetch4(condTex, from * CW4 + B4 + group);
+${split ? `  vec2 stats = fetch4(statsTex, row).xy;
+  vec4 normalised = (fetch4(xTex, texel) - vec4(stats.x)) * stats.y;`
+    : `  float total = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 v = fetch4(xTex, row * C4 + i);
+    total += v.x + v.y + v.z + v.w;
+  }
+  float mean = total / float(CHANNELS);
+  float spread = 0.0;
+  for (int i = 0; i < C4; ++i) {
+    vec4 centred = fetch4(xTex, row * C4 + i) - mean;
+    spread += dot(centred, centred);
+  }
+  float inverse = inversesqrt(spread / float(CHANNELS) + epsilon);
+  vec4 normalised = (fetch4(xTex, texel) - vec4(mean)) * inverse;`}
+  result = normalised * (vec4(1.0) + alpha) + beta;
+}`;
+
+/**
+ * `out = x + gate * branch`, the gate read out of the conditioning projection as `condAdaLnSource` reads alpha -
+ * one draw where a gate slice, the product and the residual sum were three. (Not bit-identical: the add may be
+ * contracted into the multiply where it was a stored product.)
+ */
+const condGatedResidualSourceUncached = (rows, channels, condWidth, gateAt, mapped) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int CW4 = ${condWidth / 4};
+const int G4 = ${gateAt / 4};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+uniform sampler2D branchTex;
+uniform sampler2D condTex;
+${mapped ? "uniform sampler2D indexTex;" : ""}
+
+void main() {
+  int texel = linearTexel();
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int group = texel % C4;
+  int row = texel / C4;
+  int from = ${mapped ? "int(fetch1(indexTex, row))" : "row"};
+  vec4 gate = from < 0 ? vec4(0.0) : fetch4(condTex, from * CW4 + G4 + group);
+  result = fetch4(xTex, texel) + gate * fetch4(branchTex, texel);
+}`;
+
+/**
+ * The padded x layout (`linearPaddedStride4`) that EVERY one of `consumers` - the projections that read a tensor,
+ * `{outChannels, weight}` - would lay `rows x inChannels` at, or 0 (the plain layout) where any declines or they
+ * disagree. `--no-prepadded-x` is the arm that has every projection pad its own x again.
+ */
+function sharedXStride4(execution, rows, inChannels, consumers) {
+  if (execution.noPrepaddedX || consumers.length === 0) return 0;
+  const strides = consumers.map(({ outChannels, weight }) => linearPaddedStride4(execution, {
+    rows, inChannels, outChannels, weight }));
+  return strides.every((stride) => stride === strides[0]) ? strides[0] : 0;
+}
+
+/** A `rows x channels` tensor laid at `stride4` (0: plain), float16 where the pad pass would have narrowed it. */
+function allocateX(execution, rows, channels, stride4, label) {
+  const tensor = stride4 === 0 ? execution.allocate(rows * channels, label)
+    : execution.halfActivations ? execution.allocateHalf(rows * stride4 * 4, label)
+      : execution.allocate(rows * stride4 * 4, label);
+  tensor.xStride4 = stride4;
+  return tensor;
+}
+
+/** The two projections an attention reads its input through (`projections`), as `sharedXStride4` consumers. */
+const attentionReaders = (w, channels) => (w.projQkvg !== undefined
+  ? [{ outChannels: 4 * channels, weight: w.projQkvg }]
+  : [{ outChannels: 3 * channels, weight: w.projQkv }, { outChannels: channels, weight: w.projG }]);
+
+/** `linear`, told the layout its x was written at (`allocateX`). */
+const project = (execution, call) => linear(execution, { ...call, xStride4: call.x.xStride4 ?? 0 });
+
+/**
+ * adaLN of `x` with alpha and beta channels `alphaAt`/`betaAt` of the `condWidth`-wide projection `cond`, read
+ * through `map` (null: the same rows) - see `condAdaLnSource`.
+ */
+export function condAdaLn(execution, {
+  x, cond, map, condWidth, alphaAt, betaAt, rows, channels, epsilon, label, consumers = [],
+}) {
+  const s4 = sharedXStride4(execution, rows, channels, consumers);
+  const out = allocateX(execution, rows, channels, s4, "bioemu2.adaln");
+  const mapped = map !== null;
+  const split = adaLnSplits(execution, channels);
+  let stats = null;
+  if (split) {
+    stats = execution.allocate(rows * 4, "bioemu2.adaln.stats");
+    execution.dispatch({
+      source: layerNormStatsSource(rows, channels, "two-pass"),
+      output: stats,
+      inputs: { xTex: x },
+      floats: { epsilon },
+      label: `bioemu2.adaln-stats:${rows}x${channels}`,
+    });
+  }
+  execution.dispatch({
+    source: condAdaLnSource(rows, channels, condWidth, alphaAt, betaAt, mapped, split, s4),
+    output: out,
+    inputs: { xTex: x, condTex: cond, ...(mapped ? { indexTex: map } : {}), ...(split ? { statsTex: stats } : {}) },
+    ...(split ? {} : { floats: { epsilon } }),
+    label: `${label}:${rows}x${channels}${split ? ":split" : ""}`,
+  });
+  if (stats !== null) execution.release(stats);
+  return out;
+}
+
+/** `x + gate * branch`, the gate channels `gateAt` of `cond` through `map` - see `condGatedResidualSource`. */
+export function condGatedResidual(execution, { x, branch, cond, map, condWidth, gateAt, rows, channels, label }) {
+  const out = execution.allocate(rows * channels, "bioemu2.layer");
+  const mapped = map !== null;
+  execution.dispatch({
+    source: condGatedResidualSource(rows, channels, condWidth, gateAt, mapped),
+    output: out,
+    inputs: { xTex: x, branchTex: branch, condTex: cond, ...(mapped ? { indexTex: map } : {}) },
+    label: `${label}:${rows}x${channels}`,
+  });
+  return out;
+}
+
+/**
+ * Either attention straight off its projections: q, k and v read out of the one `3 * d` projection (`[q | k | v]` in
+ * channel order, the atom stream's k and v the same per-head columns `windowAttentionSource`'s kv slice holds), the
+ * query bias added as q is read, and the output multiplied by sigmoid(gate) as it is written - at the stride the
+ * output projection reads its x at (`stridedTexel`). Where the slices, the bias add, the sigmoid and the gate product
+ * were six draws (five for the atoms' one kv slice) and the attention a seventh, this is one, on the same arithmetic
+ * in the same order: q is the same sum and the gate the same sigmoid times the same quotient. `--no-attend-fuse` is
+ * the arm. `window` true is the atoms' windowed form, false the tokens' full one.
+ */
+const fusedAttentionSourceUncached = (window, rows, channels, heads, samples, s4, stacked = false) => `${PRELUDE}${ONE_TARGET}
+const int ROWS = ${rows};
+const int CHANNELS = ${channels};
+const int C3 = ${(stacked ? 4 : 3) * channels};
+const int HEADS = ${heads};
+const int HEAD_DIM = ${channels / heads};
+const int ELEMENTS = ${samples * rows * channels};
+const float SCALE = ${(1 / Math.sqrt(channels / heads)).toFixed(10)};
+${window ? `const int W_Q = ${WINDOW_QUERIES};
+const int W_K = ${WINDOW_KEYS};
+const int CTX = ${WINDOW_CONTEXT};` : ""}
+uniform sampler2D qkvTex;
+uniform sampler2D qBiasTex;
+${stacked ? "" : "uniform sampler2D gateTex;"}
+uniform sampler2D biasTex;
+uniform sampler2D padTex;
+
+void main() {
+  ${stridedTexel(channels / 4, s4)}
+  int base = texel * 4;
+  if (base >= ELEMENTS) { result = vec4(0.0); return; }
+  // AT the row in the stack, I the row inside its own sample: a row attends within its sample only
+  int at = base / CHANNELS;
+  int c = base - at * CHANNELS;
+  int smp = at / ROWS;
+  int i = at - smp * ROWS;
+  int head = c / HEAD_DIM;
+  vec4 qv[HEAD_DIM / 4];
+  for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+    qv[d4] = fetch4(qkvTex, (at * C3 + head * HEAD_DIM) / 4 + d4)
+      + fetch4(qBiasTex, (head * HEAD_DIM) / 4 + d4);
+  }
+${window ? `  int window = i / W_Q;
+  int inWindow = i - window * W_Q;` : ""}
+  float largest = -1e30;
+  for (int slot = 0; slot < ${window ? "W_K" : "ROWS"}; ++slot) {
+    int j = ${window ? "window * W_Q - CTX + slot" : "slot"};
+${window ? "    if (j < 0 || j >= ROWS) continue;\n" : ""}    if (fetch1(padTex, j) == 0.0) continue;
+    int kBase = (smp * ROWS + j) * C3 + CHANNELS + head * HEAD_DIM;
+    float dot = 0.0;
+    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = qv[d4];
+      vec4 k4 = fetch4(qkvTex, kBase / 4 + d4);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }
+    float bias = fetch1(biasTex, ${window ? "((window * W_Q + inWindow) * W_K + slot) * HEADS + head" : "(i * ROWS + j) * HEADS + head"});
+    largest = max(largest, dot * SCALE + bias);
+  }
+  float sum = 0.0;
+  vec4 gathered = vec4(0.0);
+  for (int slot = 0; slot < ${window ? "W_K" : "ROWS"}; ++slot) {
+    int j = ${window ? "window * W_Q - CTX + slot" : "slot"};
+${window ? "    if (j < 0 || j >= ROWS) continue;\n" : ""}    if (fetch1(padTex, j) == 0.0) continue;
+    int kBase = (smp * ROWS + j) * C3 + CHANNELS + head * HEAD_DIM;
+    float dot = 0.0;
+    for (int d4 = 0; d4 < HEAD_DIM / 4; ++d4) {
+      vec4 q4 = qv[d4];
+      vec4 k4 = fetch4(qkvTex, kBase / 4 + d4);
+      dot += q4.x * k4.x; dot += q4.y * k4.y;
+      dot += q4.z * k4.z; dot += q4.w * k4.w;
+    }
+    float bias = fetch1(biasTex, ${window ? "((window * W_Q + inWindow) * W_K + slot) * HEADS + head" : "(i * ROWS + j) * HEADS + head"});
+    float weight = exp(dot * SCALE + bias - largest);
+    sum += weight;
+    gathered += weight * fetch4(qkvTex, (kBase + CHANNELS + c % HEAD_DIM) / 4);
+  }
+  vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-${stacked
+    ? "fetch4(qkvTex, (at * C3 + 3 * CHANNELS + c) / 4)" : "fetch4(gateTex, at * (CHANNELS / 4) + c / 4)"}));
+  result = gate * (gathered / sum);
+}`;
+
+/**
+ * `fusedAttentionSource`'s draw, then the output projection: what `fullAttention` and `windowAttention` do after
+ * their projections, where the fused form applies (the head walked four channels at a time).
+ */
+function fusedAttention(execution, { window, x, rows, samples, channels, heads, weights: w, bias, pad }) {
+  // 🔴 [proj_qkv; proj_g] AS ONE PROJECTION WHERE THE UPLOADER STACKED THEM (`projQkvg`, out-major, so a row is
+  // `[q | k | v | g]`): x is read once and the gate is a fourth slice of the same row. `--no-weight-stack`.
+  const stacked = w.projQkvg !== undefined;
+  const qkv = project(execution, {
+    x, weight: stacked ? w.projQkvg : w.projQkv, rows: samples * rows, inChannels: channels,
+    outChannels: (stacked ? 4 : 3) * channels, weightLayout: "out-major",
+  });
+  const rawGate = stacked ? null : project(execution, {
+    x, weight: w.projG, rows: samples * rows, inChannels: channels, outChannels: channels,
+    weightLayout: "out-major",
+  });
+  const total = samples * rows;
+  const s4 = sharedXStride4(execution, total, channels, [{ outChannels: channels, weight: w.projO }]);
+  const gated = allocateX(execution, total, channels, s4, `bioemu2.${window ? "atom" : "token"}-gated`);
+  execution.dispatch({
+    source: fusedAttentionSource(window, rows, channels, heads, samples, s4, stacked),
+    output: gated,
+    inputs: { qkvTex: qkv, qBiasTex: w.projQBias, ...(stacked ? {} : { gateTex: rawGate }), biasTex: bias, padTex: pad },
+    label: `bioemu2.${window ? "atom" : "token"}-attend-fused:${total}x${channels}:${heads}`,
+  });
+  execution.release(qkv);
+  if (rawGate !== null) execution.release(rawGate);
+  const out = project(execution, {
+    x: gated, weight: w.projO, rows: total, inChannels: channels, outChannels: channels, weightLayout: "out-major",
+  });
+  execution.release(gated);
+  return out;
+}
+
+/** Whether `fusedAttention` applies: not under its arm, and only with the head read four channels at a time. */
+export const attendFuses = (execution, channels, heads) =>
+  !execution.noAttendFuse && !execution.noAttendDot4 && channels % (heads * 4) === 0;
 
 /** A weight that a layer stack holds one slice of, as the reference views it. */
 export function layerSlice(weights, name, layer, layers) {
@@ -662,32 +1032,38 @@ export function conditionedLayer(execution, call) {
   const {
     x, conditioning, rows, channels, weights: w, attend, epsilon = 1e-5,
   } = call;
-  // silu(LN(c)) @ cond_2, which is 6 * channels wide.
-  const normalised = layerNorm(execution, {
-    x: conditioning, weight: w.cond0Scale, bias: w.cond0Offset,
-    rows, channels: conditioning.elements / rows, epsilon,
+  // 🔴 THE CONDITIONING MAY ARRIVE AT FEWER ROWS THAN x, with `condMap` taking each of x's rows to one of them (-1
+  // for none). The denoiser's atom stream conditions on its TOKEN's row and every sample of a batch on the same
+  // rows, so the projection below - LN, silu and a 6 * channels GEMM, all row by row - is made once a token rather
+  // than once an atom of every sample, and the slices gather what each row reads.
+  const condRows = call.condRows ?? rows;
+  const condMap = call.condMap ?? null;
+  // silu(LN(c)) @ cond_2, which is 6 * channels wide - the norm over `conditioningStats` where the caller made the
+  // conditioning's row statistics once for every layer (the denoiser does, a step)
+  const condChannels = conditioning.elements / condRows;
+  const activated = conditioningInput(execution, {
+    conditioning, stats: call.conditioningStats, rows: condRows, channels: condChannels,
+    scale: w.cond0Scale, offset: w.cond0Offset, epsilon,
+    consumers: [{ outChannels: 6 * channels, weight: w.cond2Weight }],
   });
-  const activated = execution.allocate(normalised.elements, "bioemu2.cond-silu");
-  execution.dispatch({
-    source: siluSource(normalised.elements),
-    output: activated,
-    inputs: { xTex: normalised },
-    label: `bioemu2.cond-silu:${normalised.elements}`,
-  });
-  execution.release(normalised);
-  const cond = linear(execution, {
-    x: activated, weight: w.cond2Weight, bias: w.cond2Bias, rows,
-    inChannels: conditioning.elements / rows, outChannels: 6 * channels,
+  const cond = project(execution, {
+    x: activated, weight: w.cond2Weight, bias: w.cond2Bias, rows: condRows,
+    inChannels: conditioning.elements / condRows, outChannels: 6 * channels,
     weightLayout: "out-major",
   });
   execution.release(activated);
   const piece = (index) => {
     const out = execution.allocate(rows * channels, `bioemu2.cond.${index}`);
-    execution.dispatch({
+    execution.dispatch(condMap === null ? {
       source: sliceSource(rows, 6 * channels, index * channels, channels),
       output: out,
       inputs: { xTex: cond },
       label: `bioemu2.cond-slice:${rows}x${channels}:${index}`,
+    } : {
+      source: gatherSliceSource(rows, 6 * channels, index * channels, channels),
+      output: out,
+      inputs: { xTex: cond, indexTex: condMap },
+      label: `bioemu2.cond-gather-slice:${rows}x${channels}:${index}`,
     });
     return out;
   };
@@ -732,6 +1108,37 @@ export function conditionedLayer(execution, call) {
     return out;
   };
 
+  // 🔴 alpha, beta and the gate are READ OUT OF THE PROJECTION by the adaLN and the gated residual, where six slice
+  // draws, two products and two sums made and combined them: 10 draws a layer to 2 (`--no-cond-fuse`, the arm).
+  if (!execution.noCondFuse) {
+    const width = 6 * channels;
+    // (each written as the x its projections read: the attention's q/k/v and gate, the transition's fc1 and fc2)
+    const readers = [call.attendConsumers ?? [], transitionReaders(w.transition, channels)];
+    const modulatedFused = (alphaIndex, input) => condAdaLn(execution, {
+      x: input, cond, map: condMap, condWidth: width, alphaAt: alphaIndex * channels,
+      betaAt: (alphaIndex + 1) * channels, rows, channels, epsilon, label: "bioemu2.cond-adaln",
+      consumers: readers[alphaIndex === 0 ? 0 : 1],
+    });
+    const gatedFused = (gateIndex, input, branch) => condGatedResidual(execution, {
+      x: input, branch, cond, map: condMap, condWidth: width, gateAt: gateIndex * channels,
+      rows, channels, label: "bioemu2.cond-gated",
+    });
+    const forAttentionFused = modulatedFused(0, x);
+    const attendedFused = attend(forAttentionFused);
+    execution.release(forAttentionFused);
+    const afterAttentionFused = gatedFused(2, x, attendedFused);
+    execution.release(attendedFused);
+    const forTransitionFused = modulatedFused(3, afterAttentionFused);
+    const transitionedFused = transitionNoNorm(execution, {
+      x: forTransitionFused, rows, channels, weights: w.transition,
+    });
+    execution.release(forTransitionFused);
+    const outFused = gatedFused(5, afterAttentionFused, transitionedFused);
+    execution.release(afterAttentionFused);
+    execution.release(transitionedFused);
+    execution.release(cond);
+    return outFused;
+  }
   const forAttention = modulated(0, 1, x);
   const attended = attend(forAttention);
   execution.release(forAttention);
@@ -760,19 +1167,69 @@ export function conditionedLayer(execution, call) {
  *   - which the coupling's two mixers are not.
  * @returns {Tensor} `rows * (outChannels ?? channels)`
  */
+/** A SwiGLU transition's hidden width, off whichever of its forms the uploader gave (`fc12` or `fc1`). */
+export const transitionHidden = (w, channels) =>
+  (w.fc12 !== undefined ? w.fc12.elements / (2 * channels) : w.fc1.elements / channels);
+
+/** The projections a SwiGLU transition reads its input through, as `sharedXStride4` consumers. */
+const transitionReaders = (w, channels) => (w.fc12 !== undefined
+  ? [{ outChannels: 2 * transitionHidden(w, channels), weight: w.fc12 }]
+  : [w.fc1, w.fc2].map((weight) => ({ outChannels: weight.elements / channels, weight })));
+
+/**
+ * `out[row][c] = silu(x[row][c]) * x[row][hidden + c]` over the stacked `[fc1 | fc2]` projection - the silu draw and
+ * the product draw's arithmetic, in one (and `stridedTexel`'s layout, for fc3).
+ */
+const swigluSourceUncached = (rows, hidden, s4) => `${PRELUDE}${ONE_TARGET}
+const int H4 = ${hidden / 4};
+const int ELEMENTS = ${rows * hidden};
+uniform sampler2D xTex;
+
+void main() {
+  ${stridedTexel(hidden / 4, s4)}
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int row = texel / H4;
+  int group = texel - row * H4;
+  vec4 g = fetch4(xTex, row * 2 * H4 + group);
+  vec4 activated = g / (vec4(1.0) + exp(-g));
+  result = activated * fetch4(xTex, row * 2 * H4 + H4 + group);
+}`;
+
 export function transitionNoNorm(execution, { x, rows, channels, weights: w, outChannels }) {
-  const hidden = w.fc1.elements / channels;
+  const hidden = transitionHidden(w, channels);
   // 🔴 THE COUPLING'S MIXERS ARE NOT SQUARE, which is the whole point of them:
   // `s_to_q_mixer` reads `[a | q]` - the two streams' widths added - and writes
   // the ATOM width, and `q_to_s_mixer` writes the TOKEN width. `fc3` is what
   // says so, and assuming square makes the product that follows a mismatch the
   // reference catches with "offset is out of bounds" and this port would not.
   const out = outChannels ?? channels;
-  const a = linear(execution, {
+  const gatedStride4 = sharedXStride4(execution, rows, hidden, [{ outChannels: out, weight: w.fc3 }]);
+  // 🔴 fc1 AND fc2 AS ONE PROJECTION WHERE THE UPLOADER STACKED THEM (`fc12`, `[fc1; fc2]` out-major, so the first
+  // `hidden` outputs are fc1's): x is read once, and the silu and the product are one draw over its two halves - the
+  // same values, where two projections, a silu and a product were six draws. `--no-weight-stack` is the arm.
+  if (w.fc12 !== undefined) {
+    const both = project(execution, {
+      x, weight: w.fc12, rows, inChannels: channels, outChannels: 2 * hidden, weightLayout: "out-major",
+    });
+    const gatedBoth = allocateX(execution, rows, hidden, gatedStride4, "bioemu2.transition-gated");
+    execution.dispatch({
+      source: swigluSource(rows, hidden, gatedStride4),
+      output: gatedBoth,
+      inputs: { xTex: both },
+      label: `bioemu2.transition-swiglu:${rows}x${hidden}`,
+    });
+    execution.release(both);
+    const projectedBoth = project(execution, {
+      x: gatedBoth, weight: w.fc3, rows, inChannels: hidden, outChannels: out, weightLayout: "out-major",
+    });
+    execution.release(gatedBoth);
+    return projectedBoth;
+  }
+  const a = project(execution, {
     x, weight: w.fc1, rows, inChannels: channels, outChannels: hidden,
     weightLayout: "out-major",
   });
-  const b = linear(execution, {
+  const b = project(execution, {
     x, weight: w.fc2, rows, inChannels: channels, outChannels: hidden,
     weightLayout: "out-major",
   });
@@ -784,16 +1241,16 @@ export function transitionNoNorm(execution, { x, rows, channels, weights: w, out
     label: `bioemu2.transition-silu:${rows}x${hidden}`,
   });
   execution.release(a);
-  const gated = execution.allocate(rows * hidden, "bioemu2.transition-gated");
+  const gated = allocateX(execution, rows, hidden, gatedStride4, "bioemu2.transition-gated");
   execution.dispatch({
-    source: productSource(rows * hidden),
+    source: productSource(rows * hidden, hidden / 4, gatedStride4),
     output: gated,
     inputs: { aTex: activated, bTex: b },
     label: `bioemu2.transition-gate:${rows}x${hidden}`,
   });
   execution.release(activated);
   execution.release(b);
-  const projected = linear(execution, {
+  const projected = project(execution, {
     x: gated, weight: w.fc3, rows, inChannels: hidden, outChannels: out,
     weightLayout: "out-major",
   });
@@ -803,7 +1260,11 @@ export function transitionNoNorm(execution, { x, rows, channels, weights: w, out
 
 /** The attention's q, its bias-carrying query, and its gate. */
 function projections(execution, { x, rows, channels, weights: w }) {
-  const qkv = linear(execution, {
+  if (w.projQkv === undefined) {
+    throw new Error("bioemu2: this attention has only a stacked [qkv; g] weight, which only the fused attention"
+      + " reads - upload them apart (--no-weight-stack) for --no-attend-fuse or --no-attend-dot4");
+  }
+  const qkv = project(execution, {
     x, weight: w.projQkv, rows, inChannels: channels, outChannels: 3 * channels,
     weightLayout: "out-major",
   });
@@ -822,7 +1283,7 @@ function projections(execution, { x, rows, channels, weights: w }) {
     label: `bioemu2.query-bias:${rows}x${channels}`,
   });
   execution.release(query);
-  const rawGate = linear(execution, {
+  const rawGate = project(execution, {
     x, weight: w.projG, rows, inChannels: channels, outChannels: channels,
     weightLayout: "out-major",
   });
@@ -870,46 +1331,57 @@ export function pairBias(execution, { pair, rows, channels, heads, weights: w, e
 /** The token stream's full attention, with its gate and output projection. */
 export function fullAttention(execution, call) {
   const { x, pair, pad, tokens, channels, heads, weights: w, epsilon = 1e-5 } = call;
+  // `samples` stacked sample-major in x, attending within their own sample over one shared bias; `bias` the
+  // precomputed `pairBias` of `pair` (the denoiser's is a fold's constant, made once - see `bioemu2DenoiserPrepare`)
+  const samples = call.samples ?? 1;
+  const rows = samples * tokens;
+  const given = call.bias;
+  if (given !== undefined && attendFuses(execution, channels, heads)) {
+    return fusedAttention(execution, {
+      window: false, x, rows: tokens, samples, channels, heads, weights: w, bias: given, pad });
+  }
   const { qkv, query, gate } = projections(execution, {
-    x, rows: tokens, channels, weights: w,
+    x, rows, channels, weights: w,
   });
   const slice = (from, label) => {
-    const out = execution.allocate(tokens * channels, `bioemu2.${label}`);
+    const out = execution.allocate(rows * channels, `bioemu2.${label}`);
     execution.dispatch({
-      source: sliceSource(tokens, 3 * channels, from, channels),
+      source: sliceSource(rows, 3 * channels, from, channels),
       output: out,
       inputs: { xTex: qkv },
-      label: `bioemu2.slice:${tokens}x${channels}:${label}`,
+      label: `bioemu2.slice:${rows}x${channels}:${label}`,
     });
     return out;
   };
   const key = slice(channels, "key");
   const value = slice(2 * channels, "value");
   execution.release(qkv);
-  const bias = pairBias(execution, {
+  const bias = given ?? pairBias(execution, {
     pair, rows: tokens * tokens, channels: pair.elements / (tokens * tokens),
     heads, weights: w, epsilon,
   });
-  const attended = execution.allocate(tokens * channels, "bioemu2.token-attended");
+  const attended = execution.allocate(rows * channels, "bioemu2.token-attended");
   execution.dispatch({
     source: fullAttentionSource(tokens, channels, heads,
-      !execution.noAttendDot4 && channels % (heads * 4) === 0),
+      !execution.noAttendDot4 && channels % (heads * 4) === 0, samples),
     output: attended,
     inputs: { qTex: query, kTex: key, vTex: value, biasTex: bias, padTex: pad },
-    label: `bioemu2.token-attend:${tokens}x${channels}:${heads}`,
+    label: `bioemu2.token-attend:${rows}x${channels}:${heads}`,
   });
-  for (const tensor of [query, key, value, bias]) execution.release(tensor);
-  const gated = execution.allocate(tokens * channels, "bioemu2.token-gated");
+  for (const tensor of [query, key, value]) execution.release(tensor);
+  if (bias !== given) execution.release(bias);
+  const gatedStride4 = sharedXStride4(execution, rows, channels, [{ outChannels: channels, weight: w.projO }]);
+  const gated = allocateX(execution, rows, channels, gatedStride4, "bioemu2.token-gated");
   execution.dispatch({
-    source: productSource(tokens * channels),
+    source: productSource(rows * channels, channels / 4, gatedStride4),
     output: gated,
     inputs: { aTex: gate, bTex: attended },
-    label: `bioemu2.token-gate:${tokens}x${channels}`,
+    label: `bioemu2.token-gate:${rows}x${channels}`,
   });
   execution.release(attended);
   execution.release(gate);
-  const out = linear(execution, {
-    x: gated, weight: w.projO, rows: tokens, inChannels: channels,
+  const out = project(execution, {
+    x: gated, weight: w.projO, rows, inChannels: channels,
     outChannels: channels, weightLayout: "out-major",
   });
   execution.release(gated);
@@ -925,17 +1397,24 @@ export function windowAttention(execution, call) {
   // before any layer runs - while the denoiser reads its own `ctx.p` every
   // layer. One kernel either way; what differs is who built the bias.
   const given = call.bias;
+  // `samples` stacked sample-major in x, as `fullAttention` takes them: `atoms` is ONE sample's
+  const samples = call.samples ?? 1;
+  const rows = samples * atoms;
+  if (given !== undefined && attendFuses(execution, channels, heads)) {
+    return fusedAttention(execution, {
+      window: true, x, rows: atoms, samples, channels, heads, weights: w, bias: given, pad });
+  }
   const { qkv, query, gate } = projections(execution, {
-    x, rows: atoms, channels, weights: w,
+    x, rows, channels, weights: w,
   });
   // 🔴 THE KEY AND VALUE TRAVEL TOGETHER, because the kernel reads them as
   // per-head halves of this one `2 * channels` slice - see the note at the top.
-  const kv = execution.allocate(atoms * 2 * channels, "bioemu2.kv");
+  const kv = execution.allocate(rows * 2 * channels, "bioemu2.kv");
   execution.dispatch({
-    source: sliceSource(atoms, 3 * channels, channels, 2 * channels),
+    source: sliceSource(rows, 3 * channels, channels, 2 * channels),
     output: kv,
     inputs: { xTex: qkv },
-    label: `bioemu2.slice-kv:${atoms}x${2 * channels}`,
+    label: `bioemu2.slice-kv:${rows}x${2 * channels}`,
   });
   execution.release(qkv);
   const windows = atoms / WINDOW_QUERIES;
@@ -944,31 +1423,159 @@ export function windowAttention(execution, call) {
     channels: pair.elements / (windows * WINDOW_QUERIES * WINDOW_KEYS),
     heads, weights: w, epsilon,
   });
-  const attended = execution.allocate(atoms * channels, "bioemu2.atom-attended");
+  const attended = execution.allocate(rows * channels, "bioemu2.atom-attended");
   execution.dispatch({
     source: windowAttentionSource(atoms, channels, heads,
-      !execution.noAttendDot4 && channels % (heads * 4) === 0),
+      !execution.noAttendDot4 && channels % (heads * 4) === 0, samples),
     output: attended,
     inputs: { qTex: query, kvTex: kv, biasTex: bias, padTex: pad },
-    label: `bioemu2.atom-attend:${atoms}x${channels}:${heads}`,
+    label: `bioemu2.atom-attend:${rows}x${channels}:${heads}`,
   });
   for (const tensor of [query, kv]) execution.release(tensor);
   if (bias !== given) execution.release(bias);
-  const gated = execution.allocate(atoms * channels, "bioemu2.atom-gated");
+  const gatedStride4 = sharedXStride4(execution, rows, channels, [{ outChannels: channels, weight: w.projO }]);
+  const gated = allocateX(execution, rows, channels, gatedStride4, "bioemu2.atom-gated");
   execution.dispatch({
-    source: productSource(atoms * channels),
+    source: productSource(rows * channels, channels / 4, gatedStride4),
     output: gated,
     inputs: { aTex: gate, bTex: attended },
-    label: `bioemu2.atom-gate:${atoms}x${channels}`,
+    label: `bioemu2.atom-gate:${rows}x${channels}`,
   });
   execution.release(attended);
   execution.release(gate);
-  const out = linear(execution, {
-    x: gated, weight: w.projO, rows: atoms, inChannels: channels,
+  const out = project(execution, {
+    x: gated, weight: w.projO, rows, inChannels: channels,
     outChannels: channels, weightLayout: "out-major",
   });
   execution.release(gated);
   return out;
+}
+
+/**
+ * Everything a denoiser call reads that is the same at every sampler step: the 16 layers' pair biases for both
+ * streams, the single conditioning's sigma-free half `single_embed(LN[s_trunk | s_inputs])`, the token stream's
+ * `s_trunk_to_a(s_trunk)`, and the row maps a batch of `samples` walks through.
+ *
+ * 🔴 THESE WERE ALL RECOMPUTED AT EVERY STEP, the biases at every LAYER of every step: 32 pair-bias draws over the
+ * `T^2 x 256` token pair and the windowed atom pair, the 839-wide LayerNorm and its projection, the trunk's norm and
+ * its projection - for tensors the sampler cannot change. webgpu/bioemu2/network.js makes the same ones once in
+ * `denoiserProgram`. Each is the same kernel on the same inputs, so hoisting it is exact.
+ *
+ * 🔴 AND THE MAPS ARE WHAT LET ONE CONDITIONING PROJECTION SERVE EVERY ATOM OF EVERY SAMPLE. The conditioning is
+ * per TOKEN - an atom's row was a gather of its token's - and every layer then normalised, activated and projected
+ * that gathered `N x 768` row by row (`576x768x768` and `576x768x1920` GEMMs a layer at 68 tokens). Made at the
+ * `T + 1` token rows instead (the last a zero row, which is what a padded atom's gather gave) and read through
+ * `atomCond`, it is the same rows of the same projection. A batch is stacked SAMPLE-MAJOR: `atomToken` takes an atom
+ * row to its own sample's token row, `centre` and `centreOrPad` a token row to its sample's centre atom row.
+ *
+ * @param {import("../runtime/execution.js").Execution} execution
+ * @param {{features: any, context: any, sInputs: Tensor, sTrunk: Tensor, weights: any, dims: any,
+ *   samples?: number, epsilon?: number}} call
+ * @returns {any} the prepared context, with `release()`
+ */
+export function bioemu2DenoiserPrepare(execution, call) {
+  const { features: f, context, sInputs, sTrunk, weights: w, dims, epsilon = 1e-5 } = call;
+  const samples = call.samples ?? 1;
+  const { atoms, tokens, layers } = dims;
+  const tokenChannels = dims.tokenChannels;
+  const held = [];
+  const keep = (tensor) => {
+    held.push(tensor);
+    return tensor;
+  };
+
+  // --- the row maps, from the features the device already has -------------
+  const atomTokenOrPad = execution.read(f.atomToTokenOrPad);
+  const centreAtom = execution.read(f.centreAtom);
+  const centreAtomOrPad = execution.read(f.centreAtomOrPad);
+  const atomCond = new Float32Array(samples * atoms);
+  const atomToken = new Float32Array(samples * atoms);
+  const centre = new Float32Array(samples * tokens);
+  const centreOrPad = new Float32Array(samples * tokens);
+  const tokenCond = new Float32Array(samples * tokens);
+  for (let s = 0; s < samples; s += 1) {
+    for (let atom = 0; atom < atoms; atom += 1) {
+      const token = atomTokenOrPad[atom];
+      atomCond[s * atoms + atom] = token < 0 ? tokens : token;
+      atomToken[s * atoms + atom] = token < 0 ? -1 : s * tokens + token;
+    }
+    for (let token = 0; token < tokens; token += 1) {
+      centre[s * tokens + token] = s * atoms + centreAtom[token];
+      centreOrPad[s * tokens + token] = centreAtomOrPad[token] < 0 ? -1 : s * atoms + centreAtomOrPad[token];
+      tokenCond[s * tokens + token] = token;
+    }
+  }
+  const withZeroRow = new Float32Array(tokens + 1);
+  for (let token = 0; token <= tokens; token += 1) withZeroRow[token] = token < tokens ? token : -1;
+  const maps = {
+    atomCond: keep(execution.upload(atomCond, "bioemu2.map.atom-cond")),
+    // the identity at one sample: a plain slice then, as before the maps
+    tokenCond: samples === 1 ? null : keep(execution.upload(tokenCond, "bioemu2.map.token-cond")),
+    // at one sample these are the features' own, so the draws read the tensors they always did
+    atomToken: samples === 1 ? f.atomToTokenOrPad : keep(execution.upload(atomToken, "bioemu2.map.atom-token")),
+    centre: samples === 1 ? f.centreAtom : keep(execution.upload(centre, "bioemu2.map.centre")),
+    centreOrPad: samples === 1 ? f.centreAtomOrPad
+      : keep(execution.upload(centreOrPad, "bioemu2.map.centre-or-pad")),
+    withZeroRow: keep(execution.upload(withZeroRow, "bioemu2.map.zero-row")),
+  };
+
+  // --- the 16 layers' pair biases, both streams ---------------------------
+  const windows = atoms / WINDOW_QUERIES;
+  const tokenBias = [];
+  const atomBias = [];
+  for (let layer = 0; layer < layers; layer += 1) {
+    tokenBias.push(keep(pairBias(execution, {
+      pair: context.z, rows: tokens * tokens, channels: context.z.elements / (tokens * tokens),
+      heads: dims.tokenHeads, weights: w.tokenBlocks[layer].attention, epsilon,
+    })));
+    atomBias.push(keep(pairBias(execution, {
+      pair: context.p, rows: windows * WINDOW_QUERIES * WINDOW_KEYS,
+      channels: context.p.elements / (windows * WINDOW_QUERIES * WINDOW_KEYS),
+      heads: dims.atomHeads, weights: w.atomBlocks[layer].attention, epsilon,
+    })));
+  }
+
+  // --- single_embed(LN[s_trunk | s_inputs]): the conditioning before sigma --
+  const trunkChannels = sTrunk.elements / tokens;
+  const inputChannels = sInputs.elements / tokens;
+  const joined = execution.allocate(tokens * (trunkChannels + inputChannels), "bioemu2.single-cat");
+  execution.dispatch({
+    source: concatSource(tokens, trunkChannels, inputChannels),
+    output: joined,
+    inputs: { leftTex: sTrunk, rightTex: sInputs },
+    label: `bioemu2.single-cat:${tokens}x${trunkChannels + inputChannels}`,
+  });
+  const normalisedSingle = layerNorm(execution, {
+    x: joined, weight: w.singleConditioner.normScale, bias: w.singleConditioner.normOffset,
+    rows: tokens, channels: trunkChannels + inputChannels, epsilon,
+  });
+  execution.release(joined);
+  const single = keep(linear(execution, {
+    x: normalisedSingle, weight: w.singleConditioner.singleEmbedWeight,
+    bias: w.singleConditioner.singleEmbedBias, rows: tokens,
+    inChannels: trunkChannels + inputChannels, outChannels: tokenChannels,
+    weightLayout: "out-major",
+  }));
+  execution.release(normalisedSingle);
+
+  // --- s_trunk_to_a(s_trunk) ----------------------------------------------
+  const normalisedTrunk = layerNorm(execution, {
+    x: sTrunk, weight: w.sTrunkToA0Scale, bias: w.sTrunkToA0Offset,
+    rows: tokens, channels: trunkChannels, epsilon,
+  });
+  const aBase = keep(linear(execution, {
+    x: normalisedTrunk, weight: w.sTrunkToA1, rows: tokens,
+    inChannels: trunkChannels, outChannels: tokenChannels, weightLayout: "out-major",
+  }));
+  execution.release(normalisedTrunk);
+
+  return {
+    samples, maps, tokenBias, atomBias, single, aBase,
+    release: () => {
+      for (const tensor of held) execution.release(tensor);
+      held.length = 0;
+    },
+  };
 }
 
 /**
@@ -982,19 +1589,46 @@ export function windowAttention(execution, call) {
  * on the output. A port that scaled only the input would return a finite
  * structure at every noise level and the wrong one at all but one.
  *
+ * 🔴 AND x MAY CARRY A BATCH: `S * atoms * 3`, SAMPLE-MAJOR, every sample conditioned alike and attending only
+ * within itself - one call where S walks would each make one, the draws shared and the rows S times. `prepared`
+ * (`bioemu2DenoiserPrepare`, at that S) is what a sampler makes once a fold; without it the call makes and drops
+ * its own.
+ *
  * @param {import("../runtime/execution.js").Execution} execution
  * @param {{x: Tensor, sigma: number, features: any, context: any,
  *   sInputs: Tensor, sTrunk: Tensor, weights: any, dims: any,
- *   hostFourier: {weight: Float32Array, bias: Float32Array},
+ *   hostFourier: {weight: Float32Array, bias: Float32Array}, prepared?: any,
  *   epsilon?: number, onStage?: (stage: string, tensor: Tensor) => void}} call
- * @returns {Tensor} `atoms * 3`; the caller's to release
+ * @returns {Tensor} `S * atoms * 3`; the caller's to release
  */
 export function bioemu2Denoise(execution, call) {
+  return drain(bioemu2DenoiseSteps(execution, call));
+}
+
+/**
+ * `bioemu2Denoise` as a generator that yields after each of the 16 layers, so the page can let go of its thread
+ * inside a denoiser call (~0.8 s at 68 tokens on an M2) - the same draws in the same order; `drain` is the call.
+ */
+export function* bioemu2DenoiseSteps(execution, call) {
   const {
     x, sigma, features: f, context, sInputs, sTrunk, weights: w, dims,
     epsilon = 1e-5,
   } = call;
   const { atoms, tokens, layers } = dims;
+  const samples = x.elements / (atoms * 3);
+  if (!Number.isInteger(samples) || samples < 1) {
+    throw new RangeError(`bioemu2 denoiser: x holds ${x.elements} floats, not a whole number of ${atoms} x 3`);
+  }
+  const own = call.prepared === undefined;
+  const prepared = own
+    ? bioemu2DenoiserPrepare(execution, { features: f, context, sInputs, sTrunk, weights: w, dims, samples, epsilon })
+    : call.prepared;
+  if (prepared.samples !== samples) {
+    throw new RangeError(`bioemu2 denoiser: prepared for ${prepared.samples} samples, handed ${samples}`);
+  }
+  const { maps } = prepared;
+  const atomRows = samples * atoms;
+  const tokenRows = samples * tokens;
   const sigmaData = dims.sigmaData ?? SIGMA_DATA;
   const atomChannels = dims.atomChannels;
   const tokenChannels = dims.tokenChannels;
@@ -1006,45 +1640,24 @@ export function bioemu2Denoise(execution, call) {
 
   // c_in, and the masked scaled input.
   const cIn = 1 / Math.sqrt(sigma * sigma + sigmaData * sigmaData);
-  const scaled = keep(execution.allocate(atoms * 3, "bioemu2.r"));
+  const scaled = keep(execution.allocate(atomRows * 3, "bioemu2.r"));
   execution.dispatch({
-    source: scaleSource(atoms * 3),
+    source: scaleSource(atomRows * 3),
     output: scaled,
     inputs: { xTex: x },
     floats: { factor: cIn },
-    label: `bioemu2.c-in:${atoms}`,
+    label: `bioemu2.c-in:${atomRows}`,
   });
-  const r = keep(execution.allocate(atoms * 3, "bioemu2.r-masked"));
+  const r = keep(execution.allocate(atomRows * 3, "bioemu2.r-masked"));
   execution.dispatch({
-    source: maskRowsSource(atoms, 3),
+    source: maskRowsSource(atomRows, 3, atoms),
     output: r,
     inputs: { xTex: scaled, maskTex: f.atomMask },
-    label: `bioemu2.r-mask:${atoms}`,
+    label: `bioemu2.r-mask:${atomRows}`,
   });
   call.onStage?.("r", r);
 
-  // The single conditioning: [s_trunk | s_inputs], then the Fourier term.
-  const trunkChannels = sTrunk.elements / tokens;
-  const inputChannels = sInputs.elements / tokens;
-  const joined = keep(execution.allocate(
-    tokens * (trunkChannels + inputChannels), "bioemu2.single-cat"));
-  execution.dispatch({
-    source: concatSource(tokens, trunkChannels, inputChannels),
-    output: joined,
-    inputs: { leftTex: sTrunk, rightTex: sInputs },
-    label: `bioemu2.single-cat:${tokens}x${trunkChannels + inputChannels}`,
-  });
-  const normalisedSingle = keep(layerNorm(execution, {
-    x: joined, weight: w.singleConditioner.normScale,
-    bias: w.singleConditioner.normOffset,
-    rows: tokens, channels: trunkChannels + inputChannels, epsilon,
-  }));
-  let cond = keep(linear(execution, {
-    x: normalisedSingle, weight: w.singleConditioner.singleEmbedWeight,
-    bias: w.singleConditioner.singleEmbedBias, rows: tokens,
-    inChannels: trunkChannels + inputChannels, outChannels: tokenChannels,
-    weightLayout: "out-major",
-  }));
+  // The single conditioning: the prepared [s_trunk | s_inputs] embedding, then the Fourier term.
   // 🔴 t IS `0.25 * log(sigma / sigma_data)`, embedded on the HOST: it is one
   // row, and the alternative is a texture to hold a number the host has.
   const t = 0.25 * Math.log(sigma / sigmaData);
@@ -1063,15 +1676,13 @@ export function bioemu2Denoise(execution, call) {
     x: normalisedFourier, weight: w.singleConditioner.fourierToSingle, rows: 1,
     inChannels: fourier.length, outChannels: tokenChannels, weightLayout: "out-major",
   }));
-  const withFourier = keep(execution.allocate(
-    tokens * tokenChannels, "bioemu2.cond"));
+  let cond = keep(execution.allocate(tokens * tokenChannels, "bioemu2.cond"));
   execution.dispatch({
     source: broadcastRowSource(tokens, tokenChannels),
-    output: withFourier,
-    inputs: { xTex: cond, rowTex: fourierTerm },
+    output: cond,
+    inputs: { xTex: prepared.single, rowTex: fourierTerm },
     label: `bioemu2.fourier-add:${tokens}x${tokenChannels}`,
   });
-  cond = withFourier;
   for (const group of w.singleConditioner.transitions) {
     const normalised = layerNorm(execution, {
       x: cond, weight: group.normScale, bias: group.normOffset,
@@ -1092,82 +1703,109 @@ export function bioemu2Denoise(execution, call) {
     cond = next;
   }
   call.onStage?.("cond", cond);
+  // ...and with a zero row after the last token: the row a padded atom's conditioning reads (`maps.atomCond`)
+  const condWithZero = keep(execution.allocate((tokens + 1) * tokenChannels, "bioemu2.cond-zero-row"));
+  execution.dispatch({
+    source: gatherRowsSource(tokens + 1, tokenChannels),
+    output: condWithZero,
+    inputs: { sourceTex: cond, indexTex: maps.withZeroRow },
+    label: `bioemu2.cond-zero-row:${tokens + 1}x${tokenChannels}`,
+  });
+  // ...and its row statistics, ONCE: every layer's four conditionings normalise these same rows, each with its own
+  // affine (the token-side ones read the first T rows, which are `cond`'s own)
+  const condStats = execution.noCondFuse ? null : keep(execution.allocate((tokens + 1) * 4, "bioemu2.cond-stats"));
+  if (condStats !== null) {
+    execution.dispatch({
+      source: layerNormStatsSource(tokens + 1, tokenChannels, "two-pass"),
+      output: condStats,
+      inputs: { xTex: condWithZero },
+      floats: { epsilon },
+      label: `bioemu2.cond-stats:${tokens + 1}x${tokenChannels}`,
+    });
+  }
 
   // The two streams' initial states.
   const rToQ = keep(linear(execution, {
-    x: r, weight: w.rToQ, rows: atoms, inChannels: 3, outChannels: atomChannels,
+    x: r, weight: w.rToQ, rows: atomRows, inChannels: 3, outChannels: atomChannels,
     weightLayout: "out-major",
   }));
-  let q = keep(execution.allocate(atoms * atomChannels, "bioemu2.q"));
+  let q = keep(execution.allocate(atomRows * atomChannels, "bioemu2.q"));
   execution.dispatch({
-    source: sumSource(atoms * atomChannels),
+    source: sumSource(atomRows * atomChannels, atoms * atomChannels),
     output: q,
     inputs: { aTex: context.q0, bTex: rToQ },
-    label: `bioemu2.q0:${atoms}x${atomChannels}`,
+    label: `bioemu2.q0:${atomRows}x${atomChannels}`,
   });
-  const normalisedTrunk = keep(layerNorm(execution, {
-    x: sTrunk, weight: w.sTrunkToA0Scale, bias: w.sTrunkToA0Offset,
-    rows: tokens, channels: trunkChannels, epsilon,
-  }));
-  const aBase = keep(linear(execution, {
-    x: normalisedTrunk, weight: w.sTrunkToA1, rows: tokens,
-    inChannels: trunkChannels, outChannels: tokenChannels, weightLayout: "out-major",
-  }));
   // ...plus the scaled input AT EVERY TOKEN'S CENTRE ATOM, masked by the token pad.
-  const centreR = keep(execution.allocate(tokens * 3, "bioemu2.centre-r"));
+  const centreR = keep(execution.allocate(tokenRows * 3, "bioemu2.centre-r"));
   execution.dispatch({
-    source: gatherRowsSource(tokens, 3),
+    source: gatherRowsSource(tokenRows, 3),
     output: centreR,
-    inputs: { sourceTex: r, indexTex: f.centreAtom },
-    label: `bioemu2.centre-r:${tokens}`,
+    inputs: { sourceTex: r, indexTex: maps.centre },
+    label: `bioemu2.centre-r:${tokenRows}`,
   });
-  const maskedCentre = keep(execution.allocate(tokens * 3, "bioemu2.centre-masked"));
+  const maskedCentre = keep(execution.allocate(tokenRows * 3, "bioemu2.centre-masked"));
   execution.dispatch({
-    source: maskRowsSource(tokens, 3),
+    source: maskRowsSource(tokenRows, 3, tokens),
     output: maskedCentre,
     inputs: { xTex: centreR, maskTex: f.tokenPad },
-    label: `bioemu2.centre-mask:${tokens}`,
+    label: `bioemu2.centre-mask:${tokenRows}`,
   });
   const rToA = keep(linear(execution, {
-    x: maskedCentre, weight: w.rTokenToA, rows: tokens, inChannels: 3,
+    x: maskedCentre, weight: w.rTokenToA, rows: tokenRows, inChannels: 3,
     outChannels: tokenChannels, weightLayout: "out-major",
   }));
-  let a = keep(execution.allocate(tokens * tokenChannels, "bioemu2.a"));
+  let a = keep(execution.allocate(tokenRows * tokenChannels, "bioemu2.a"));
   execution.dispatch({
-    source: sumSource(tokens * tokenChannels),
+    source: sumSource(tokenRows * tokenChannels, tokens * tokenChannels),
     output: a,
-    inputs: { aTex: aBase, bTex: rToA },
-    label: `bioemu2.a0:${tokens}x${tokenChannels}`,
-  });
-  // The conditioning at every atom, through its token - a padded atom gets zeros.
-  const condAtAtom = keep(execution.allocate(
-    atoms * tokenChannels, "bioemu2.cond-at-atom"));
-  execution.dispatch({
-    source: gatherRowsSource(atoms, tokenChannels),
-    output: condAtAtom,
-    inputs: { sourceTex: cond, indexTex: f.atomToTokenOrPad },
-    label: `bioemu2.cond-at-atom:${atoms}x${tokenChannels}`,
+    inputs: { aTex: prepared.aBase, bTex: rToA },
+    label: `bioemu2.a0:${tokenRows}x${tokenChannels}`,
   });
   call.onStage?.("q0", q);
   call.onStage?.("a0", a);
 
+  // 🔴 THE ATOM STREAM'S CONDITIONING IS PROJECTED AT THE TOKEN ROWS (`bioemu2DenoiserPrepare`'s note): the two
+  // GEMMs a layer it feeds were 576 x 768 x 768 and 576 x 768 x 1920 at 68 tokens and are 69 rows now. Exact in f32
+  // (this denoiser's gate reads the same relative RMS to four digits); with the fold's float16 x the narrowed
+  // rounding differs by row count, worst atom 0.056 A over a 20-step fold (0.001 A with `--no-half-x`).
+  // `--no-token-row-cond` is the control arm: the conditioning gathered to every atom row first, as it was.
+  let atomCond = { source: condWithZero, rows: tokens + 1, map: maps.atomCond };
+  if (execution.noTokenRowCond) {
+    const atAtom = keep(execution.allocate(atomRows * tokenChannels, "bioemu2.cond-at-atom"));
+    execution.dispatch({
+      source: gatherRowsSource(atomRows, tokenChannels),
+      output: atAtom,
+      inputs: { sourceTex: condWithZero, indexTex: maps.atomCond },
+      label: `bioemu2.cond-at-atom:${atomRows}x${tokenChannels}`,
+    });
+    atomCond = { source: atAtom, rows: atomRows, map: null };
+  }
   for (let layer = 0; layer < layers; layer += 1) {
     const atomWeights = w.atomBlocks[layer];
     const tokenWeights = w.tokenBlocks[layer];
     const nextQ = conditionedLayer(execution, {
-      x: q, conditioning: condAtAtom, rows: atoms, channels: atomChannels,
+      x: q, conditioning: atomCond.source, condRows: atomCond.rows, condMap: atomCond.map,
+      rows: atomRows, channels: atomChannels,
       heads: dims.atomHeads, weights: atomWeights, epsilon,
+      attendConsumers: attentionReaders(atomWeights.attention, atomChannels),
+      conditioningStats: atomCond.map === null ? null : condStats,
       attend: (input) => windowAttention(execution, {
         x: input, pair: context.p, pad: f.atomPad, atoms, channels: atomChannels,
         heads: dims.atomHeads, weights: atomWeights.attention, epsilon,
+        bias: prepared.atomBias[layer], samples,
       }),
     });
     const nextA = conditionedLayer(execution, {
-      x: a, conditioning: cond, rows: tokens, channels: tokenChannels,
+      x: a, conditioning: cond, condRows: tokens, condMap: maps.tokenCond,
+      rows: tokenRows, channels: tokenChannels,
       heads: dims.tokenHeads, weights: tokenWeights, epsilon,
+      attendConsumers: attentionReaders(tokenWeights.attention, tokenChannels),
+      conditioningStats: condStats,
       attend: (input) => fullAttention(execution, {
         x: input, pair: context.z, pad: f.tokenPad, tokens, channels: tokenChannels,
         heads: dims.tokenHeads, weights: tokenWeights.attention, epsilon,
+        bias: prepared.tokenBias[layer], samples,
       }),
     });
     execution.release(q);
@@ -1179,32 +1817,35 @@ export function bioemu2Denoise(execution, call) {
     // its own three-way slice: alpha, beta and a gate.
     const coupling = w.coupling[layer];
     const width = tokenChannels + atomChannels;
-    const mix = (condSource, rows, gatherIndex, left, right, weights, outChannels) => {
-      const normalised = layerNorm(execution, {
-        x: condSource, weight: weights.cond0Scale, bias: weights.cond0Offset,
-        rows, channels: condSource.elements / rows, epsilon,
+    // `condSource` at `condRows` rows, read by each of the `rows` rows through `condMap` (null: the same rows)
+    const mix = (condSource, condRows, condMap, rows, gatherIndex, left, right, weights, outChannels) => {
+      const condChannels = condSource.elements / condRows;
+      const projectedWidth = 2 * width + outChannels;
+      const activated = conditioningInput(execution, {
+        // (the statistics are condWithZero's rows - cond's are its first T - and not the control arm's atom rows)
+        conditioning: condSource, stats: condSource === cond || condSource === condWithZero ? condStats : null,
+        rows: condRows, channels: condChannels,
+        scale: weights.cond0Scale, offset: weights.cond0Offset, epsilon,
+        consumers: [{ outChannels: projectedWidth, weight: weights.cond2Weight }],
       });
-      const activated = execution.allocate(normalised.elements, "bioemu2.mix-silu");
-      execution.dispatch({
-        source: siluSource(normalised.elements),
-        output: activated,
-        inputs: { xTex: normalised },
-        label: `bioemu2.mix-silu:${normalised.elements}`,
-      });
-      execution.release(normalised);
-      const projected = linear(execution, {
-        x: activated, weight: weights.cond2Weight, bias: weights.cond2Bias, rows,
-        inChannels: condSource.elements / rows,
+      const projected = project(execution, {
+        x: activated, weight: weights.cond2Weight, bias: weights.cond2Bias, rows: condRows,
+        inChannels: condSource.elements / condRows,
         outChannels: 2 * width + outChannels, weightLayout: "out-major",
       });
       execution.release(activated);
       const slice = (from, howWide, label) => {
         const out = execution.allocate(rows * howWide, `bioemu2.mix.${label}`);
-        execution.dispatch({
+        execution.dispatch(condMap === null ? {
           source: sliceSource(rows, 2 * width + outChannels, from, howWide),
           output: out,
           inputs: { xTex: projected },
           label: `bioemu2.mix-slice:${rows}x${howWide}:${label}`,
+        } : {
+          source: gatherSliceSource(rows, 2 * width + outChannels, from, howWide),
+          output: out,
+          inputs: { xTex: projected, indexTex: condMap },
+          label: `bioemu2.mix-gather-slice:${rows}x${howWide}:${label}`,
         });
         return out;
       };
@@ -1223,6 +1864,27 @@ export function bioemu2Denoise(execution, call) {
         label: `bioemu2.mix-cat:${rows}x${width}`,
       });
       execution.release(gathered);
+      if (!execution.noCondFuse) {
+        // alpha and beta read by the adaLN, and the gate by the residual against the stream's own state - the
+        // coupling's sum - where three slices, the gate product and the sum were five draws
+        const modulatedFused = condAdaLn(execution, {
+          x: joinedMix, cond: projected, map: condMap, condWidth: projectedWidth, alphaAt: 0, betaAt: width,
+          rows, channels: width, epsilon, label: "bioemu2.mix-cond-adaln",
+          consumers: transitionReaders(weights, width),
+        });
+        execution.release(joinedMix);
+        const mixedFused = transitionNoNorm(execution, {
+          x: modulatedFused, rows, channels: width, weights, outChannels,
+        });
+        execution.release(modulatedFused);
+        const outFused = condGatedResidual(execution, {
+          x: right.tensor, branch: mixedFused, cond: projected, map: condMap, condWidth: projectedWidth,
+          gateAt: 2 * width, rows, channels: outChannels, label: "bioemu2.mix-cond-gated",
+        });
+        execution.release(mixedFused);
+        execution.release(projected);
+        return { coupled: outFused };
+      }
       const alpha = slice(0, width, "alpha");
       const beta = slice(width, width, "beta");
       const modulated = execution.allocate(rows * width, "bioemu2.mix-adaln");
@@ -1256,75 +1918,73 @@ export function bioemu2Denoise(execution, call) {
       execution.release(gate);
       execution.release(mixed);
       execution.release(projected);
+      return { gated: out };
+    };
+    const sToQ = mix(atomCond.source, atomCond.rows, atomCond.map, atomRows, maps.atomToken,
+      { tensor: a, channels: tokenChannels }, { tensor: q, channels: atomChannels },
+      { ...coupling.qCoupling, ...coupling.sToQ },
+      atomChannels);
+    const qToS = mix(cond, tokens, maps.tokenCond, tokenRows, maps.centreOrPad,
+      { tensor: q, channels: atomChannels }, { tensor: a, channels: tokenChannels },
+      { ...coupling.sCoupling, ...coupling.qToS },
+      tokenChannels);
+    // (the fused mixers hand back the coupled state itself; the control arm the gated term, summed here)
+    const coupled = (term, base, rows, channels, label) => {
+      if (term.coupled !== undefined) return term.coupled;
+      const out = execution.allocate(rows * channels, `bioemu2.${label[0]}`);
+      execution.dispatch({
+        source: sumSource(rows * channels),
+        output: out,
+        inputs: { aTex: base, bTex: term.gated },
+        label: `bioemu2.${label}:${rows}x${channels}`,
+      });
+      execution.release(term.gated);
       return out;
     };
-    const sToQ = mix(condAtAtom, atoms, f.atomToTokenOrPad,
-      { tensor: a, channels: tokenChannels }, { tensor: q, channels: atomChannels },
-      { ...coupling.qCoupling, fc1: coupling.sToQ.fc1, fc2: coupling.sToQ.fc2,
-        fc3: coupling.sToQ.fc3 },
-      atomChannels);
-    const qToS = mix(cond, tokens, f.centreAtomOrPad,
-      { tensor: q, channels: atomChannels }, { tensor: a, channels: tokenChannels },
-      { ...coupling.sCoupling, fc1: coupling.qToS.fc1, fc2: coupling.qToS.fc2,
-        fc3: coupling.qToS.fc3 },
-      tokenChannels);
-    const mixedQ = execution.allocate(atoms * atomChannels, "bioemu2.q");
-    execution.dispatch({
-      source: sumSource(atoms * atomChannels),
-      output: mixedQ,
-      inputs: { aTex: q, bTex: sToQ },
-      label: `bioemu2.q-couple:${atoms}x${atomChannels}`,
-    });
-    const mixedA = execution.allocate(tokens * tokenChannels, "bioemu2.a");
-    execution.dispatch({
-      source: sumSource(tokens * tokenChannels),
-      output: mixedA,
-      inputs: { aTex: a, bTex: qToS },
-      label: `bioemu2.a-couple:${tokens}x${tokenChannels}`,
-    });
-    execution.release(sToQ);
-    execution.release(qToS);
+    const mixedQ = coupled(sToQ, q, atomRows, atomChannels, "q-couple");
+    const mixedA = coupled(qToS, a, tokenRows, tokenChannels, "a-couple");
     execution.release(q);
     execution.release(a);
     q = mixedQ;
     a = mixedA;
     call.onStage?.(`layer${layer}.q`, q);
     call.onStage?.(`layer${layer}.a`, a);
+    yield { stage: "denoiser-layer", layer };
   }
 
   // The readout: the atom stream plus the token stream at every atom.
   const hidden = w.readout.qToHidden.elements / atomChannels;
   const fromQ = linear(execution, {
-    x: q, weight: w.readout.qToHidden, rows: atoms, inChannels: atomChannels,
+    x: q, weight: w.readout.qToHidden, rows: atomRows, inChannels: atomChannels,
     outChannels: hidden, weightLayout: "out-major",
   });
   const fromA = linear(execution, {
-    x: a, weight: w.readout.sToHidden, rows: tokens, inChannels: tokenChannels,
+    x: a, weight: w.readout.sToHidden, rows: tokenRows, inChannels: tokenChannels,
     outChannels: hidden, weightLayout: "out-major",
   });
-  const atAtom = execution.allocate(atoms * hidden, "bioemu2.readout-at-atom");
+  const atAtom = execution.allocate(atomRows * hidden, "bioemu2.readout-at-atom");
   execution.dispatch({
-    source: gatherRowsSource(atoms, hidden),
+    source: gatherRowsSource(atomRows, hidden),
     output: atAtom,
-    inputs: { sourceTex: fromA, indexTex: f.atomToTokenOrPad },
-    label: `bioemu2.readout-gather:${atoms}x${hidden}`,
+    inputs: { sourceTex: fromA, indexTex: maps.atomToken },
+    label: `bioemu2.readout-gather:${atomRows}x${hidden}`,
   });
   execution.release(fromA);
-  const summed = execution.allocate(atoms * hidden, "bioemu2.readout");
+  const summed = execution.allocate(atomRows * hidden, "bioemu2.readout");
   execution.dispatch({
-    source: sumSource(atoms * hidden),
+    source: sumSource(atomRows * hidden),
     output: summed,
     inputs: { aTex: fromQ, bTex: atAtom },
-    label: `bioemu2.readout-add:${atoms}x${hidden}`,
+    label: `bioemu2.readout-add:${atomRows}x${hidden}`,
   });
   execution.release(fromQ);
   execution.release(atAtom);
   const normalised = layerNorm(execution, {
-    x: summed, weight: w.readout.outNormScale, rows: atoms, channels: hidden, epsilon,
+    x: summed, weight: w.readout.outNormScale, rows: atomRows, channels: hidden, epsilon,
   });
   execution.release(summed);
   const update = linear(execution, {
-    x: normalised, weight: w.readout.toOut, rows: atoms, inChannels: hidden,
+    x: normalised, weight: w.readout.toOut, rows: atomRows, inChannels: hidden,
     outChannels: 3, weightLayout: "out-major",
   });
   execution.release(normalised);
@@ -1333,21 +1993,23 @@ export function bioemu2Denoise(execution, call) {
   // 🔴 AND THE ANSWER IS THE EDM BLEND, not the update: c_skip * x + c_out * out.
   const cSkip = (sigmaData * sigmaData) / (sigma * sigma + sigmaData * sigmaData);
   const cOut = (sigma * sigmaData) / Math.sqrt(sigmaData * sigmaData + sigma * sigma);
-  const out = execution.allocate(atoms * 3, "bioemu2.denoised");
+  const out = execution.allocate(atomRows * 3, "bioemu2.denoised");
   execution.dispatch({
-    source: blendSource(atoms * 3),
+    source: blendSource(atomRows * 3),
     output: out,
     inputs: { aTex: x, bTex: update },
     floats: { keep: cSkip, take: cOut },
-    label: `bioemu2.blend:${atoms}`,
+    label: `bioemu2.blend:${atomRows}`,
   });
   execution.release(update);
   execution.release(q);
   execution.release(a);
   for (const tensor of temporary) execution.release(tensor);
+  if (own) prepared.release();
   out.label = "bioemu2.denoised";
   return out;
 }
+
 
 /** `out[row][c] = x[row][c] + row0[c]`. */
 const broadcastRowSourceUncached = (rows, channels) => `${PRELUDE}${ONE_TARGET}
@@ -1386,6 +2048,12 @@ export const sliceSource = memoSource(sliceSourceUncached);
 export const concatSource = memoSource(concatSourceUncached);
 export const gatherRowsSource = memoSource(gatherRowsSourceUncached);
 export const maskRowsSource = memoSource(maskRowsSourceUncached);
+export const gatherSliceSource = memoSource(gatherSliceSourceUncached);
+export const condAdaLnSource = memoSource(condAdaLnSourceUncached);
+export const statsSiluSource = memoSource(statsSiluSourceUncached);
+export const swigluSource = memoSource(swigluSourceUncached);
+export const fusedAttentionSource = memoSource(fusedAttentionSourceUncached);
+export const condGatedResidualSource = memoSource(condGatedResidualSourceUncached);
 export const splitAdaLnSource = memoSource(splitAdaLnSourceUncached);
 export const adaLnSource = memoSource(adaLnSourceUncached);
 export const pairBiasSource = memoSource(pairBiasSourceUncached);
