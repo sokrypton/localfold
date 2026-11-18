@@ -167,6 +167,12 @@
  *                         `in * out >= 65536` threshold rather than on the
  *                         aspect ratio - a threshold fitted with f32 weights
  *                         where every fold uses float16.
+ *   --short-block / --no-short-block
+ *                         An [out][in] projection of 8-63 rows blocked
+ *                         (Execution.shortBlock) rather than one texel a
+ *                         fragment. A BioEmu2 driver default: 2.18x a
+ *                         denoiser step at 58 tokens in Safari 16.3, Chrome
+ *                         unmoved, bit-identical in f32.
  *   --no-linear-tile      The int5 blocked projection's fragments in the 1D
  *                         `texel / RQ` order, so a rasterisation tile spans
  *                         every row block there is - 918 KiB of x under one
@@ -326,6 +332,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noContractWide: flag(args, "no-contract-wide"),
     noNormSplit: flag(args, "no-norm-split"),
     noLinearAspect: flag(args, "no-linear-aspect"),
+    shortBlock: flag(args, "short-block") || ((defaults.shortBlock ?? false) && !flag(args, "no-short-block")),
     noFramebufferReuse: flag(args, "no-framebuffer-reuse"),
     noLinearTile: flag(args, "no-linear-tile"),
     linearTileWidth: Number(option(args, "linear-tile-width", "0")),

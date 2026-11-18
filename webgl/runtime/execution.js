@@ -486,6 +486,9 @@ export class Execution {
      * fitted with f32 weights where every fold uses float16.
      */
     this.noLinearAspect = options.noLinearAspect ?? false;
+    // An [out][in] projection of 8-63 rows takes the blocked path (webgl/kernels/linear.js `linearBlocks`); off by
+    // default, on in the BioEmu2 drivers, where it is 2.18x a denoiser step at 58 tokens in Safari
+    this.shortBlock = options.shortBlock ?? false;
     this.noLinearTile = options.noLinearTile ?? false;
     // 🔴 OFF HERE AND ON IN THE FOLD DRIVERS, as `halfWeights` is - see
     // `padStride`, the only pass it reaches.

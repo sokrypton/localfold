@@ -686,6 +686,17 @@ function decodedInt5(execution, weight, shape) {
  * @returns {Tensor}
  */
 /**
+ * Whether `linear` takes the blocked path for this projection: `blockedApplies`, plus an int5 weight below 64 rows
+ * (its codes have no other kernel), plus - with `execution.shortBlock` - an `[out][in]` weight below 64 rows.
+ */
+function linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5) {
+  const aspect = !execution.noLinearAspect;
+  return blockedApplies(rows, inChannels, outChannels, weightLayout, aspect)
+    || ((int5 || (execution.shortBlock && rows >= 8 && weightLayout === "out-major"))
+      && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, aspect));
+}
+
+/**
  * The row stride (in texels) at which `linear` would pad x for this projection, or 0 where it would not - so a
  * producer can write x laid out that way itself (float16 where `execution.halfActivations` is set) and hand it over
  * as `xStride4`, saving the pad pass.
@@ -695,8 +706,7 @@ export function linearPaddedStride4(execution, { rows, inChannels, outChannels, 
   // without it this answers 0 for a shape `linear` will pad all the same
   const int5 = /** @type {any} */ (weight)?.int5 === true;
   if (execution.noLinearBlock || inChannels % 4 !== 0
-    || !(blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
-      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)))) {
+    || !linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5)) {
     return 0;
   }
   const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
@@ -769,8 +779,7 @@ export function linear(execution, call, into) {
   let weightTensor = weight;
   const codeWeight = /** @type {Int5Weight} */ (weight);
   const blocked = !execution.noLinearBlock
-    && (blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
-      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)));
+    && linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5);
   // 🔴 AN int5 WEIGHT BLOCKS BELOW 64 ROWS TOO, AND IS DECODED ONLY WHERE EVEN THAT DECLINES - because the codes have
   // no other kernel. This threw ("an int5 weight only has the blocked path"), which no fold here reached until BioEmu2
   // folded a chain under 64 residues on the page: its token stream projects 58 rows, and `blockedApplies` sends an

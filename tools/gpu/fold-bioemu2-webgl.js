@@ -3,7 +3,7 @@
 //     LOCALFOLD_GPU_TIMEOUT_MS=2700000 node tools/gpu-chrome.mjs tools/gpu/fold-bioemu2-webgl.js \
 //       --job=/tools/fixtures/bioemu2/6mrr-68.json --crystal=/tools/fixtures/6mrr-crystal.pdb \
 //       [--model=/model-bioemu2-int5] [--steps=20] [--samples=1] [--seed=1] [--passes=4]
-//       [--mixer-blocks=48] [--batch=5] [--pdb] [--allow-broken-geometry]
+//       [--mixer-blocks=48] [--batch=5] [--pdb] [--allow-broken-geometry] [--pause]
 //
 // 🔴 SCORE `6mrr-68.json` AGAINST THE CRYSTAL, NOT `6mrr.json`. The two fixtures
 // are the same protein at 68 and 71 residues and the crystal resolves 68 alpha
@@ -43,6 +43,7 @@ import { foldBioemu2OnWebGl2 } from "../../webgl/bioemu2/model/fold.js";
 import { bioemu2Batches, BIOEMU2_MAX_BATCH } from "../../cpu/bioemu2/sampler.js";
 import { webglExecution, webglProfile } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
+import { laggedPause } from "../../webgl/runtime/steps.js";
 import { superpose } from "./superpose.js";
 import { bondGeometry } from "./bond-geometry.js";
 import { assertChainGeometry, chainGeometryOf } from "./chain-geometry.js";
@@ -107,7 +108,8 @@ export async function main(device, args) {
   // AlphaFold 2 it is no faster at all while the worst atom against the WGSL
   // fold goes 0.0353 A to 0.0904 - past that comparison's own 0.0355 A dither
   // floor. `--no-narrow-aligned-x` is the arm.
-  const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true, narrowUnblockedX: true });
+  // (and the short-row blocked projection, the page's - web/bioemu2-webgl2.js; `--no-short-block` is the arm without)
+  const execution = webglExecution(gl, args ?? [], { narrowAlignedX: true, narrowUnblockedX: true, shortBlock: true });
   const settings = {
     steps: Number(option(args, "steps", "20")),
     samples: Number(option(args, "samples", "1")),
@@ -131,9 +133,25 @@ export async function main(device, args) {
     () => foldBioemu2OnWebGl2(execution, read, features, {
       ...settings, steps: 2, samples: bioemu2Batches(settings.samples, settings.batch).size }))).keys());
   const prepareMs = Math.round(performance.now() - prepareStart);
+  // 🔴 `--pause` IS THE PAGE'S DRIVE: web/bioemu2-webgl2.js lets go of the thread at every trunk block and denoiser
+  // layer through `laggedPause`, where this tool runs the generators straight through. With `--pool --pool-mib=512`
+  // it is the page's whole configuration, so a page-vs-tool gap can be split between the drive and the page.
+  // `stepMs` is the wall time of each sampler step, from the step callback (the median is the number to read).
+  const behind = args.includes("--pause") ? laggedPause(gl) : null;
+  const stepAt = [];
   const t1 = performance.now();
-  const result = await foldBioemu2OnWebGl2(execution, read, features, settings);
+  let result;
+  try {
+    result = await foldBioemu2OnWebGl2(execution, read, features, {
+      ...settings,
+      ...(behind === null ? {} : { pause: () => behind() }),
+      onStep: () => { stepAt.push(performance.now()); },
+    });
+  } finally {
+    behind?.finish();
+  }
   const foldMs = Math.round(performance.now() - t1);
+  const stepMs = stepAt.slice(1).map((t, i) => t - stepAt[i]).sort((a, b) => a - b);
 
   const conformers = await (await fetch("/tools/oracle/reference-conformers.json")).json();
   // 🔴 A NON-FINITE COORDINATE IS A FAILED FOLD, SAID HERE: chain-geometry's
@@ -179,7 +197,9 @@ export async function main(device, args) {
     steps: Number(option(args, "steps", "20")),
     samples: result.samples.length,
     denoiserCalls: result.calls,
-    ms: { featurise: featuriseMs, prepare: prepareMs, fold: foldMs },
+    ms: { featurise: featuriseMs, prepare: prepareMs, fold: foldMs,
+      stepMedian: stepMs.length ? Math.round(stepMs[stepMs.length >> 1]) : null,
+      stepMin: stepMs.length ? Math.round(stepMs[0]) : null, pause: behind !== null },
     stages: result.stages,
     peakMiB: result.peakMiB,
     perSample: scored.map((s) => ({
