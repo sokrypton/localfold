@@ -33,7 +33,9 @@
 import { BIOEMU2, BIOEMU2_SAMPLER } from "../../../shared/bioemu2/weights.js";
 import { trunkBlockWeights } from "../../../shared/esmfold2/weights.js";
 import { normalFrom } from "../../../shared/af3/random.js";
-import { bioemu2Schedule, sampleMany, centre } from "../../../cpu/bioemu2/sampler.js";
+import { bioemu2Schedule, bioemu2Batches, BIOEMU2_MAX_BATCH, sampleMany, centre }
+  from "../../../cpu/bioemu2/sampler.js";
+import { drain, drainAsync } from "../../runtime/steps.js";
 import { uploadTriangleWeights, releaseTriangleWeights }
   from "../../af3/trunk/triangle.js";
 import { uploadTransitionWeights, releaseTransitionWeights }
@@ -41,9 +43,9 @@ import { uploadTransitionWeights, releaseTransitionWeights }
 import { distogramLogits } from "../../esmfold2/distogram.js";
 import { inputEmbedder } from "../embedder.js";
 import { sequenceEmbedder } from "../sequence.js";
-import { trunkPass } from "../trunk.js";
+import { trunkPassSteps } from "../trunk.js";
 import { staticContext } from "../context.js";
-import { bioemu2Denoise } from "../denoiser.js";
+import { bioemu2DenoiseSteps } from "../denoiser.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -125,19 +127,50 @@ function group(execution, read) {
 }
 
 /**
+ * 🔴 ON THE PAGE IT LETS GO OF THE THREAD, AND A STOP KEEPS WHAT FINISHED. With `pause` the trunk yields after
+ * every pair block and the denoiser after every layer (`trunkPassSteps`, `bioemu2DenoiseSteps`), each yield awaiting
+ * `pause` - the page's `laggedPause`, one slice behind the GPU - and `signal` is checked at every one. Without it the
+ * same generators are drained straight through, which is what every tool and gate does. The samples are grouped into
+ * the WGSL fold's batches (`bioemu2Batches`) and `onSamples(frames, first)` hands each over as it lands; a stop (an
+ * AbortError from the signal or from a callback) once a batch has landed returns those with `stopped: true`, as
+ * webgpu/bioemu2/fold.js does. Whatever the fold had allocated when it threw is released before the error goes on,
+ * so a stopped fold leaves the context as it found it.
+ *
  * @param {import("../../runtime/execution.js").Execution} execution
  * @param {any} read a bundle reader, with its `.source(name)` for the codes a bundle reader
  * @param {any} features `shared/bioemu2/featurise.js`'s
  * @param {{steps?: number, samples?: number, seed?: number, passes?: number,
  *   mode?: "structure" | "equilibrium", stepScale?: number, epsilon?: number,
- *   mixerBlocks?: number, onStage?: (name: string, detail?: any) => void,
- *   onStep?: (step: number, steps: number) => void}} [options]
+ *   mixerBlocks?: number, batch?: number, onStage?: (name: string, detail?: any) => void,
+ *   onTrunk?: (done: number, total: number) => void,
+ *   onContacts?: (contact: Float32Array) => void,
+ *   onSamples?: (frames: Float32Array[], first: number) => void | Promise<void>,
+ *   pause?: (yielded: any) => Promise<void>, signal?: AbortSignal,
+ *   onStep?: (step: number, steps: number, denoised: Float32Array) => void | Promise<void>}} [options]
  * @returns {Promise<{samples: Float32Array[], contact: Float32Array,
  *   distogram: Float32Array, tokens: number, atoms: number, calls: number,
  *   stages: [string, number][], mode: string, stepScale: number,
- *   peakMiB: number}>}
+ *   peakMiB: number, stopped: boolean, batches: number, batchSize: number}>}
  */
 export async function foldBioemu2OnWebGl2(execution, read, features, options = {}) {
+  // every tensor this fold leaves behind if it throws is one not live now (the uploader groups release theirs on the
+  // way through, but a throw mid-stage would strand a stage's weights and activations in a context the page keeps)...
+  const before = new Set(execution.storage.live);
+  // ...and so does a stop part-way through a walk, which returns the batches before it: the walk's own denoiser call
+  // was abandoned inside its generator with its temporaries live. A fold that ran to the end has released everything
+  // already, so this finds nothing.
+  try {
+    return await foldSteps(execution, read, features, options);
+  } finally {
+    for (const tensor of [...execution.storage.live]) {
+      if (!before.has(tensor)) execution.release(tensor);
+    }
+  }
+}
+
+async function foldSteps(execution, read, features, options) {
+  const run = (steps) => (options.pause === undefined ? drain(steps)
+    : drainAsync(steps, options.pause, options.signal));
   const f = features;
   const tokens = f.res_type.length;
   const atoms = f.atom_pad_mask.length;
@@ -307,12 +340,14 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
       single: execution.zeros(tokens * BIOEMU2.single, "bioemu2.s-prev"),
     };
     const passes = options.passes ?? BIOEMU2.trunkPasses;
+    const perPass = msaBlocks.length + mixerBlocks.length;
     for (let pass = 0; pass < passes; pass += 1) {
-      const out = trunkPass(execution, {
+      const out = await run(trunkPassSteps(execution, {
         zInit, sInit, m0: embedded.m0, zPrev: previous.pair, sPrev: previous.single,
         pairMask, tokens, sequences, valid: embedded.valid, weights,
         msaBlocks, mixerBlocks, epsilon,
-      });
+        onBlock: (index) => options.onTrunk?.(pass * perPass + index + 1, passes * perPass),
+      }));
       execution.release(previous.pair);
       execution.release(previous.single);
       previous = out;
@@ -370,6 +405,7 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
     }
     return { logits: values, contact: near };
   });
+  options.onContacts?.(contact);
 
   // --- the denoiser's static context --------------------------------------
   const contextWeights = group(execution, read);
@@ -549,10 +585,10 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   const denoise = async (stacked, sigma) => {
     calls += 1;
     const x = execution.upload(Float32Array.from(stacked), "bioemu2.x");
-    const out = bioemu2Denoise(execution, {
+    const out = await run(bioemu2DenoiseSteps(execution, {
       x, sigma, features: deviceFeatures, context, sInputs, sTrunk,
       weights, dims, hostFourier, epsilon,
-    });
+    }));
     const values = Float32Array.from(execution.read(out));
     execution.release(out);
     execution.release(x);
@@ -565,20 +601,37 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   const normal = normalFrom(options.seed ?? 1);
   const mask = Int32Array.from(f.atom_mask);
   const samples = [];
+  const wanted = options.samples ?? 1;
+  // the WGSL fold's batches, so a page hands each over as that fold does; here a batch is `size` walks in turn
+  const { batches, size } = bioemu2Batches(wanted, options.batch ?? BIOEMU2_MAX_BATCH);
+  let stopped = false;
   await clock("sample", async () => {
-    for (let index = 0; index < (options.samples ?? 1); index += 1) {
-      // 🔴 ONE SAMPLE A CALL. The WGSL denoiser compiles for a batch of S and
-      // runs them sample-major in one call; this one takes a single frame, so an
-      // ensemble is S walks of the same compiled programs - the same arithmetic,
-      // S times the draws, in the same order, because `sampleMany` consumes the
-      // generator step by step either way.
-      const walked = await sampleMany({
-        denoise, setCompanion: () => {}, mask, N: atoms, S: 1, schedule,
-        stepScale, normal, companions: null,
-        onStep: (step, total) => options.onStep?.(step, total),
-      });
-      samples.push(centre(walked[0], mask, atoms));
-      options.onStage?.("sample", index + 1);
+    for (let batch = 0; batch < batches && samples.length < wanted && !stopped; batch += 1) {
+      const landed = [];
+      try {
+        for (let index = 0; index < size && samples.length + landed.length < wanted; index += 1) {
+          // 🔴 ONE SAMPLE A CALL. The WGSL denoiser compiles for a batch of S and
+          // runs them sample-major in one call; this one takes a single frame, so an
+          // ensemble is S walks of the same compiled programs - the same arithmetic,
+          // S times the draws, in the same order, because `sampleMany` consumes the
+          // generator step by step either way.
+          const walked = await sampleMany({
+            denoise, setCompanion: () => {}, mask, N: atoms, S: 1, schedule,
+            stepScale, normal, companions: null,
+            onStep: (step, total, denoised) => options.onStep?.(step, total, denoised),
+          });
+          landed.push(centre(walked[0], mask, atoms));
+          options.onStage?.("sample", samples.length + landed.length);
+        }
+      } catch (error) {
+        // a stop part-way through a batch keeps the batches that landed before it, and only those
+        if (error?.name !== "AbortError" || samples.length === 0) throw error;
+        stopped = true;
+        break;
+      }
+      const first = samples.length;
+      samples.push(...landed);
+      await options.onSamples?.(landed, first);
     }
   });
 
@@ -592,5 +645,6 @@ export async function foldBioemu2OnWebGl2(execution, read, features, options = {
   return {
     samples, contact, distogram: logits, tokens, atoms, calls, stages, mode,
     stepScale, peakMiB: Math.round(execution.stats().peakBytes / 1048576),
+    stopped, batches, batchSize: size,
   };
 }

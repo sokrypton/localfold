@@ -39,6 +39,7 @@
  * all before anyone adds one.
  */
 import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
+import { drain } from "../runtime/steps.js";
 import { BIOEMU2 } from "../../shared/bioemu2/weights.js";
 import { layerNorm } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
@@ -389,6 +390,11 @@ void main() {
  *   release - and its inputs for the next pass
  */
 export function trunkPass(execution, call) {
+  return drain(trunkPassSteps(execution, call));
+}
+
+/** `trunkPass` as a generator that yields after each pair block: the same draws, for a caller that lets go between. */
+export function* trunkPassSteps(execution, call) {
   const {
     zInit, sInit, m0, zPrev, sPrev, pairMask, tokens, sequences, valid,
     weights: w, msaBlocks, mixerBlocks, epsilon = 1e-5,
@@ -459,6 +465,7 @@ export function trunkPass(execution, call) {
     execution.release(z);
     z = next;
     call.onBlock?.(index);
+    yield { stage: "trunk-block" };
   }
   execution.release(msa);
   for (const [index, block] of mixerBlocks.entries()) {
@@ -469,6 +476,7 @@ export function trunkPass(execution, call) {
     execution.release(z);
     z = next;
     call.onBlock?.(msaBlocks.length + index);
+    yield { stage: "trunk-block" };
   }
   z.label = "bioemu2.z";
   s.label = "bioemu2.s";

@@ -221,6 +221,22 @@ export function preloadWebGl2Weights(weights) {
 }
 
 /**
+ * Let the resident AF3-lineage weights go, and the pool with them (the page folds with a model this file does not
+ * fold, whose own WebGL2 context would otherwise run beside ~800 MB of these). The next fold uploads again.
+ */
+export async function releaseWebGl2Weights() {
+  if (resident === null || execution === null) return;
+  const previous = resident;
+  resident = null;
+  try {
+    releaseAf3Weights(execution, await previous.ready);
+  } catch {
+    // an upload that failed holds nothing to release
+  }
+  execution.storage.drainPool();
+}
+
+/**
  * @param {object} batch the featurised batch
  * @param {object} weights web/af3-model.js `loadAf3Weights`'s tree
  * @param {{steps: number, recycles?: number, seed?: number, templateSlots?: object[],

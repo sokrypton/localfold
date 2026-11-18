@@ -3948,3 +3948,48 @@ attention 128 -> 516 and triangle 128 -> 512 the largest, x-bound as "The dense 
 locality" says), the flash attention 12%, LayerNorm at 128 channels 11% (the statistics split is a measured loss at
 this width), the q/k/v/g split 6% and the triangle operands 6% - its incoming direction a third slower than its
 outgoing one, from the transposed read.
+
+## 🔴 2026-11-17: BioEmu2 on the page in WebGL2
+
+The page folds BioEmu2 without WebGPU now (`web/bioemu2-webgl2.js`, beside `web/af2-webgl2.js`): the same call shape
+and result as webgpu/bioemu2/fold.js's `foldBioemu2` - `samples` in the page's order, `contact`, `stopped` - so
+`foldWithBioemu2` chooses a driver and nothing else. Structure and Equilibrium fold; **Propagate is refused by name**
+(the WebGL2 sampler carries no companion frame), at the gate before the download and again in the adapter. The page
+has no steered sampler or potentials control on a local fold (`bioemu2-sampler` is read only on the native path), so
+there is nothing else to refuse.
+
+What the port needed for a page:
+
+- **The thread let go inside the fold.** `trunkPassSteps` yields after every pair block and `bioemu2DenoiseSteps` after
+  every one of the 16 layers (`trunkPass`/`bioemu2Denoise` drain them, so every gate is unchanged - the tool's fold is
+  CA-CA 3.8529611222441167 before and after); the fold awaits `laggedPause` at each yield and checks the signal there.
+- **Batches and Stop as the WGSL fold has them.** Samples are grouped by `bioemu2Batches` and `onSamples` fires per
+  batch; a stop once a batch has landed returns it with `stopped: true`. Whatever a fold has live when it throws or
+  stops part-way through a walk is released (a snapshot of `storage.live`), so a stopped fold leaves the context clean.
+- **The live frames for free**: `sampleMany` already hands each step's denoised estimate to `onStep`, on the host.
+- **No resident weights, and the pool drained after each fold** - see the adapter's header. A context between folds
+  holds its programs and nothing else; a change of model on the WebGL2 path also lets the AF3 lineage's and
+  AlphaFold 2's resident weights go (`releaseWebGl2Weights`, `releaseAf2WebGl2`).
+
+🔴 **AND A CHAIN UNDER 64 RESIDUES DID NOT FOLD AT ALL**: `linear: an int5 weight only has the blocked path, and
+58x128x512 does not take it`. Every bioemu2 measurement here was at 68 tokens; the page's default example is 58, and
+the token stream projects one row a token. An int5 weight now blocks below 64 rows too (decoded only where even that
+declines): 58 residues, 20 steps, `fold-bioemu2-webgl.js --pool --pool-mib=512`, **15.6 s at 680 MiB** blocked from the
+codes against 27.9 s at 1332 MiB decoded to f16 and one-texel. Only a shape that used to throw moves.
+
+The texture pool (`AF3_POOL_LIMIT_BYTES`) on the tool, 68 tokens, 20 steps, Chrome on an M2: 25.1 -> 20.2 s, peak 411
+-> 739 MiB, the fold identical to the last digit.
+
+**Through the page**, 58 residues (the page's own example), the page's defaults (200 steps, 3 recycles, single
+sequence), M2, `fold-in-page.py --remote-weights --model bioemu2 --msa-mode none --recycles 3 --steps 200` with and
+without `--no-webgpu`, and `tools/fold-in-safari.py` in Safari 16.3. Every sample passes the physicality report and
+every ensemble's CA-CA medians are 3.865-3.871 A on both backends:
+
+| | 1 sample | 5 samples |
+|---|---:|---:|
+| Chrome, WebGPU | 41.6 s | 90.3 s (one batch of five) |
+| Chrome, WebGL2 | **117.0 s** (2.8x) | **512.3 s** (5.7x - five walks in turn) |
+| Safari 16.3, WebGL2 | **280.2 s** | **1258.4 s** |
+
+Safari's sampler step is 1.22 s against Chrome's ~0.5, and its progress reading moves on every one of the 200 steps.
+A Stop 200 s into an 8-sample, 25-step Safari fold returned "4 of 8 samples (stopped)" 0.18 s after the press.

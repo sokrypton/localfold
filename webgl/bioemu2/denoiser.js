@@ -39,6 +39,7 @@
  * this port be handed the same ones.
  */
 import { ONE_TARGET, PRELUDE, memoSource } from "../runtime/execution.js";
+import { drain } from "../runtime/steps.js";
 import { layerNorm, layerNormStatsSource } from "../kernels/layer-norm.js";
 import { linear } from "../kernels/linear.js";
 
@@ -990,6 +991,14 @@ export function windowAttention(execution, call) {
  * @returns {Tensor} `atoms * 3`; the caller's to release
  */
 export function bioemu2Denoise(execution, call) {
+  return drain(bioemu2DenoiseSteps(execution, call));
+}
+
+/**
+ * `bioemu2Denoise` as a generator that yields after each of the 16 layers, so the page can let go of its thread
+ * inside a denoiser call (~0.8 s at 68 tokens on an M2) - the same draws in the same order; `drain` is the call.
+ */
+export function* bioemu2DenoiseSteps(execution, call) {
   const {
     x, sigma, features: f, context, sInputs, sTrunk, weights: w, dims,
     epsilon = 1e-5,
@@ -1290,6 +1299,7 @@ export function bioemu2Denoise(execution, call) {
     a = mixedA;
     call.onStage?.(`layer${layer}.q`, q);
     call.onStage?.(`layer${layer}.a`, a);
+    yield { stage: "denoiser-layer", layer };
   }
 
   // The readout: the atom stream plus the token stream at every atom.
