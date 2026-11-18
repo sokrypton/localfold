@@ -40,7 +40,7 @@
  * holds this decoder to `readTensor` element by element on real bundle tensors,
  * not to a tolerance.
  */
-import { tensorElements } from "../../shared/weights/dtype.js";
+import { tensorElements, float16Values } from "../../shared/weights/dtype.js";
 import { memoSource } from "./execution.js";
 
 /** Bytes of codes in one group: 32 codes x 5 bits. */
@@ -66,7 +66,11 @@ export const INT5_GROUP_WORDS = INT5_GROUP_BYTES / 4;
 export function int5WeightSource(record, buffer, byteOffset) {
   if (record.dtype !== "int5" || record.block !== INT5_GROUP) return null;
   if (!Number.isInteger(record.scaleOffset) || !Number.isInteger(record.zeroOffset)) return null;
-  if (typeof globalThis.Float16Array !== "function") return null;
+  // 🔴 NO `Float16Array` IS NOT A REASON TO DECLINE THE CODES, AND IT WAS - IN EVERY SAFARI THIS BACKEND EXISTS FOR.
+  // Safari before 18.2 has no Float16Array, so this returned null there and every int5 weight fell back to the host
+  // decode and a float16 texture: 2.3x the bytes a projection streams, and every Safari WebGL2 fold (AlphaFold 2 and
+  // 3, BioEmu2) ran the float16 kernels its Chrome twin had replaced. The scales are read through `float16Values`,
+  // the host decode's own reader, so the two still agree by construction.
   const elements = tensorElements(record);
   // 🔴 ONLY A WHOLE NUMBER OF GROUPS. A tensor whose last group is short is
   // legal in the format and `readTensor` handles it, but the kernel's address
@@ -85,11 +89,11 @@ export function int5WeightSource(record, buffer, byteOffset) {
   const words = new Uint32Array(groups * INT5_GROUP_WORDS);
   new Uint8Array(words.buffer).set(codeBytes);
 
-  // Read through Float16Array so the float32 values are exactly the ones
-  // `readTensor` multiplies by; a hand-rolled conversion here would be a second
+  // Read through the host decode's own float16 reader (a Float16Array view where there is one), so the float32
+  // values are exactly the ones `readTensor` multiplies by; a conversion of its own here would be a second
   // implementation of the one thing both sides must agree about.
-  const scales = new globalThis.Float16Array(buffer, scaleAt, groups);
-  const zeros = new globalThis.Float16Array(buffer, zeroAt, groups);
+  const scales = float16Values(buffer, scaleAt, groups);
+  const zeros = float16Values(buffer, zeroAt, groups);
   const scaleZero = new Float32Array(groups * 2);
   for (let group = 0; group < groups; group += 1) {
     scaleZero[group * 2] = scales[group];

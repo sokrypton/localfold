@@ -86,6 +86,15 @@ function rangeHalves(buffer, byteOffset, firstGroup, lastGroup) {
   return halves(buffer, byteOffset + firstGroup * 2, Math.max(0, lastGroup - firstGroup));
 }
 
+/**
+ * `length` float16 values at `byteOffset`, as `halves` reads them: a Float16Array view, or the same values widened
+ * into a Float32Array where the runtime has no Float16Array (Safari before 18.2). Exported so a device packer reading
+ * a quantised bundle's float16 scales agrees with this host decode by construction - webgl/runtime/int5.js.
+ */
+export function float16Values(buffer, byteOffset, length) {
+  return halves(buffer, byteOffset, length);
+}
+
 function halves(buffer, byteOffset, length) {
   if (typeof Float16Array === "function") return view(Float16Array, buffer, byteOffset, length);
   const bits = view(Uint16Array, buffer, byteOffset, length);

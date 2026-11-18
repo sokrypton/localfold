@@ -167,6 +167,12 @@
  *                         `in * out >= 65536` threshold rather than on the
  *                         aspect ratio - a threshold fitted with f32 weights
  *                         where every fold uses float16.
+ *   --short-block / --no-short-block
+ *                         An [out][in] projection of 8-63 rows blocked
+ *                         (Execution.shortBlock) rather than one texel a
+ *                         fragment. A BioEmu2 driver default: 2.18x a
+ *                         denoiser step at 58 tokens in Safari 16.3, Chrome
+ *                         unmoved, bit-identical in f32.
  *   --no-linear-tile      The int5 blocked projection's fragments in the 1D
  *                         `texel / RQ` order, so a rasterisation tile spans
  *                         every row block there is - 918 KiB of x under one
@@ -226,6 +232,13 @@
  *                         group rather than row block, so neighbours walk
  *                         different weight rows and the weight is streamed
  *                         again for every row block.
+ *   --no-row-fastest-weight
+ *                         Row block fastest only under ROW_FASTEST_X_FLOATS,
+ *                         not also where x is no bigger than the weight - the
+ *                         rule before a five-sample batch's 2880 x 896 -> 3584
+ *                         mixer took it (6% a step in Chrome, 2-3% in Safari).
+ *   --row-fastest-floats=<n>
+ *                         That cap, forced. Bit-identical either way.
  *   --no-stride-pad       x laid at its own row width rather than padded to a
  *                         stride that divides the texture width. Worth 4.08x
  *                         on a shape whose width does not - the single largest
@@ -318,6 +331,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noTriangleCoalesce: flag(args, "no-triangle-coalesce"),
     noContractBlock: flag(args, "no-contract-block"),
     noRowFastest: flag(args, "no-row-fastest"),
+    noRowFastestWeight: flag(args, "no-row-fastest-weight"),
     noStridePad: flag(args, "no-stride-pad"),
     noContractChannelSlowest: flag(args, "no-contract-channel-slowest"),
     noContractCeiling: flag(args, "no-contract-ceiling"),
@@ -326,6 +340,10 @@ export function webglExecutionOptions(args, defaults = {}) {
     noContractWide: flag(args, "no-contract-wide"),
     noNormSplit: flag(args, "no-norm-split"),
     noLinearAspect: flag(args, "no-linear-aspect"),
+    // `--row-fastest-floats=<n>`: the int5 projection's row-block-fastest cap (ROW_FASTEST_X_FLOATS), forced
+    rowFastestXFloats: option(args, "row-fastest-floats", null) === null ? (defaults.rowFastestXFloats ?? null)
+      : Number(option(args, "row-fastest-floats", "0")),
+    shortBlock: flag(args, "short-block") || ((defaults.shortBlock ?? false) && !flag(args, "no-short-block")),
     noFramebufferReuse: flag(args, "no-framebuffer-reuse"),
     noLinearTile: flag(args, "no-linear-tile"),
     linearTileWidth: Number(option(args, "linear-tile-width", "0")),

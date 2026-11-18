@@ -40,9 +40,15 @@ function executionFor() {
   // creates and deletes its output texture through the browser's GPU process. Measured with that tool (6MRR, 68
   // tokens, 20 steps, Chrome on an M2): 25.1 s -> 20.2 s with `--pool --pool-mib=512`, the peak 411 -> 739 MiB, and the
   // same fold to the last digit (CA-CA 3.8529611222441167 both ways).
+  // 🔴 AND `shortBlock`, WHICH IS WHAT MADE A CHAIN UNDER 64 RESIDUES TWICE AS SLOW A STEP IN SAFARI AS ONE OVER IT.
+  // Below 64 rows `blockedApplies` sends an [out][in] projection to the one-texel kernel, and every token-stream
+  // projection of the denoiser is [out][in] at the chain's length: in Safari 16.3 on an M2 that kernel is 2-2.5x the
+  // blocked one at these widths (58 x 768 -> 6144: 15.4 ms a call against ~6.6 at 68 rows blocked), so 58 residues
+  // stepped at 1144 ms where 68 stepped at 586. Blocked: 525 ms (2.18x), bit-identical in f32 (the same sums in the
+  // same order - check-webgl-bioemu2-denoiser.js at 10 and 13 tokens), and Chrome unmoved (357 / 358 ms).
   execution ??= new Execution(createWebGL2Context(),
     { halfWeights: true, halfActivations: true, int5Weights: true, narrowAlignedX: true, narrowUnblockedX: true,
-      anyFit: true, pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES });
+      anyFit: true, pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES, shortBlock: true });
   return execution;
 }
 

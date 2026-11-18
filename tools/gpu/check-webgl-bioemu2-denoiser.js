@@ -2,7 +2,7 @@
  * BioEmu2's denoiser in WebGL2 against `cpu/bioemu2/denoiser.js`.
  *
  *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-bioemu2-denoiser.js [--falsify] [--no-weight-stack] [--qkvg-stack]
- *       [--no-cond-fuse] [--no-attend-fuse] [--no-token-row-cond] [--no-prepadded-x]
+ *       [--no-cond-fuse] [--no-attend-fuse] [--no-token-row-cond] [--no-prepadded-x] [--no-short-block]
  *       (the denoiser's own arms of tools/gpu/webgl-execution-options.js, on an f32 Execution)
  *
  * 🔴 EVERY WEIGHT IN THIS MODEL IS OUT-MAJOR, which is the opposite of every
@@ -251,6 +251,8 @@ export async function main(device, args) {
   const execution = new Execution(gl, {
     noCondFuse: flag(args, "no-cond-fuse"), noAttendFuse: flag(args, "no-attend-fuse"),
     noTokenRowCond: flag(args, "no-token-row-cond"), noPrepaddedX: flag(args, "no-prepadded-x"),
+    // the fold drivers' short-row blocked projection (Execution.shortBlock); `--no-short-block` is the one-texel arm
+    shortBlock: !flag(args, "no-short-block"),
   });
   const held = [];
   const upload = (values, label) => {

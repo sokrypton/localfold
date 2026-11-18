@@ -686,6 +686,17 @@ function decodedInt5(execution, weight, shape) {
  * @returns {Tensor}
  */
 /**
+ * Whether `linear` takes the blocked path for this projection: `blockedApplies`, plus an int5 weight below 64 rows
+ * (its codes have no other kernel), plus - with `execution.shortBlock` - an `[out][in]` weight below 64 rows.
+ */
+function linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5) {
+  const aspect = !execution.noLinearAspect;
+  return blockedApplies(rows, inChannels, outChannels, weightLayout, aspect)
+    || ((int5 || (execution.shortBlock && rows >= 8 && weightLayout === "out-major"))
+      && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, aspect));
+}
+
+/**
  * The row stride (in texels) at which `linear` would pad x for this projection, or 0 where it would not - so a
  * producer can write x laid out that way itself (float16 where `execution.halfActivations` is set) and hand it over
  * as `xStride4`, saving the pad pass.
@@ -695,8 +706,7 @@ export function linearPaddedStride4(execution, { rows, inChannels, outChannels, 
   // without it this answers 0 for a shape `linear` will pad all the same
   const int5 = /** @type {any} */ (weight)?.int5 === true;
   if (execution.noLinearBlock || inChannels % 4 !== 0
-    || !(blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
-      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)))) {
+    || !linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5)) {
     return 0;
   }
   const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
@@ -769,8 +779,7 @@ export function linear(execution, call, into) {
   let weightTensor = weight;
   const codeWeight = /** @type {Int5Weight} */ (weight);
   const blocked = !execution.noLinearBlock
-    && (blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
-      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)));
+    && linearBlocks(execution, rows, inChannels, outChannels, weightLayout, int5);
   // 🔴 AN int5 WEIGHT BLOCKS BELOW 64 ROWS TOO, AND IS DECODED ONLY WHERE EVEN THAT DECLINES - because the codes have
   // no other kernel. This threw ("an int5 weight only has the blocked path"), which no fold here reached until BioEmu2
   // folded a chain under 64 residues on the page: its token stream projects 58 rows, and `blockedApplies` sends an
@@ -793,8 +802,16 @@ export function linear(execution, call, into) {
     // bioemu2's atom projection and **436** for AF2's pair track, so every
     // output texel lands on its own cache line. The order is only worth having
     // where the block count is small enough that the repack survives it.
+    // 🔴 AND PAST THE CAP STILL WHERE x IS THE SMALLER OPERAND, which is the rule the cap stands in for. A batch of
+    // five BioEmu2 samples puts the s-to-q mixer at 2880 x 896 -> 3584: x 2.6 M floats, the weight 3.2 M, so x is
+    // the operand that should stream and the cap sent it group-fastest. Ordered row block fastest: a five-sample step
+    // 1610 -> 1507 ms in Chrome and 1543 -> 1498 in Safari 16.3 on an M2 (68 tokens, two rounds each), bit-identical.
+    // The trunk's pair projections (x 1.2-4.7 M floats against a 262 K weight) stay group-fastest.
+    // `--no-row-fastest-weight` is the cap alone; `--row-fastest-floats=<n>` forces the cap.
+    const xFloats = rows * inChannels;
     const rowFastestClassic = int5 && !execution.noRowFastest
-      && rows * inChannels <= ROW_FASTEST_X_FLOATS;
+      && (xFloats <= (execution.rowFastestXFloats ?? ROW_FASTEST_X_FLOATS)
+        || (!execution.noRowFastestWeight && xFloats <= inChannels * outChannels));
     // 🔴 x's ROW STRIDE PADDED TO DIVIDE THE TEXTURE WIDTH, which is 4.08x on
     // every shape whose input width does not - see webgl/runtime/pad-stride.js.
     // One pass over x against sixty milliseconds of cache misses; measured, the

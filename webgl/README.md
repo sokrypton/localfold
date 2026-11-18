@@ -4061,6 +4061,9 @@ medians 3.865-3.869 A:
 | Safari 16.3, WebGL2, before | 280.2 s | 1258.4 s |
 | Safari 16.3, WebGL2, now | **270.2 s** | **400.2 s** |
 
+🔴 **(FOUND AND FIXED THE NEXT DAY - see "Safari at Chrome's speed" below: it was the chain length and a missing
+`Float16Array`, not the page.)** The note as it was written:
+
 🔴 **AND SAFARI'S PAGE STEP IS TWICE ITS TOOL STEP, WHICH NONE OF THIS TOUCHES.** The same code in Safari 16.3 runs a
 sampler step in ~0.6 s at 68 tokens through `run-in-safari.py` and ~1.2 s at 58 tokens on the page, so the one-sample
 page fold moved only 280 -> 270 s while the tool moved 1.36x (five samples share the step, which is why that row
@@ -4074,3 +4077,55 @@ What is left, Chrome profile at one sample: the dense projections - `576x896x179
 mixer's `2880x896x3584` is past `ROW_FASTEST_X_FLOATS` and runs group-fastest untiled; raising that cap to 4M floats
 was ~6% on the five-sample fold in one Chrome run, bit-identical, and is not taken: it is a shared kernel's rule and
 was measured on one shape.
+
+## 🔴 2026-11-18: BioEmu2 in Safari at Chrome's speed - the "page gap" was the chain length and a missing `Float16Array`
+
+The open question above was why Safari 16.3 stepped at ~1.2 s on the page and ~0.6 s in the tool. Split piece by piece
+in the tool first (`fold-bioemu2-webgl.js --pause`, the page's `laggedPause` drive, and `--pool --pool-mib=512`, its
+pool), Safari 16.3, M2, 68 tokens, 10 steps:
+
+| arm | step median | trunk stage |
+|---|---:|---:|
+| the tool's own configuration | 654 ms | 15.8 s |
+| `--pause` (the page's drive) | 654 ms | 17.7 s |
+| `--pool --pool-mib=512` (the page's pool) | 585 ms | 6.5 s |
+| both - the page's whole configuration | 586 ms | 6.5 s |
+
+and the page itself on the same 68-residue sequence stepped at **600 ms over all 200 steps**. So the page cost nothing;
+the gap was the INPUT: the page's default example is 58 residues and the tool's fixture 68, and the tool stepped at
+**1144 ms** given the 58-residue job. Chrome scales normally (357 ms at 58, 424 at 68). Two causes, both Safari's:
+
+- **A token projection under 64 rows took the one-texel kernel.** `blockedApplies` sends an `[out][in]` projection
+  below 64 rows to it, and every denoiser token-stream projection is `[out][in]` at the chain's length. Safari runs
+  that kernel 2-2.5x slower than the blocked one at these widths (58 x 768 -> 6144: 987 ms over 64 calls against 420
+  for 68 rows blocked); Chrome does not care. `Execution.shortBlock` blocks an `[out][in]` projection of 8-63 rows,
+  on in both BioEmu2 drivers (`--no-short-block`): 58 tokens **1144 -> 525 ms** in Safari, Chrome 357 / 358,
+  bit-identical in f32 (`check-webgl-bioemu2-denoiser.js` at 10 and 13 tokens, which now runs the blocked path).
+- **Safari kept no int5 codes at all.** `int5WeightSource` returned null without `Float16Array` (Safari before 18.2)
+  for the group scales, so every int5 weight fell back to the host decode and a float16 texture in exactly the
+  browsers this backend is for: 2.3x the bytes a projection streams, ~3.5 s of decode and upload before the first
+  step, ~450 MiB more peak. The scales are read through shared/weights/dtype.js's `float16Values` now (its own exact
+  widening without the type). 58 tokens **525 -> 357 ms**, 68 tokens 586 -> 426, the denoiser weights 3.8 -> 0.3 s,
+  peak 1124 -> 683 MiB; `check-webgl-int5-decode.js` in Safari: 21,233,664 elements, 0 differing. Only BioEmu2 keeps
+  codes, so AF2 and AF3 are unmoved (AF2 in Safari pLDDT 57.937 either way).
+
+And one for both browsers: the int5 projection orders row block fastest wherever x is no bigger than the weight, not
+only under `ROW_FASTEST_X_FLOATS` - a five-sample batch's `2880x896x3584` mixer was past the cap. Five samples, a step:
+Chrome 1611 -> 1515 ms (68 tokens), 1334 -> 1250 (58); Safari 1540 -> 1503, 1284 -> 1243; bit-identical
+(`--no-row-fastest-weight`).
+
+The page, 58 residues, 200 steps, single sequence, local weights, `fold-in-safari.py` / `fold-in-page.py --no-webgpu`,
+`main` (bfb79f71) against this branch, every sample passing physicality:
+
+| | 1 sample | 5 samples |
+|---|---:|---:|
+| Safari 16.3, before | 247.7 s | 380.6 s |
+| Safari 16.3, now | **77.6 s** | **257.3 s** |
+| Chrome, WebGL2, before | 74.0 s | 269.1 s |
+| Chrome, WebGL2, now | 74.0 s | **251.6 s** |
+
+(the table above this section was taken with `--remote-weights`, so its seconds include the download.) Ruled out on
+the way: the page's pauses (654 ms a step with and without), the viewer and live frames (the page stepped as the tool
+did at 68 residues), and Safari's per-kernel outliers (with both fixes every label runs within 1.5-2.6x of Chrome's
+under the per-draw-waiting profile, and the unprofiled steps are equal). `bioemu2.pair-bias` read 254 ms a call in
+Safari before the int5 fix and 26 after, so that one was memory pressure from the float16 weights, not the kernel.
