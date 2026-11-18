@@ -23,6 +23,8 @@
 import { foldAf2, releaseAf2Weights, uploadAf2Weights } from "../webgl/af2/model/fold.js";
 import { paeCentres } from "../webgl/heads/confidence.js";
 import { createWebGL2Context } from "../webgl/runtime/context.js";
+import { laggedPause } from "../webgl/runtime/steps.js";
+import { AF3_POOL_LIMIT_BYTES } from "../webgl/af3/model/fold-batch.js";
 import { Execution } from "../webgl/runtime/execution.js";
 import { tmScoresFromTerm } from "../webgpu/heads/confidence.js";
 import { makeA3mFeatures } from "../shared/input/a3m-features.js";
@@ -33,9 +35,14 @@ let execution = null;
 let resident = null; // { weights, uploaded }
 
 function executionFor() {
-  // The configuration tools/gpu/fold-af2-webgl.js gates against the WGSL fold (`webglExecutionOptions` with no flags).
+  // The configuration tools/gpu/fold-af2-webgl.js gates against the WGSL fold, with the AF3 path's texture pool.
+  // 🔴 THE POOL IS MOST OF THE SPEED, AND IT WAS OFF. Without it every one of a fold's ~17,000 draws created and
+  // deleted its output texture, a round trip through the browser's GPU process each. The page's default AlphaFold 2
+  // example (59 residues, the 8076-row search drawn 128:256, 4 passes) on an M2: Safari 16.3 29.0 -> 12.3-12.8 s, Chrome
+  // 17.4 -> 12.1 s, pLDDT 95.288 either way, the peak 395 -> 499 MiB. The AF3 path's bound (AF3_POOL_LIMIT_BYTES).
   execution ??= new Execution(createWebGL2Context(),
-    { halfWeights: true, halfActivations: true, int5Weights: true, anyFit: true });
+    { halfWeights: true, halfActivations: true, int5Weights: true, anyFit: true,
+      pooling: true, poolLimitBytes: AF3_POOL_LIMIT_BYTES });
   return execution;
 }
 
@@ -133,25 +140,37 @@ export class AlphaFoldWebGl2 {
     await run.prepare((await run.collectPrograms(() => foldAf2(run, call))).keys());
     if (signal?.aborted) throw abortError();
 
-    await foldAf2(run, {
-      ...call,
-      onBlock: () => {
-        completed += 1;
-        onProgress?.({ completed, total, waiting: false });
-      },
-      onRecycle: (raw, recycle) => {
-        const now = performance.now();
-        const pass = asPass(raw, { length, chainLengths, paeBreaks, elapsedMilliseconds: now - passStart });
-        passStart = now;
-        passes.push(pass);
-        onRecycle?.(pass, recycle);
-      },
-      // Every draw is issued synchronously, so the page gets its frames back between stages here - and a Stop.
-      yieldTo: async () => {
-        await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-        if (signal?.aborted) throw abortError();
-      },
-    });
+    // 🔴 ONE BLOCK BEHIND THE GPU, NEVER DRAINED (webgl/runtime/steps.js laggedPause, the AF3 path's own pause): every
+    // Evoformer block waits for the block before it to FINISH, so the page repaints, Stop is seen and the percentage is
+    // the GPU's - where the 48 main-stack blocks used to be issued in one synchronous run (the bar stood, then jumped).
+    const behind = laggedPause(run.gl);
+    try {
+      await foldAf2(run, {
+        ...call,
+        blockPause: async () => {
+          await behind();
+          if (signal?.aborted) throw abortError();
+        },
+        onBlock: () => {
+          completed += 1;
+          onProgress?.({ completed, total, waiting: false });
+        },
+        onRecycle: (raw, recycle) => {
+          const now = performance.now();
+          const pass = asPass(raw, { length, chainLengths, paeBreaks, elapsedMilliseconds: now - passStart });
+          passStart = now;
+          passes.push(pass);
+          onRecycle?.(pass, recycle);
+        },
+        // Every draw is issued synchronously, so the page gets its frames back between stages here - and a Stop.
+        yieldTo: async () => {
+          await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+          if (signal?.aborted) throw abortError();
+        },
+      });
+    } finally {
+      behind.finish();
+    }
     return {
       recycles: passes, final: passes[passes.length - 1], resumable: undefined,
       elapsedMilliseconds: performance.now() - start,
