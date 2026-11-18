@@ -124,6 +124,14 @@
  *   --no-attend-dot4      bioemu2's two attentions walking their head
  *                         dimension with one fetch1 a channel, twice over -
  *                         four times the texelFetch for the same numbers.
+ *   --no-token-row-cond   bioemu2's denoiser conditioning its atom stream at
+ *                         every ATOM row of every sample (the token rows
+ *                         gathered first, then LN, silu and the GEMMs), as it
+ *                         did, where it now projects the T + 1 token rows once
+ *                         and gathers the slices. Exact in f32; with the
+ *                         fold's float16 x the two arms differ by the narrowed
+ *                         rounding (worst atom 0.056 A at 20 steps, 0.001 A
+ *                         with --no-half-x).
  *   --no-combine          Every kernel its own program, where a fold packs the
  *                         light ones into combined programs (`Execution.combine`).
  *                         A link costs ~40 ms on this M2's Chrome whatever the
@@ -309,6 +317,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     linearBlockRows: Number(option(args, "block-rows", "0")),
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),
+    noTokenRowCond: flag(args, "no-token-row-cond"),
     noCombine: flag(args, "no-combine"),
     combineBytes: Number(option(args, "combine-bytes", "0")),
     poolLabelPattern: pattern("pool-labels"),

@@ -414,6 +414,43 @@ export async function main(device, args) {
     if (!(value > 1e-3)) failures.push(`${name} is INERT: ${value}`);
   }
 
+  // 🔴 AND A BATCH IS ITS SAMPLES, EACH: three different inputs stacked sample-major through ONE call must give,
+  // sample by sample, what three calls give - the attention reading another sample's keys, a gather taking a
+  // neighbour's token row or a mask read at the wrong period all return a plausible tensor of the right shape. The
+  // bar is ZERO differing floats: every kernel here computes a row from that row alone. (Not under `--falsify`,
+  // which perturbs the input and not the batching.)
+  const batch = {};
+  if (!falsify) {
+    const others = [noise(atoms * 3, 10), noise(atoms * 3, 4)];
+    const singles = [x, ...others];
+    const stacked = new Float32Array(singles.length * atoms * 3);
+    singles.forEach((values, s) => stacked.set(values, s * atoms * 3));
+    const sigma = 16;
+    const each = singles.map((values, s) => {
+      if (s === 0) return answers[sigma];
+      const one = upload(values, `bioemu2.x${s}`);
+      const out = bioemu2Denoise(execution, { ...inputs, x: one, sigma, features, context, weights, dims, hostFourier });
+      const answer = Float32Array.from(execution.read(out));
+      execution.release(out);
+      return answer;
+    });
+    const together = upload(stacked, "bioemu2.x-batch");
+    const out = bioemu2Denoise(execution, { ...inputs, x: together, sigma, features, context, weights, dims, hostFourier });
+    const all = Float32Array.from(execution.read(out));
+    execution.release(out);
+    let differing = 0;
+    each.forEach((answer, s) => {
+      for (let i = 0; i < answer.length; i += 1) if (all[s * atoms * 3 + i] !== answer[i]) differing += 1;
+    });
+    // ...and the samples must DIFFER from each other, or a batch that read sample 0 three times would pass
+    const apart = relativeRms(each[1], each[0], "samples");
+    batch.samples = singles.length;
+    batch.differing = differing;
+    batch.samplesApart = Number(apart.toPrecision(3));
+    if (differing !== 0) failures.push(`a batch of ${singles.length}: ${differing} floats differ from the single calls`);
+    if (!(apart > 1e-3)) failures.push(`the batch's samples are INERT: ${apart}`);
+  }
+
   for (const tensor of held) execution.release(tensor);
   if (execution.stats().live !== 0) {
     failures.push(`${execution.stats().live} tensors left live`);
@@ -432,6 +469,7 @@ export async function main(device, args) {
     falsify,
     arms,
     separations,
+    batch,
     memory: execution.stats(),
     verdict: falsify
       ? (red === arms.length

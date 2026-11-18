@@ -3,7 +3,7 @@
 //     LOCALFOLD_GPU_TIMEOUT_MS=2700000 node tools/gpu-chrome.mjs tools/gpu/fold-bioemu2-webgl.js \
 //       --job=/tools/fixtures/bioemu2/6mrr-68.json --crystal=/tools/fixtures/6mrr-crystal.pdb \
 //       [--model=/model-bioemu2-int5] [--steps=20] [--samples=1] [--seed=1] [--passes=4]
-//       [--mixer-blocks=48] [--pdb] [--allow-broken-geometry]
+//       [--mixer-blocks=48] [--batch=5] [--pdb] [--allow-broken-geometry]
 //
 // 🔴 SCORE `6mrr-68.json` AGAINST THE CRYSTAL, NOT `6mrr.json`. The two fixtures
 // are the same protein at 68 and 71 residues and the crystal resolves 68 alpha
@@ -40,6 +40,7 @@ import { bundleReader } from "../../shared/bioemu2/weights.js";
 import { bioemu2Pdb, alphaCarbonSpacings } from "../../shared/bioemu2/structure.js";
 import { fetchComponents, smilesTemplates } from "../../shared/bioemu2/inputs.js";
 import { foldBioemu2OnWebGl2 } from "../../webgl/bioemu2/model/fold.js";
+import { bioemu2Batches, BIOEMU2_MAX_BATCH } from "../../cpu/bioemu2/sampler.js";
 import { webglExecution, webglProfile } from "./webgl-execution-options.js";
 import { createWebGL2Context } from "../../webgl/index.js";
 import { superpose } from "./superpose.js";
@@ -113,6 +114,8 @@ export async function main(device, args) {
     seed: Number(option(args, "seed", "1")),
     passes: Number(option(args, "passes", "4")),
     mixerBlocks: Number(option(args, "mixer-blocks", "48")),
+    // samples a denoiser call carries (`bioemu2Batches`); 1 is the control arm, the walks in turn
+    batch: Number(option(args, "batch", String(BIOEMU2_MAX_BATCH))),
     mode,
   };
   // 🔴 THE PROGRAMS FIRST, TOGETHER. A dry run on virtual tensors - no textures, no draws - says
@@ -124,7 +127,9 @@ export async function main(device, args) {
   await execution.prepare((await execution.collectPrograms(
     // Two steps and one sample: the fewest the sampler takes, and every program a longer
     // schedule draws with (a step is the same slice again).
-    () => foldBioemu2OnWebGl2(execution, read, features, { ...settings, steps: 2, samples: 1 }))).keys());
+    // (and one BATCH, at the fold's own batch size: the denoiser's sources carry its rows)
+    () => foldBioemu2OnWebGl2(execution, read, features, {
+      ...settings, steps: 2, samples: bioemu2Batches(settings.samples, settings.batch).size }))).keys());
   const prepareMs = Math.round(performance.now() - prepareStart);
   const t1 = performance.now();
   const result = await foldBioemu2OnWebGl2(execution, read, features, settings);

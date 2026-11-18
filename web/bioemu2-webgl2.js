@@ -29,6 +29,7 @@ import { createWebGL2Context } from "../webgl/runtime/context.js";
 import { laggedPause } from "../webgl/runtime/steps.js";
 import { AF3_POOL_LIMIT_BYTES } from "../webgl/af3/model/fold-batch.js";
 import { Execution } from "../webgl/runtime/execution.js";
+import { bioemu2Batches } from "../cpu/bioemu2/sampler.js";
 
 let execution = null;
 /** The programs prepared so far, by the feature shape that reached them (a kernel's source carries its sizes). */
@@ -66,17 +67,17 @@ export async function foldBioemu2WebGl2(read, features, options = {}) {
 
   // The programs this fold draws with, linked off the thread before the first draw - a dry run of two steps and one
   // sample reaches every one (tools/gpu/fold-bioemu2-webgl.js's order); a second fold of the same shape finds them.
-  const shape = `${features.res_type.length}:${features.atom_pad_mask.length}:${features.msa.length}`;
+  // (and by the batch: the denoiser's sources carry a batch's rows, so the dry run walks one batch of that size)
+  const { size } = bioemu2Batches(samples);
+  const shape = `${features.res_type.length}:${features.atom_pad_mask.length}:${features.msa.length}:${size}`;
   if (!prepared.has(shape)) {
     await run.prepare((await run.collectPrograms(
-      () => foldBioemu2OnWebGl2(run, read, features, { ...call, steps: 2, samples: 1 }))).keys());
+      () => foldBioemu2OnWebGl2(run, read, features, { ...call, steps: 2, samples: size }))).keys());
     prepared.add(shape);
   }
   if (signal?.aborted) throw abortError();
 
   const behind = laggedPause(run.gl);
-  const total = steps * samples;
-  let done = 0;
   try {
     return await foldBioemu2OnWebGl2(run, read, features, {
       ...call,
@@ -84,10 +85,8 @@ export async function foldBioemu2WebGl2(read, features, options = {}) {
       pause: () => behind(),
       onTrunk: (block, blocks) => progress("trunk", block, blocks),
       onContacts: options.onContacts,
-      onStep: (_, __, denoised) => {
-        done += 1;
-        return progress("diffusion", done, total, denoised);
-      },
+      // (steps over every batch, and the batch's denoised estimate - webgpu/bioemu2/fold.js's progress exactly)
+      onStep: (done, total, denoised) => progress("diffusion", done, total, denoised),
       onSamples: options.onSamples,
     });
   } finally {

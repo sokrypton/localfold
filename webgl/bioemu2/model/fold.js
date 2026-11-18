@@ -45,7 +45,7 @@ import { inputEmbedder } from "../embedder.js";
 import { sequenceEmbedder } from "../sequence.js";
 import { trunkPassSteps } from "../trunk.js";
 import { staticContext } from "../context.js";
-import { bioemu2DenoiseSteps } from "../denoiser.js";
+import { bioemu2DenoiseSteps, bioemu2DenoiserPrepare } from "../denoiser.js";
 
 /** @typedef {import("../../runtime/storage.js").Tensor} Tensor */
 
@@ -146,7 +146,9 @@ function group(execution, read) {
  *   onContacts?: (contact: Float32Array) => void,
  *   onSamples?: (frames: Float32Array[], first: number) => void | Promise<void>,
  *   pause?: (yielded: any) => Promise<void>, signal?: AbortSignal,
- *   onStep?: (step: number, steps: number, denoised: Float32Array) => void | Promise<void>}} [options]
+ *   onStep?: (done: number, total: number, denoised: Float32Array) => void | Promise<void>}} [options]
+ *   `onStep` counts sampler steps over every batch (`total` is steps x batches) and hands the step's denoised
+ *   estimate of the whole batch, `size x atoms x 3`, sample-major - as webgpu/bioemu2/fold.js's progress does.
  * @returns {Promise<{samples: Float32Array[], contact: Float32Array,
  *   distogram: Float32Array, tokens: number, atoms: number, calls: number,
  *   stages: [string, number][], mode: string, stepScale: number,
@@ -582,12 +584,21 @@ async function foldSteps(execution, read, features, options) {
     sigmaData: BIOEMU2.sigmaData,
   };
   let calls = 0;
+  // what every denoiser call reads and no sampler step changes, made once for the walks of one batch size
+  const preparedBy = new Map();
+  const preparedFor = (samples) => {
+    if (!preparedBy.has(samples)) {
+      preparedBy.set(samples, bioemu2DenoiserPrepare(execution, {
+        features: deviceFeatures, context, sInputs, sTrunk, weights, dims, samples, epsilon }));
+    }
+    return preparedBy.get(samples);
+  };
   const denoise = async (stacked, sigma) => {
     calls += 1;
     const x = execution.upload(Float32Array.from(stacked), "bioemu2.x");
     const out = await run(bioemu2DenoiseSteps(execution, {
       x, sigma, features: deviceFeatures, context, sInputs, sTrunk,
-      weights, dims, hostFourier, epsilon,
+      weights, dims, hostFourier, epsilon, prepared: preparedFor(stacked.length / (atoms * 3)),
     }));
     const values = Float32Array.from(execution.read(out));
     execution.release(out);
@@ -602,39 +613,45 @@ async function foldSteps(execution, read, features, options) {
   const mask = Int32Array.from(f.atom_mask);
   const samples = [];
   const wanted = options.samples ?? 1;
-  // the WGSL fold's batches, so a page hands each over as that fold does; here a batch is `size` walks in turn
+  // the WGSL fold's batches: `size` samples walk together through ONE denoiser call a step, as webgpu/bioemu2/fold.js
+  // runs them, and a page is handed each batch as it lands
   const { batches, size } = bioemu2Batches(wanted, options.batch ?? BIOEMU2_MAX_BATCH);
+  const total = (schedule.length - 1) * batches;
+  let done = 0;
   let stopped = false;
   await clock("sample", async () => {
-    for (let batch = 0; batch < batches && samples.length < wanted && !stopped; batch += 1) {
-      const landed = [];
+    for (let batch = 0; batch < batches && !stopped; batch += 1) {
+      let landed;
       try {
-        for (let index = 0; index < size && samples.length + landed.length < wanted; index += 1) {
-          // 🔴 ONE SAMPLE A CALL. The WGSL denoiser compiles for a batch of S and
-          // runs them sample-major in one call; this one takes a single frame, so an
-          // ensemble is S walks of the same compiled programs - the same arithmetic,
-          // S times the draws, in the same order, because `sampleMany` consumes the
-          // generator step by step either way.
-          const walked = await sampleMany({
-            denoise, setCompanion: () => {}, mask, N: atoms, S: 1, schedule,
-            stepScale, normal, companions: null,
-            onStep: (step, total, denoised) => options.onStep?.(step, total, denoised),
-          });
-          landed.push(centre(walked[0], mask, atoms));
-          options.onStage?.("sample", samples.length + landed.length);
-        }
+        // 🔴 A BATCH IS ONE WALK OF `size` SAMPLES, NOT `size` WALKS IN TURN. The denoiser stacks them sample-major
+        // (`bioemu2DenoiseSteps`), so a step is one call's draws over `size` times the rows where it was `size`
+        // calls - the draws are what a WebGL2 step costs. `sampleMany` draws its noise sample by sample within a
+        // step, which is the WGSL fold's order; `batch: 1` is the control arm, the walks in turn as they were.
+        const walked = await sampleMany({
+          denoise, setCompanion: () => {}, mask, N: atoms, S: size, schedule,
+          stepScale, normal, companions: null,
+          onStep: (step, steps, denoised) => {
+            done += 1;
+            return options.onStep?.(done, total, denoised);
+          },
+        });
+        landed = walked.map((x) => centre(x, mask, atoms));
       } catch (error) {
         // a stop part-way through a batch keeps the batches that landed before it, and only those
         if (error?.name !== "AbortError" || samples.length === 0) throw error;
         stopped = true;
         break;
       }
+      // the last batch may carry samples nobody asked for (bioemu2Batches); they are dropped here
+      landed = landed.slice(0, wanted - samples.length);
       const first = samples.length;
       samples.push(...landed);
+      options.onStage?.("sample", samples.length);
       await options.onSamples?.(landed, first);
     }
   });
 
+  for (const prepared of preparedBy.values()) prepared.release();
   denoiser.release();
   for (const tensor of Object.values(deviceFeatures)) execution.release(tensor);
   execution.release(sInputs);

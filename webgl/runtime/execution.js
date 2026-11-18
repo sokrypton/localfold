@@ -520,6 +520,8 @@ export class Execution {
      * which is four times the texelFetch for the same numbers.
      */
     this.noAttendDot4 = options.noAttendDot4 ?? false;
+    /** bioemu2's denoiser conditioning its atom stream at every atom row - see `bioemu2DenoiseSteps`. */
+    this.noTokenRowCond = options.noTokenRowCond ?? false;
     /**
      * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every
      * kernel its own program, as this backend did before it had any. A link costs ~40 ms on this
