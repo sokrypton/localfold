@@ -690,9 +690,15 @@ function decodedInt5(execution, weight, shape) {
  * producer can write x laid out that way itself (float16 where `execution.halfActivations` is set) and hand it over
  * as `xStride4`, saving the pad pass.
  */
-export function linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout = "out-major" }) {
+export function linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout = "out-major", weight }) {
+  // `weight`, where the caller has it: an int5 weight takes the blocked path below 64 rows too (see `linear`), so
+  // without it this answers 0 for a shape `linear` will pad all the same
+  const int5 = /** @type {any} */ (weight)?.int5 === true;
   if (execution.noLinearBlock || inChannels % 4 !== 0
-    || !blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)) return 0;
+    || !(blockedApplies(rows, inChannels, outChannels, weightLayout, !execution.noLinearAspect)
+      || (int5 && blockedApplies(Math.max(rows, 64), inChannels, outChannels, weightLayout, !execution.noLinearAspect)))) {
+    return 0;
+  }
   const padX = !execution.noStridePad && !strideDividesWidth(inChannels / 4);
   const narrowX = execution.halfActivations && execution.narrowAlignedX && !padX;
   return padX || narrowX ? strideFor(inChannels / 4) : 0;
@@ -708,7 +714,7 @@ export function linear(execution, call, into) {
   // batched tensor at `row * stride4 + at4 + group` - AdaLN-zero's gate, in the projection's own last draw
   // `xStride4`: x arrives ALREADY laid at that row stride (`linearPaddedStride4`), so the pad pass is skipped
   if (givenStride4 > 0) {
-    if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout })) {
+    if (givenStride4 !== linearPaddedStride4(execution, { rows, inChannels, outChannels, weightLayout, weight })) {
       throw new RangeError(`linear: x laid at stride ${givenStride4 * 4}, which this projection would not pad to`);
     }
     if (call.x.elements !== rows * givenStride4 * 4) {

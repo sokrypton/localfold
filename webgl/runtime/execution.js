@@ -522,6 +522,11 @@ export class Execution {
     this.noAttendDot4 = options.noAttendDot4 ?? false;
     /** bioemu2's denoiser conditioning its atom stream at every atom row - see `bioemu2DenoiseSteps`. */
     this.noTokenRowCond = options.noTokenRowCond ?? false;
+    /** bioemu2's adaLN and gated residuals taking slices drawn first - see `conditionedLayer`. */
+    this.noCondFuse = options.noCondFuse ?? false;
+    /** bioemu2's attentions reading sliced q, k, v and a gate tensor - see `fusedAttention`. */
+    this.noAttendFuse = options.noAttendFuse ?? false;
+
     /**
      * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every
      * kernel its own program, as this backend did before it had any. A link costs ~40 ms on this

@@ -132,6 +132,14 @@
  *                         fold's float16 x the two arms differ by the narrowed
  *                         rounding (worst atom 0.056 A at 20 steps, 0.001 A
  *                         with --no-half-x).
+ *   --no-cond-fuse        bioemu2's adaLN conditioning sliced into alpha, beta
+ *                         and gate tensors first and the gated residual as a
+ *                         product and a sum, where the fused kernels read
+ *                         them out of the projection (12 draws a layer to 2).
+ *   --no-attend-fuse      bioemu2's denoiser attentions slicing q, k and v, adding
+ *                         the query bias, taking the sigmoid gate and its
+ *                         product in draws of their own, where one draw reads
+ *                         the projections and writes the gated output.
  *   --no-combine          Every kernel its own program, where a fold packs the
  *                         light ones into combined programs (`Execution.combine`).
  *                         A link costs ~40 ms on this M2's Chrome whatever the
@@ -318,6 +326,8 @@ export function webglExecutionOptions(args, defaults = {}) {
     noPairBiasFast: flag(args, "no-pair-bias-fast"),
     noAttendDot4: flag(args, "no-attend-dot4"),
     noTokenRowCond: flag(args, "no-token-row-cond"),
+    noCondFuse: flag(args, "no-cond-fuse"),
+    noAttendFuse: flag(args, "no-attend-fuse"),
     noCombine: flag(args, "no-combine"),
     combineBytes: Number(option(args, "combine-bytes", "0")),
     poolLabelPattern: pattern("pool-labels"),
