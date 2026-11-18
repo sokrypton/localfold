@@ -1,7 +1,9 @@
 /**
  * BioEmu2's denoiser in WebGL2 against `cpu/bioemu2/denoiser.js`.
  *
- *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-bioemu2-denoiser.js [--falsify]
+ *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-bioemu2-denoiser.js [--falsify] [--no-weight-stack]
+ *       [--no-cond-fuse] [--no-attend-fuse] [--no-token-row-cond] [--no-prepadded-x]
+ *       (the denoiser's own arms of tools/gpu/webgl-execution-options.js, on an f32 Execution)
  *
  * 🔴 EVERY WEIGHT IN THIS MODEL IS OUT-MAJOR, which is the opposite of every
  * other model in this tree: the reference's `linear` reads `weight[o * inF + k]`
@@ -245,7 +247,11 @@ export async function main(device, args) {
   put("readout/to_out_1/weight", noise(hidden * 3, 0.3 / Math.sqrt(hidden)), [3, hidden]);
 
   const gl = createWebGL2Context();
-  const execution = new Execution(gl);
+  // f32 throughout (the reference's bar), with the denoiser's own control arms reachable
+  const execution = new Execution(gl, {
+    noCondFuse: flag(args, "no-cond-fuse"), noAttendFuse: flag(args, "no-attend-fuse"),
+    noTokenRowCond: flag(args, "no-token-row-cond"), noPrepaddedX: flag(args, "no-prepadded-x"),
+  });
   const held = [];
   const upload = (values, label) => {
     const tensor = execution.upload(Float32Array.from(values), label);
@@ -253,10 +259,33 @@ export async function main(device, args) {
     return tensor;
   };
   const layerTensor = (name, layer) => upload(stacks[name].slice(layer), `w.${name}.${layer}`);
+  // 🔴 A SwiGLU AS THE FOLD UPLOADS IT: fc1 and fc2 stacked into ONE out-major weight (`fc12`), which is what
+  // `transitionNoNorm`'s one-projection path reads; `--no-weight-stack` is the two-projection path.
+  const stackSwiglu = !flag(args, "no-weight-stack");
+  const swiglu = (fc1, fc2, fc3, label) => {
+    if (!stackSwiglu) return { fc1: upload(fc1, `${label}.fc1`), fc2: upload(fc2, `${label}.fc2`), fc3: upload(fc3, `${label}.fc3`) };
+    const both = new Float32Array(fc1.length + fc2.length);
+    both.set(fc1, 0);
+    both.set(fc2, fc1.length);
+    return { fc12: upload(both, `${label}.fc12`), fc3: upload(fc3, `${label}.fc3`) };
+  };
+  const layerSwiglu = (prefix, layer) => swiglu(stacks[`${prefix}/fc1/weight`].slice(layer),
+    stacks[`${prefix}/fc2/weight`].slice(layer), stacks[`${prefix}/fc3/weight`].slice(layer), `w.${prefix}.${layer}`);
   const attentionTree = (prefix, layer) => {
     const names = attentionNames(prefix);
-    return Object.fromEntries(Object.entries(names)
+    const tree = Object.fromEntries(Object.entries(names)
+      .filter(([key]) => !stackSwiglu || flag(args, "no-attend-fuse") || (key !== "projQkv" && key !== "projG"))
       .map(([key, name]) => [key, layerTensor(name, layer)]));
+    // ...and [proj_qkv; proj_g] stacked, as the fold uploads it for the fused attention
+    if (stackSwiglu && !flag(args, "no-attend-fuse")) {
+      const qkv = stacks[names.projQkv].slice(layer);
+      const g = stacks[names.projG].slice(layer);
+      const both = new Float32Array(qkv.length + g.length);
+      both.set(qkv, 0);
+      both.set(g, qkv.length);
+      tree.projQkvg = upload(both, `w.${prefix}.qkvg.${layer}`);
+    }
+    return tree;
   };
   const streamTree = (prefix, attn, layer) => ({
     cond0Scale: layerTensor(`${prefix}/cond_0/weight`, layer),
@@ -264,11 +293,7 @@ export async function main(device, args) {
     cond2Weight: layerTensor(`${prefix}/cond_2/weight`, layer),
     cond2Bias: layerTensor(`${prefix}/cond_2/bias`, layer),
     attention: attentionTree(attn, layer),
-    transition: {
-      fc1: layerTensor(`${prefix}/transition/fc1/weight`, layer),
-      fc2: layerTensor(`${prefix}/transition/fc2/weight`, layer),
-      fc3: layerTensor(`${prefix}/transition/fc3/weight`, layer),
-    },
+    transition: layerSwiglu(`${prefix}/transition`, layer),
   });
   const weights = {
     singleConditioner: {
@@ -287,9 +312,8 @@ export async function main(device, args) {
       transitions: conditionerTransitions.map((prefix) => ({
         normScale: upload(flat[`${prefix}/norm/weight`].data, `w.${prefix}.norm`),
         normOffset: upload(flat[`${prefix}/norm/bias`].data, `w.${prefix}.norm-b`),
-        fc1: upload(flat[`${prefix}/fc1/weight`].data, `w.${prefix}.fc1`),
-        fc2: upload(flat[`${prefix}/fc2/weight`].data, `w.${prefix}.fc2`),
-        fc3: upload(flat[`${prefix}/fc3/weight`].data, `w.${prefix}.fc3`),
+        ...swiglu(flat[`${prefix}/fc1/weight`].data, flat[`${prefix}/fc2/weight`].data,
+          flat[`${prefix}/fc3/weight`].data, `w.${prefix}`),
       })),
     },
     rToQ: upload(flat["atom_feature_embedder/r_to_q_trans/weight"].data, "w.r-to-q"),
@@ -314,16 +338,8 @@ export async function main(device, args) {
         cond2Weight: layerTensor("layers/coupling/s_coupling_cond_2/weight", layer),
         cond2Bias: layerTensor("layers/coupling/s_coupling_cond_2/bias", layer),
       },
-      sToQ: {
-        fc1: layerTensor("layers/coupling/s_to_q_mixer/fc1/weight", layer),
-        fc2: layerTensor("layers/coupling/s_to_q_mixer/fc2/weight", layer),
-        fc3: layerTensor("layers/coupling/s_to_q_mixer/fc3/weight", layer),
-      },
-      qToS: {
-        fc1: layerTensor("layers/coupling/q_to_s_mixer/fc1/weight", layer),
-        fc2: layerTensor("layers/coupling/q_to_s_mixer/fc2/weight", layer),
-        fc3: layerTensor("layers/coupling/q_to_s_mixer/fc3/weight", layer),
-      },
+      sToQ: layerSwiglu("layers/coupling/s_to_q_mixer", layer),
+      qToS: layerSwiglu("layers/coupling/q_to_s_mixer", layer),
     })),
     readout: {
       qToHidden: upload(flat["readout/q_to_hidden/weight"].data, "w.q-to-hidden"),

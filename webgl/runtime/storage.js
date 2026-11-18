@@ -540,9 +540,36 @@ export class Storage {
    *   what `read.source(name)` / `HttpTensorStore.tensorSource(name)` returns
    */
   uploadInt5Weight(source, label = "weight") {
+    return this.uploadInt5Weights([source], label);
+  }
+
+  /**
+   * Several int5 tensors as ONE weight, their codes and group tables end to end - so out-major `[out][in]` weights
+   * of one input width become one projection with their outputs side by side (a SwiGLU's fc1 and fc2 in one GEMM).
+   * Each part is a whole number of groups (`int5WeightSource` refuses otherwise), so a part's codes start on a group
+   * boundary and decode exactly as they did alone. Null where any part is not int5 or the whole is under the floor.
+   */
+  uploadInt5Weights(sources, label = "weight") {
     if (!this.int5Weights) return null;
-    const extracted = int5WeightSource(source.record, source.buffer, source.byteOffset);
-    if (extracted === null) return null;
+    const parts = sources.map((source) => int5WeightSource(source.record, source.buffer, source.byteOffset));
+    if (parts.length === 0 || parts.some((part) => part === null)) return null;
+    const extracted = parts.length === 1 ? parts[0] : (() => {
+      const words = new Uint32Array(parts.reduce((total, part) => total + part.words.length, 0));
+      const scaleZero = new Float32Array(parts.reduce((total, part) => total + part.scaleZero.length, 0));
+      let wordAt = 0;
+      let tableAt = 0;
+      for (const part of parts) {
+        words.set(part.words, wordAt);
+        scaleZero.set(part.scaleZero, tableAt);
+        wordAt += part.words.length;
+        tableAt += part.scaleZero.length;
+      }
+      return {
+        words, scaleZero,
+        groups: parts.reduce((total, part) => total + part.groups, 0),
+        elements: parts.reduce((total, part) => total + part.elements, 0),
+      };
+    })();
     const { words, scaleZero, groups, elements } = extracted;
     if (elements < HALF_WEIGHT_FLOOR) return null;
     const codes = this.allocateWords(words.length, `${label}.codes`);

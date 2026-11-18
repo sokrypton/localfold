@@ -125,6 +125,61 @@ void main() {
   result = x / (vec4(1.0) + exp(-x));
 }`;
 
+/**
+ * `out = silu(LN(x) * scale + offset)` with the row statistics READ (`layerNormStatsSource`'s, made once a step for
+ * the conditioning every layer normalises): `layerNorm`'s split apply and the silu draw's arithmetic, in one draw, at
+ * the conditioning GEMM's x layout (`stridedTexel`).
+ */
+const statsSiluSourceUncached = (rows, channels, s4) => `${PRELUDE}${ONE_TARGET}
+const int C4 = ${channels / 4};
+const int ELEMENTS = ${rows * channels};
+uniform sampler2D xTex;
+uniform sampler2D statsTex;
+uniform sampler2D weightTex;
+uniform sampler2D biasTex;
+
+void main() {
+  ${stridedTexel(channels / 4, s4)}
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int row = texel / C4;
+  int group = texel - row * C4;
+  vec2 stats = fetch4(statsTex, row).xy;
+  vec4 value = fetch4(xTex, texel);
+  vec4 w = fetch4(weightTex, group);
+  vec4 b = fetch4(biasTex, group);
+  vec4 normalised = (value - stats.x) * stats.y * w + b;
+  result = normalised / (vec4(1.0) + exp(-normalised));
+}`;
+
+/**
+ * silu(LN(conditioning)) for a conditioning GEMM, at its x layout: one draw over shared `stats` where there are
+ * some (and not under `--no-cond-fuse`), otherwise `layerNorm` and a silu draw.
+ */
+function conditioningInput(execution, { conditioning, stats, rows, channels, scale, offset, consumers, epsilon }) {
+  const s4 = sharedXStride4(execution, rows, channels, consumers);
+  const activated = allocateX(execution, rows, channels, s4, "bioemu2.cond-silu");
+  if (stats !== undefined && stats !== null && channels % 4 === 0 && !execution.noCondFuse) {
+    execution.dispatch({
+      source: statsSiluSource(rows, channels, s4),
+      output: activated,
+      inputs: { xTex: conditioning, statsTex: stats, weightTex: scale, biasTex: offset },
+      label: `bioemu2.cond-ln-silu:${rows}x${channels}`,
+    });
+    return activated;
+  }
+  const normalised = layerNorm(execution, {
+    x: conditioning, weight: scale, bias: offset, rows, channels, epsilon,
+  });
+  execution.dispatch({
+    source: siluSource(rows * channels, channels / 4, s4),
+    output: activated,
+    inputs: { xTex: normalised },
+    label: `bioemu2.cond-silu:${rows * channels}`,
+  });
+  execution.release(normalised);
+  return activated;
+}
+
 /** `out = sigmoid(x)`. */
 const sigmoidSourceUncached = (elements) => `${PRELUDE}${ONE_TARGET}
 const int ELEMENTS = ${elements};
@@ -776,8 +831,9 @@ function allocateX(execution, rows, channels, stride4, label) {
 }
 
 /** The two projections an attention reads its input through (`projections`), as `sharedXStride4` consumers. */
-const attentionReaders = (w, channels) => [
-  { outChannels: 3 * channels, weight: w.projQkv }, { outChannels: channels, weight: w.projG }];
+const attentionReaders = (w, channels) => (w.projQkvg !== undefined
+  ? [{ outChannels: 4 * channels, weight: w.projQkvg }]
+  : [{ outChannels: 3 * channels, weight: w.projQkv }, { outChannels: channels, weight: w.projG }]);
 
 /** `linear`, told the layout its x was written at (`allocateX`). */
 const project = (execution, call) => linear(execution, { ...call, xStride4: call.x.xStride4 ?? 0 });
@@ -837,10 +893,10 @@ export function condGatedResidual(execution, { x, branch, cond, map, condWidth, 
  * in the same order: q is the same sum and the gate the same sigmoid times the same quotient. `--no-attend-fuse` is
  * the arm. `window` true is the atoms' windowed form, false the tokens' full one.
  */
-const fusedAttentionSourceUncached = (window, rows, channels, heads, samples, s4) => `${PRELUDE}${ONE_TARGET}
+const fusedAttentionSourceUncached = (window, rows, channels, heads, samples, s4, stacked = false) => `${PRELUDE}${ONE_TARGET}
 const int ROWS = ${rows};
 const int CHANNELS = ${channels};
-const int C3 = ${3 * channels};
+const int C3 = ${(stacked ? 4 : 3) * channels};
 const int HEADS = ${heads};
 const int HEAD_DIM = ${channels / heads};
 const int ELEMENTS = ${samples * rows * channels};
@@ -850,7 +906,7 @@ const int W_K = ${WINDOW_KEYS};
 const int CTX = ${WINDOW_CONTEXT};` : ""}
 uniform sampler2D qkvTex;
 uniform sampler2D qBiasTex;
-uniform sampler2D gateTex;
+${stacked ? "" : "uniform sampler2D gateTex;"}
 uniform sampler2D biasTex;
 uniform sampler2D padTex;
 
@@ -904,7 +960,8 @@ ${window ? "    if (j < 0 || j >= ROWS) continue;\n" : ""}    if (fetch1(padTex,
     sum += weight;
     gathered += weight * fetch4(qkvTex, (kBase + CHANNELS + c % HEAD_DIM) / 4);
   }
-  vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-fetch4(gateTex, at * (CHANNELS / 4) + c / 4)));
+  vec4 gate = vec4(1.0) / (vec4(1.0) + exp(-${stacked
+    ? "fetch4(qkvTex, (at * C3 + 3 * CHANNELS + c) / 4)" : "fetch4(gateTex, at * (CHANNELS / 4) + c / 4)"}));
   result = gate * (gathered / sum);
 }`;
 
@@ -913,11 +970,14 @@ ${window ? "    if (j < 0 || j >= ROWS) continue;\n" : ""}    if (fetch1(padTex,
  * their projections, where the fused form applies (the head walked four channels at a time).
  */
 function fusedAttention(execution, { window, x, rows, samples, channels, heads, weights: w, bias, pad }) {
+  // 🔴 [proj_qkv; proj_g] AS ONE PROJECTION WHERE THE UPLOADER STACKED THEM (`projQkvg`, out-major, so a row is
+  // `[q | k | v | g]`): x is read once and the gate is a fourth slice of the same row. `--no-weight-stack`.
+  const stacked = w.projQkvg !== undefined;
   const qkv = project(execution, {
-    x, weight: w.projQkv, rows: samples * rows, inChannels: channels, outChannels: 3 * channels,
-    weightLayout: "out-major",
+    x, weight: stacked ? w.projQkvg : w.projQkv, rows: samples * rows, inChannels: channels,
+    outChannels: (stacked ? 4 : 3) * channels, weightLayout: "out-major",
   });
-  const rawGate = project(execution, {
+  const rawGate = stacked ? null : project(execution, {
     x, weight: w.projG, rows: samples * rows, inChannels: channels, outChannels: channels,
     weightLayout: "out-major",
   });
@@ -925,13 +985,13 @@ function fusedAttention(execution, { window, x, rows, samples, channels, heads, 
   const s4 = sharedXStride4(execution, total, channels, [{ outChannels: channels, weight: w.projO }]);
   const gated = allocateX(execution, total, channels, s4, `bioemu2.${window ? "atom" : "token"}-gated`);
   execution.dispatch({
-    source: fusedAttentionSource(window, rows, channels, heads, samples, s4),
+    source: fusedAttentionSource(window, rows, channels, heads, samples, s4, stacked),
     output: gated,
-    inputs: { qkvTex: qkv, qBiasTex: w.projQBias, gateTex: rawGate, biasTex: bias, padTex: pad },
+    inputs: { qkvTex: qkv, qBiasTex: w.projQBias, ...(stacked ? {} : { gateTex: rawGate }), biasTex: bias, padTex: pad },
     label: `bioemu2.${window ? "atom" : "token"}-attend-fused:${total}x${channels}:${heads}`,
   });
   execution.release(qkv);
-  execution.release(rawGate);
+  if (rawGate !== null) execution.release(rawGate);
   const out = project(execution, {
     x: gated, weight: w.projO, rows: total, inChannels: channels, outChannels: channels, weightLayout: "out-major",
   });
@@ -940,7 +1000,7 @@ function fusedAttention(execution, { window, x, rows, samples, channels, heads, 
 }
 
 /** Whether `fusedAttention` applies: not under its arm, and only with the head read four channels at a time. */
-const attendFuses = (execution, channels, heads) =>
+export const attendFuses = (execution, channels, heads) =>
   !execution.noAttendFuse && !execution.noAttendDot4 && channels % (heads * 4) === 0;
 
 /** A weight that a layer stack holds one slice of, as the reference views it. */
@@ -978,22 +1038,14 @@ export function conditionedLayer(execution, call) {
   // than once an atom of every sample, and the slices gather what each row reads.
   const condRows = call.condRows ?? rows;
   const condMap = call.condMap ?? null;
-  // silu(LN(c)) @ cond_2, which is 6 * channels wide.
-  const normalised = layerNorm(execution, {
-    x: conditioning, weight: w.cond0Scale, bias: w.cond0Offset,
-    rows: condRows, channels: conditioning.elements / condRows, epsilon,
-  });
+  // silu(LN(c)) @ cond_2, which is 6 * channels wide - the norm over `conditioningStats` where the caller made the
+  // conditioning's row statistics once for every layer (the denoiser does, a step)
   const condChannels = conditioning.elements / condRows;
-  const siluStride4 = sharedXStride4(execution, condRows, condChannels,
-    [{ outChannels: 6 * channels, weight: w.cond2Weight }]);
-  const activated = allocateX(execution, condRows, condChannels, siluStride4, "bioemu2.cond-silu");
-  execution.dispatch({
-    source: siluSource(normalised.elements, condChannels / 4, siluStride4),
-    output: activated,
-    inputs: { xTex: normalised },
-    label: `bioemu2.cond-silu:${normalised.elements}`,
+  const activated = conditioningInput(execution, {
+    conditioning, stats: call.conditioningStats, rows: condRows, channels: condChannels,
+    scale: w.cond0Scale, offset: w.cond0Offset, epsilon,
+    consumers: [{ outChannels: 6 * channels, weight: w.cond2Weight }],
   });
-  execution.release(normalised);
   const cond = project(execution, {
     x: activated, weight: w.cond2Weight, bias: w.cond2Bias, rows: condRows,
     inChannels: conditioning.elements / condRows, outChannels: 6 * channels,
@@ -1061,9 +1113,7 @@ export function conditionedLayer(execution, call) {
   if (!execution.noCondFuse) {
     const width = 6 * channels;
     // (each written as the x its projections read: the attention's q/k/v and gate, the transition's fc1 and fc2)
-    const hidden = w.transition.fc1.elements / channels;
-    const readers = [call.attendConsumers ?? [],
-      [{ outChannels: hidden, weight: w.transition.fc1 }, { outChannels: hidden, weight: w.transition.fc2 }]];
+    const readers = [call.attendConsumers ?? [], transitionReaders(w.transition, channels)];
     const modulatedFused = (alphaIndex, input) => condAdaLn(execution, {
       x: input, cond, map: condMap, condWidth: width, alphaAt: alphaIndex * channels,
       betaAt: (alphaIndex + 1) * channels, rows, channels, epsilon, label: "bioemu2.cond-adaln",
@@ -1117,14 +1167,64 @@ export function conditionedLayer(execution, call) {
  *   - which the coupling's two mixers are not.
  * @returns {Tensor} `rows * (outChannels ?? channels)`
  */
+/** A SwiGLU transition's hidden width, off whichever of its forms the uploader gave (`fc12` or `fc1`). */
+export const transitionHidden = (w, channels) =>
+  (w.fc12 !== undefined ? w.fc12.elements / (2 * channels) : w.fc1.elements / channels);
+
+/** The projections a SwiGLU transition reads its input through, as `sharedXStride4` consumers. */
+const transitionReaders = (w, channels) => (w.fc12 !== undefined
+  ? [{ outChannels: 2 * transitionHidden(w, channels), weight: w.fc12 }]
+  : [w.fc1, w.fc2].map((weight) => ({ outChannels: weight.elements / channels, weight })));
+
+/**
+ * `out[row][c] = silu(x[row][c]) * x[row][hidden + c]` over the stacked `[fc1 | fc2]` projection - the silu draw and
+ * the product draw's arithmetic, in one (and `stridedTexel`'s layout, for fc3).
+ */
+const swigluSourceUncached = (rows, hidden, s4) => `${PRELUDE}${ONE_TARGET}
+const int H4 = ${hidden / 4};
+const int ELEMENTS = ${rows * hidden};
+uniform sampler2D xTex;
+
+void main() {
+  ${stridedTexel(hidden / 4, s4)}
+  if (texel * 4 >= ELEMENTS) { result = vec4(0.0); return; }
+  int row = texel / H4;
+  int group = texel - row * H4;
+  vec4 g = fetch4(xTex, row * 2 * H4 + group);
+  vec4 activated = g / (vec4(1.0) + exp(-g));
+  result = activated * fetch4(xTex, row * 2 * H4 + H4 + group);
+}`;
+
 export function transitionNoNorm(execution, { x, rows, channels, weights: w, outChannels }) {
-  const hidden = w.fc1.elements / channels;
+  const hidden = transitionHidden(w, channels);
   // 🔴 THE COUPLING'S MIXERS ARE NOT SQUARE, which is the whole point of them:
   // `s_to_q_mixer` reads `[a | q]` - the two streams' widths added - and writes
   // the ATOM width, and `q_to_s_mixer` writes the TOKEN width. `fc3` is what
   // says so, and assuming square makes the product that follows a mismatch the
   // reference catches with "offset is out of bounds" and this port would not.
   const out = outChannels ?? channels;
+  const gatedStride4 = sharedXStride4(execution, rows, hidden, [{ outChannels: out, weight: w.fc3 }]);
+  // 🔴 fc1 AND fc2 AS ONE PROJECTION WHERE THE UPLOADER STACKED THEM (`fc12`, `[fc1; fc2]` out-major, so the first
+  // `hidden` outputs are fc1's): x is read once, and the silu and the product are one draw over its two halves - the
+  // same values, where two projections, a silu and a product were six draws. `--no-weight-stack` is the arm.
+  if (w.fc12 !== undefined) {
+    const both = project(execution, {
+      x, weight: w.fc12, rows, inChannels: channels, outChannels: 2 * hidden, weightLayout: "out-major",
+    });
+    const gatedBoth = allocateX(execution, rows, hidden, gatedStride4, "bioemu2.transition-gated");
+    execution.dispatch({
+      source: swigluSource(rows, hidden, gatedStride4),
+      output: gatedBoth,
+      inputs: { xTex: both },
+      label: `bioemu2.transition-swiglu:${rows}x${hidden}`,
+    });
+    execution.release(both);
+    const projectedBoth = project(execution, {
+      x: gatedBoth, weight: w.fc3, rows, inChannels: hidden, outChannels: out, weightLayout: "out-major",
+    });
+    execution.release(gatedBoth);
+    return projectedBoth;
+  }
   const a = project(execution, {
     x, weight: w.fc1, rows, inChannels: channels, outChannels: hidden,
     weightLayout: "out-major",
@@ -1141,7 +1241,6 @@ export function transitionNoNorm(execution, { x, rows, channels, weights: w, out
     label: `bioemu2.transition-silu:${rows}x${hidden}`,
   });
   execution.release(a);
-  const gatedStride4 = sharedXStride4(execution, rows, hidden, [{ outChannels: out, weight: w.fc3 }]);
   const gated = allocateX(execution, rows, hidden, gatedStride4, "bioemu2.transition-gated");
   execution.dispatch({
     source: productSource(rows * hidden, hidden / 4, gatedStride4),
@@ -1161,6 +1260,10 @@ export function transitionNoNorm(execution, { x, rows, channels, weights: w, out
 
 /** The attention's q, its bias-carrying query, and its gate. */
 function projections(execution, { x, rows, channels, weights: w }) {
+  if (w.projQkv === undefined) {
+    throw new Error("bioemu2: this attention has only a stacked [qkv; g] weight, which only the fused attention"
+      + " reads - upload them apart (--no-weight-stack) for --no-attend-fuse or --no-attend-dot4");
+  }
   const qkv = project(execution, {
     x, weight: w.projQkv, rows, inChannels: channels, outChannels: 3 * channels,
     weightLayout: "out-major",
@@ -1608,6 +1711,18 @@ export function* bioemu2DenoiseSteps(execution, call) {
     inputs: { sourceTex: cond, indexTex: maps.withZeroRow },
     label: `bioemu2.cond-zero-row:${tokens + 1}x${tokenChannels}`,
   });
+  // ...and its row statistics, ONCE: every layer's four conditionings normalise these same rows, each with its own
+  // affine (the token-side ones read the first T rows, which are `cond`'s own)
+  const condStats = execution.noCondFuse ? null : keep(execution.allocate((tokens + 1) * 4, "bioemu2.cond-stats"));
+  if (condStats !== null) {
+    execution.dispatch({
+      source: layerNormStatsSource(tokens + 1, tokenChannels, "two-pass"),
+      output: condStats,
+      inputs: { xTex: condWithZero },
+      floats: { epsilon },
+      label: `bioemu2.cond-stats:${tokens + 1}x${tokenChannels}`,
+    });
+  }
 
   // The two streams' initial states.
   const rToQ = keep(linear(execution, {
@@ -1674,6 +1789,7 @@ export function* bioemu2DenoiseSteps(execution, call) {
       rows: atomRows, channels: atomChannels,
       heads: dims.atomHeads, weights: atomWeights, epsilon,
       attendConsumers: attentionReaders(atomWeights.attention, atomChannels),
+      conditioningStats: atomCond.map === null ? null : condStats,
       attend: (input) => windowAttention(execution, {
         x: input, pair: context.p, pad: f.atomPad, atoms, channels: atomChannels,
         heads: dims.atomHeads, weights: atomWeights.attention, epsilon,
@@ -1685,6 +1801,7 @@ export function* bioemu2DenoiseSteps(execution, call) {
       rows: tokenRows, channels: tokenChannels,
       heads: dims.tokenHeads, weights: tokenWeights, epsilon,
       attendConsumers: attentionReaders(tokenWeights.attention, tokenChannels),
+      conditioningStats: condStats,
       attend: (input) => fullAttention(execution, {
         x: input, pair: context.z, pad: f.tokenPad, tokens, channels: tokenChannels,
         heads: dims.tokenHeads, weights: tokenWeights.attention, epsilon,
@@ -1702,22 +1819,15 @@ export function* bioemu2DenoiseSteps(execution, call) {
     const width = tokenChannels + atomChannels;
     // `condSource` at `condRows` rows, read by each of the `rows` rows through `condMap` (null: the same rows)
     const mix = (condSource, condRows, condMap, rows, gatherIndex, left, right, weights, outChannels) => {
-      const normalised = layerNorm(execution, {
-        x: condSource, weight: weights.cond0Scale, bias: weights.cond0Offset,
-        rows: condRows, channels: condSource.elements / condRows, epsilon,
-      });
       const condChannels = condSource.elements / condRows;
       const projectedWidth = 2 * width + outChannels;
-      const siluStride4 = sharedXStride4(execution, condRows, condChannels,
-        [{ outChannels: projectedWidth, weight: weights.cond2Weight }]);
-      const activated = allocateX(execution, condRows, condChannels, siluStride4, "bioemu2.mix-silu");
-      execution.dispatch({
-        source: siluSource(normalised.elements, condChannels / 4, siluStride4),
-        output: activated,
-        inputs: { xTex: normalised },
-        label: `bioemu2.mix-silu:${normalised.elements}`,
+      const activated = conditioningInput(execution, {
+        // (the statistics are condWithZero's rows - cond's are its first T - and not the control arm's atom rows)
+        conditioning: condSource, stats: condSource === cond || condSource === condWithZero ? condStats : null,
+        rows: condRows, channels: condChannels,
+        scale: weights.cond0Scale, offset: weights.cond0Offset, epsilon,
+        consumers: [{ outChannels: projectedWidth, weight: weights.cond2Weight }],
       });
-      execution.release(normalised);
       const projected = project(execution, {
         x: activated, weight: weights.cond2Weight, bias: weights.cond2Bias, rows: condRows,
         inChannels: condSource.elements / condRows,
@@ -1760,7 +1870,7 @@ export function* bioemu2DenoiseSteps(execution, call) {
         const modulatedFused = condAdaLn(execution, {
           x: joinedMix, cond: projected, map: condMap, condWidth: projectedWidth, alphaAt: 0, betaAt: width,
           rows, channels: width, epsilon, label: "bioemu2.mix-cond-adaln",
-          consumers: [weights.fc1, weights.fc2].map((weight) => ({ outChannels: weight.elements / width, weight })),
+          consumers: transitionReaders(weights, width),
         });
         execution.release(joinedMix);
         const mixedFused = transitionNoNorm(execution, {
@@ -1812,13 +1922,11 @@ export function* bioemu2DenoiseSteps(execution, call) {
     };
     const sToQ = mix(atomCond.source, atomCond.rows, atomCond.map, atomRows, maps.atomToken,
       { tensor: a, channels: tokenChannels }, { tensor: q, channels: atomChannels },
-      { ...coupling.qCoupling, fc1: coupling.sToQ.fc1, fc2: coupling.sToQ.fc2,
-        fc3: coupling.sToQ.fc3 },
+      { ...coupling.qCoupling, ...coupling.sToQ },
       atomChannels);
     const qToS = mix(cond, tokens, maps.tokenCond, tokenRows, maps.centreOrPad,
       { tensor: q, channels: atomChannels }, { tensor: a, channels: tokenChannels },
-      { ...coupling.sCoupling, fc1: coupling.qToS.fc1, fc2: coupling.qToS.fc2,
-        fc3: coupling.qToS.fc3 },
+      { ...coupling.sCoupling, ...coupling.qToS },
       tokenChannels);
     // (the fused mixers hand back the coupled state itself; the control arm the gated term, summed here)
     const coupled = (term, base, rows, channels, label) => {
@@ -1942,6 +2050,8 @@ export const gatherRowsSource = memoSource(gatherRowsSourceUncached);
 export const maskRowsSource = memoSource(maskRowsSourceUncached);
 export const gatherSliceSource = memoSource(gatherSliceSourceUncached);
 export const condAdaLnSource = memoSource(condAdaLnSourceUncached);
+export const statsSiluSource = memoSource(statsSiluSourceUncached);
+export const swigluSource = memoSource(swigluSourceUncached);
 export const fusedAttentionSource = memoSource(fusedAttentionSourceUncached);
 export const condGatedResidualSource = memoSource(condGatedResidualSourceUncached);
 export const splitAdaLnSource = memoSource(splitAdaLnSourceUncached);

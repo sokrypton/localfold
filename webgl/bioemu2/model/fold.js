@@ -106,6 +106,27 @@ function group(execution, read) {
       held.push(tensor);
       return tensor;
     },
+    /**
+     * Out-major weights of one input width as ONE weight, their outputs side by side (`Storage.uploadInt5Weights`;
+     * the float forms concatenated on the host where the codes are not int5).
+     */
+    stack: async (names, label) => {
+      const codes = execution.uploadInt5Weights(await Promise.all(names.map((name) => read.source(name))), label);
+      if (codes !== null) {
+        held.push(codes);
+        return codes;
+      }
+      const parts = await Promise.all(names.map((name) => read(name)));
+      const all = new Float32Array(parts.reduce((total, part) => total + part.length, 0));
+      let at = 0;
+      for (const part of parts) {
+        all.set(part, at);
+        at += part.length;
+      }
+      const tensor = execution.uploadWeight(all, label);
+      held.push(tensor);
+      return tensor;
+    },
     /** A map of {key: name} uploaded under its keys. */
     tree: async function tree(names, label) {
       const out = {};
@@ -463,17 +484,32 @@ async function foldSteps(execution, read, features, options) {
   const weights = await clock("denoiser-weights", async () => {
     const P = "structure_module";
     const sc = `${P}/single_conditioner`;
+    // a SwiGLU's fc1 and fc2 as ONE projection (`fc12`; transitionNoNorm), or apart under `--no-weight-stack`
+    const swiglu = async (prefix, label) => (execution.noWeightStack
+      ? denoiser.tree({ fc1: `${prefix}/fc1/weight`, fc2: `${prefix}/fc2/weight`, fc3: `${prefix}/fc3/weight` }, label)
+      : {
+        fc12: await denoiser.stack([`${prefix}/fc1/weight`, `${prefix}/fc2/weight`], `${label}.fc12`),
+        fc3: await denoiser.up(`${prefix}/fc3/weight`, `${label}.fc3`),
+      });
+    // an attention's [proj_qkv; proj_g] as ONE projection (`projQkvg`; the denoiser's fused attention), where the
+    // fused attention is what will read it
+    const stackAttention = !execution.noWeightStack && !execution.noAttendFuse && !execution.noAttendDot4;
+    const attentionTree = async (attn, label) => {
+      const names = attentionNames(attn);
+      if (!stackAttention) return denoiser.tree(names, label);
+      const { projQkv, projG, ...rest } = names;
+      return {
+        ...(await denoiser.tree(rest, label)),
+        projQkvg: await denoiser.stack([projQkv, projG], `${label}.projQkvg`),
+      };
+    };
     const streamTree = async (base, attn, layer) => ({
       cond0Scale: await denoiser.up(`${base}/cond_0/weight`, `dn.${layer}.cond0`),
       cond0Offset: await denoiser.up(`${base}/cond_0/bias`, `dn.${layer}.cond0b`),
       cond2Weight: await denoiser.up(`${base}/cond_2/weight`, `dn.${layer}.cond2`),
       cond2Bias: await denoiser.up(`${base}/cond_2/bias`, `dn.${layer}.cond2b`),
-      attention: await denoiser.tree(attentionNames(attn), `dn.${layer}.attn`),
-      transition: await denoiser.tree({
-        fc1: `${base}/transition/fc1/weight`,
-        fc2: `${base}/transition/fc2/weight`,
-        fc3: `${base}/transition/fc3/weight`,
-      }, `dn.${layer}.transition`),
+      attention: await attentionTree(attn, `dn.${layer}.attn`),
+      transition: await swiglu(`${base}/transition`, `dn.${layer}.transition`),
     });
     const singleConditioner = {
       ...(await denoiser.tree({
@@ -488,13 +524,13 @@ async function foldSteps(execution, read, features, options) {
       transitions: [],
     };
     for (let index = 0; index < 2; index += 1) {
-      singleConditioner.transitions.push(await denoiser.tree({
-        normScale: `${sc}/transitions_${index}/norm/weight`,
-        normOffset: `${sc}/transitions_${index}/norm/bias`,
-        fc1: `${sc}/transitions_${index}/fc1/weight`,
-        fc2: `${sc}/transitions_${index}/fc2/weight`,
-        fc3: `${sc}/transitions_${index}/fc3/weight`,
-      }, `dn.single.transition${index}`));
+      singleConditioner.transitions.push({
+        ...(await denoiser.tree({
+          normScale: `${sc}/transitions_${index}/norm/weight`,
+          normOffset: `${sc}/transitions_${index}/norm/bias`,
+        }, `dn.single.transition${index}`)),
+        ...(await swiglu(`${sc}/transitions_${index}`, `dn.single.transition${index}`)),
+      });
     }
     const atomBlocks = [];
     const tokenBlocks = [];
@@ -519,16 +555,8 @@ async function foldSteps(execution, read, features, options) {
           cond2Weight: `${L}/coupling/s_coupling_cond_2/weight`,
           cond2Bias: `${L}/coupling/s_coupling_cond_2/bias`,
         }, `dn.${layer}.scond`),
-        sToQ: await denoiser.tree({
-          fc1: `${L}/coupling/s_to_q_mixer/fc1/weight`,
-          fc2: `${L}/coupling/s_to_q_mixer/fc2/weight`,
-          fc3: `${L}/coupling/s_to_q_mixer/fc3/weight`,
-        }, `dn.${layer}.stoq`),
-        qToS: await denoiser.tree({
-          fc1: `${L}/coupling/q_to_s_mixer/fc1/weight`,
-          fc2: `${L}/coupling/q_to_s_mixer/fc2/weight`,
-          fc3: `${L}/coupling/q_to_s_mixer/fc3/weight`,
-        }, `dn.${layer}.qtos`),
+        sToQ: await swiglu(`${L}/coupling/s_to_q_mixer`, `dn.${layer}.stoq`),
+        qToS: await swiglu(`${L}/coupling/q_to_s_mixer`, `dn.${layer}.qtos`),
       });
     }
     return {

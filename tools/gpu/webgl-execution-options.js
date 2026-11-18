@@ -140,6 +140,9 @@
  *                         the query bias, taking the sigmoid gate and its
  *                         product in draws of their own, where one draw reads
  *                         the projections and writes the gated output.
+ *   --no-weight-stack     bioemu2's denoiser SwiGLUs as two projections, a silu
+ *                         and a product, where the fold stacks fc1 and fc2
+ *                         into one weight and the silu-product is one draw.
  *   --no-combine          Every kernel its own program, where a fold packs the
  *                         light ones into combined programs (`Execution.combine`).
  *                         A link costs ~40 ms on this M2's Chrome whatever the
@@ -328,6 +331,7 @@ export function webglExecutionOptions(args, defaults = {}) {
     noTokenRowCond: flag(args, "no-token-row-cond"),
     noCondFuse: flag(args, "no-cond-fuse"),
     noAttendFuse: flag(args, "no-attend-fuse"),
+    noWeightStack: flag(args, "no-weight-stack"),
     noCombine: flag(args, "no-combine"),
     combineBytes: Number(option(args, "combine-bytes", "0")),
     poolLabelPattern: pattern("pool-labels"),

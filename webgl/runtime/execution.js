@@ -526,6 +526,8 @@ export class Execution {
     this.noCondFuse = options.noCondFuse ?? false;
     /** bioemu2's attentions reading sliced q, k, v and a gate tensor - see `fusedAttention`. */
     this.noAttendFuse = options.noAttendFuse ?? false;
+    /** bioemu2's fold uploading a SwiGLU's fc1 and fc2 apart - see `transitionNoNorm`. */
+    this.noWeightStack = options.noWeightStack ?? false;
 
     /**
      * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every
@@ -705,6 +707,7 @@ export class Execution {
   uploadWeight(values, label) { return this.storage.uploadWeight(values, label); }
   /** An int5 weight left as codes, or null if this one cannot be. */
   uploadInt5Weight(source, label) { return this.storage.uploadInt5Weight(source, label); }
+  uploadInt5Weights(sources, label) { return this.storage.uploadInt5Weights(sources, label); }
   allocateHalf(elements, label) { return this.storage.allocateHalf(elements, label); }
 
   upload(values, label) { return this.storage.upload(values, label); }
