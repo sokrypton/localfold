@@ -65,7 +65,7 @@
  */
 import { confidenceHeads, releaseConfidenceWeights, uploadConfidenceWeights } from "../../heads/confidence.js";
 import { distogramContacts } from "../../heads/distogram.js";
-import { evoformerStack, extraMsaStack } from "../evoformer/stack.js";
+import { evoformerStack, evoformerStackAsync, extraMsaStack, extraMsaStackAsync } from "../evoformer/stack.js";
 import {
   inputEmbedder, releaseInputEmbedderWeights, residueIdentity, uploadInputEmbedderWeights,
   widenRelativePositionWeight,
@@ -244,7 +244,8 @@ export function releaseAf2Weights(execution, weights) {
  *   shape?: Partial<typeof AF2_SHAPE>,
  *   onRecycle?: (result: object, recycle: number) => void,
  *   onBlock?: (stack: "extra" | "main", block: number, blocks: number) => void,
- *   yieldTo?: () => Promise<void>}} call
+ *   yieldTo?: () => Promise<void>, blockPause?: () => Promise<void>}} call
+ *   `blockPause` is awaited after every Evoformer block (`evoformerStackAsync`): a page's repaint, Stop and progress.
  * @param {import("../../runtime/execution.js").Execution} execution
  * @returns {Promise<{recycles: object[], final: object}>}
  */
@@ -435,7 +436,8 @@ export async function foldAf2(execution, call) {
     }
     await yieldTo?.();
 
-    const extra = extraMsaStack(execution, {
+    const blockPause = call.blockPause;
+    const extra = await (blockPause === undefined ? extraMsaStack : extraMsaStackAsync)(execution, {
       msa: embedding.extraMsa, pair, msaMask: extraMsaMask, pairMask,
       sequences: features.extraSequences, length,
       cM: extraMsaChannels, cZ: pairChannels,
@@ -447,12 +449,13 @@ export async function foldAf2(execution, call) {
       ...multimerRegime,
       onBlock: call.onBlock === undefined
         ? undefined : (block, blocks) => call.onBlock("extra", block, blocks),
+      pause: blockPause,
     });
     execution.release(embedding.extraMsa);
     execution.release(pair);
     await yieldTo?.();
 
-    const trunk = evoformerStack(execution, {
+    const trunk = await (blockPause === undefined ? evoformerStack : evoformerStackAsync)(execution, {
       msa: embedding.msa, pair: extra.pair, msaMask, pairMask,
       sequences: features.msaSequences, length,
       cM: msaChannels, cZ: pairChannels,
@@ -464,6 +467,7 @@ export async function foldAf2(execution, call) {
       ...multimerRegime,
       onBlock: call.onBlock === undefined
         ? undefined : (block, blocks) => call.onBlock("main", block, blocks),
+      pause: blockPause,
     });
     execution.release(embedding.msa);
     execution.release(extra.msa);

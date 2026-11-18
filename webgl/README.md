@@ -3761,6 +3761,24 @@ own crystal as a template: Protenix-v2 pLDDT 95.3 both ways, 261/261 covered (21
 (This box's local `model-boltz2-int5` and `model-rosettafold3-int5` are not the exports the registry pins - the page
 404s or refuses a shard on WebGPU as well - so those two page folds used `--remote-weights`.)
 
+### 🔴 2026-11-17: AlphaFold 2 on the page in Safari, 12.3 s -> 5.4 s - the AF3 path's texture pool and pause, which it never had
+
+The page's default AlphaFold 2 example (59 residues, an MMseqs2 search, 3 recycles) in Safari 16.3 on an M2, through
+`tools/fold-in-safari.py --model monomer --msa search --recycles 3 --remote-weights`: **12.3 s -> 5.4 s**, pLDDT 61.6 /
+pTM 0.346 either way, and its progress **every 1%** where it stood at 25% steps for ~2.5 s each.
+
+- **The texture pool** (`pooling` with `AF3_POOL_LIMIT_BYTES`, the 2026-11-08 change that took Safari's second AF3
+  fold 25 -> 14 s): web/af2-webgl2.js built its context without it, so each of a fold's ~17,000 draws created and
+  deleted its output texture - a round trip through the browser's GPU process every time. Per KERNEL Safari was not
+  the slow one (its `--profile` sum 45.7 s against Chrome's 60.3 for the same fold); per DRAW it was, 1.75 ms against
+  1.04. `fold-af2-webgl.js --a3m=/tools/fixtures/test.a3m --recycles=3`: Safari 29.0 -> 12.3-12.8 s, Chrome 17.4 ->
+  12.1 s, the peak 395 -> 499 MiB, bit-identical (the WGSL gate's worst atom 0.0447 A against a 0.0403 floor, as
+  without). Tried first and NOT it: per-draw `getError` off, with and without `--flush-every=1|16` (28.8-29.4 s against
+  28.8), and `--invalidate` (59.3 s, twice as slow).
+- **A pause after every Evoformer block, one block behind the GPU** (`evoformerStackAsync`/`extraMsaStackAsync`,
+  `laggedPause`): the 48 main-stack blocks were issued in one synchronous run, so the page neither repainted nor saw
+  Stop, and `onBlock` counted blocks ISSUED. The synchronous stacks stay for the stage gates.
+
 ### The input kinds, every family: two defects, both fixed, and three folds that are the INPUT's
 
 `fold-af3-webgl.js --seams --recycles=1 --steps=25` (it now featurises through `featuriserDialect`, as the page does,

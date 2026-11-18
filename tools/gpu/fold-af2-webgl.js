@@ -136,9 +136,14 @@ export async function main(device, args) {
   };
   const loadMs = Math.round(performance.now() - loadStart);
 
-  const a3m = `>query\n${sequence}\n`;
+  // `--a3m=<served path>` folds with an alignment, as the page's default (an MMseqs2 search, 128:256) does - the deep
+  // MSA path is a different cost profile from the single sequence; its first record is the query.
+  const a3mPath = option(args, "a3m", "");
+  const a3m = a3mPath !== "" ? await (await fetch(a3mPath)).text() : `>query\n${sequence}\n`;
   const featureOptions = {
-    recycles, randomSeed: seed, maxMsaSequences: 1, maxExtraSequences: 1,
+    recycles, randomSeed: seed,
+    maxMsaSequences: a3mPath !== "" ? Number(option(args, "max-msa", "128")) : 1,
+    maxExtraSequences: a3mPath !== "" ? Number(option(args, "max-extra", "256")) : 1,
     // `chainAware` is what makes the featuriser emit the asym, entity and
     // symmetry lanes the 73-row relative encoding reads.
     ...(multimer ? { chainAware: true, chainSequences: chains } : {}),
