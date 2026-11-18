@@ -485,15 +485,17 @@ async function foldSteps(execution, read, features, options) {
     const P = "structure_module";
     const sc = `${P}/single_conditioner`;
     // a SwiGLU's fc1 and fc2 as ONE projection (`fc12`; transitionNoNorm), or apart under `--no-weight-stack`
-    const swiglu = async (prefix, label) => (execution.noWeightStack
+    const swiglu = async (prefix, label) => (execution.noWeightStack || execution.noSwigluStack
       ? denoiser.tree({ fc1: `${prefix}/fc1/weight`, fc2: `${prefix}/fc2/weight`, fc3: `${prefix}/fc3/weight` }, label)
       : {
         fc12: await denoiser.stack([`${prefix}/fc1/weight`, `${prefix}/fc2/weight`], `${label}.fc12`),
         fc3: await denoiser.up(`${prefix}/fc3/weight`, `${label}.fc3`),
       });
-    // an attention's [proj_qkv; proj_g] as ONE projection (`projQkvg`; the denoiser's fused attention), where the
-    // fused attention is what will read it
-    const stackAttention = !execution.noWeightStack && !execution.noAttendFuse && !execution.noAttendDot4;
+    // an attention's [proj_qkv; proj_g] as ONE projection (`projQkvg`; the denoiser's fused attention) - OFF unless
+    // asked (`--qkvg-stack`), which is a measurement: ten sampler steps at 68 tokens on an M2, Chrome 4.64/4.58 s
+    // stacked against 4.64/4.61 apart, and Safari 16.3 6.47/6.34 stacked against 6.07/6.02 apart (the SwiGLU stack
+    // beside it is Chrome's 1.10x and within a percent in Safari, so it stays on)
+    const stackAttention = execution.qkvgStack && !execution.noWeightStack && !execution.noAttendFuse && !execution.noAttendDot4;
     const attentionTree = async (attn, label) => {
       const names = attentionNames(attn);
       if (!stackAttention) return denoiser.tree(names, label);

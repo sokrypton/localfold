@@ -141,8 +141,12 @@
  *                         product in draws of their own, where one draw reads
  *                         the projections and writes the gated output.
  *   --no-weight-stack     bioemu2's denoiser SwiGLUs as two projections, a silu
- *                         and a product, where the fold stacks fc1 and fc2
- *                         into one weight and the silu-product is one draw.
+ *   --no-swiglu-stack     and a product, where the fold stacks fc1 and fc2
+ *                         into one weight and the silu-product is one draw
+ *                         (Chrome 1.10x on the sampler, Safari within 1%).
+ *   --qkvg-stack          bioemu2's attentions' proj_qkv and proj_g as one
+ *                         weight too: neutral in Chrome and ~7% SLOWER in
+ *                         Safari 16.3, so off.
  *   --no-combine          Every kernel its own program, where a fold packs the
  *                         light ones into combined programs (`Execution.combine`).
  *                         A link costs ~40 ms on this M2's Chrome whatever the
@@ -332,6 +336,8 @@ export function webglExecutionOptions(args, defaults = {}) {
     noCondFuse: flag(args, "no-cond-fuse"),
     noAttendFuse: flag(args, "no-attend-fuse"),
     noWeightStack: flag(args, "no-weight-stack"),
+    noSwigluStack: flag(args, "no-swiglu-stack"),
+    qkvgStack: flag(args, "qkvg-stack"),
     noCombine: flag(args, "no-combine"),
     combineBytes: Number(option(args, "combine-bytes", "0")),
     poolLabelPattern: pattern("pool-labels"),

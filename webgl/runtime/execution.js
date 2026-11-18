@@ -528,6 +528,8 @@ export class Execution {
     this.noAttendFuse = options.noAttendFuse ?? false;
     /** bioemu2's fold uploading a SwiGLU's fc1 and fc2 apart - see `transitionNoNorm`. */
     this.noWeightStack = options.noWeightStack ?? false;
+    this.noSwigluStack = options.noSwigluStack ?? false;
+    this.qkvgStack = options.qkvgStack ?? false;
 
     /**
      * The control arm for the combined programs (`combine`, `part`, `partFromSource`): every

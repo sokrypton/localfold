@@ -1,7 +1,7 @@
 /**
  * BioEmu2's denoiser in WebGL2 against `cpu/bioemu2/denoiser.js`.
  *
- *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-bioemu2-denoiser.js [--falsify] [--no-weight-stack]
+ *     node tools/gpu-chrome.mjs tools/gpu/check-webgl-bioemu2-denoiser.js [--falsify] [--no-weight-stack] [--qkvg-stack]
  *       [--no-cond-fuse] [--no-attend-fuse] [--no-token-row-cond] [--no-prepadded-x]
  *       (the denoiser's own arms of tools/gpu/webgl-execution-options.js, on an f32 Execution)
  *
@@ -262,6 +262,8 @@ export async function main(device, args) {
   // 🔴 A SwiGLU AS THE FOLD UPLOADS IT: fc1 and fc2 stacked into ONE out-major weight (`fc12`), which is what
   // `transitionNoNorm`'s one-projection path reads; `--no-weight-stack` is the two-projection path.
   const stackSwiglu = !flag(args, "no-weight-stack");
+  // ([proj_qkv; proj_g] stacked only where asked, as the fold does: `--qkvg-stack`)
+  const stackQkvg = flag(args, "qkvg-stack") && !flag(args, "no-attend-fuse");
   const swiglu = (fc1, fc2, fc3, label) => {
     if (!stackSwiglu) return { fc1: upload(fc1, `${label}.fc1`), fc2: upload(fc2, `${label}.fc2`), fc3: upload(fc3, `${label}.fc3`) };
     const both = new Float32Array(fc1.length + fc2.length);
@@ -274,10 +276,10 @@ export async function main(device, args) {
   const attentionTree = (prefix, layer) => {
     const names = attentionNames(prefix);
     const tree = Object.fromEntries(Object.entries(names)
-      .filter(([key]) => !stackSwiglu || flag(args, "no-attend-fuse") || (key !== "projQkv" && key !== "projG"))
+      .filter(([key]) => !stackQkvg || (key !== "projQkv" && key !== "projG"))
       .map(([key, name]) => [key, layerTensor(name, layer)]));
     // ...and [proj_qkv; proj_g] stacked, as the fold uploads it for the fused attention
-    if (stackSwiglu && !flag(args, "no-attend-fuse")) {
+    if (stackQkvg) {
       const qkv = stacks[names.projQkv].slice(layer);
       const g = stacks[names.projG].slice(layer);
       const both = new Float32Array(qkv.length + g.length);
